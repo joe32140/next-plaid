@@ -328,7 +328,7 @@ checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
 
 [[package]]
 name = "colgrep"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "atty",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "colgrep-parser"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "colgrep",
  "pyo3",
@@ -836,9 +836,9 @@ dependencies = [
 
 [[package]]
 name = "fastkmeans-rs"
-version = "1.0.6"
+version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e4488640442526b76eea0097d0d807b61deb98e45a76c8454a471029df70167"
+checksum = "d1528732c31bd517b4df7a2796adcad4502c2e501694c2141c1e6a6df5f3e80a"
 dependencies = [
  "ndarray 0.16.1",
  "ndarray-rand",
@@ -1810,7 +1810,7 @@ dependencies = [
 
 [[package]]
 name = "next-plaid"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "byteorder",
  "fancy-regex",
@@ -1834,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "next-plaid-onnx"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "glob",

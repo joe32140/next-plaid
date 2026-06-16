@@ -164,10 +164,94 @@ const SMALL_BATCH_CPU_THRESHOLD: usize = 300;
 /// disk I/O falls behind.
 const POOLED_EMBEDDING_QUEUE_CAPACITY: usize = 4;
 
+/// Bounded channel capacity for upstream pipeline stages.
+/// Tokenized chunks and raw token-level embeddings can be large on codebases with many
+/// long functions. Keeping these queues bounded makes back-pressure propagate all the way
+/// to parsing instead of letting encoding run far ahead of indexing.
+const PIPELINE_QUEUE_CAPACITY: usize = 2;
+
+/// Bounded channel capacity for chunks waiting on initial-create coding.
+/// During first index creation the coding thread waits for k-means before compressing chunks,
+/// so this queue must stay small or pooled embeddings pile up in memory.
+const CODING_QUEUE_CAPACITY: usize = 2;
+
+/// Default ONNX sessions for indexing on accelerator providers (CoreML/DirectML/MIGraphX)
+/// when the user has not configured `settings --parallel`. On these providers every session
+/// is a full model copy held in device memory, so default to a single session and let users
+/// opt into more with `--parallel`. CPU indexing uses [`default_index_parallel_sessions`]
+/// instead, which scales with cores because CPU encoding cannot run ahead of the bounded
+/// pipeline queues (so extra sessions add throughput at modest, bounded memory cost).
+const DEFAULT_INDEX_ACCEL_PARALLEL_SESSIONS: usize = 1;
+
+/// Pick the default number of ONNX sessions for indexing based on the chosen execution
+/// provider, when the user has not set `settings --parallel`.
+///
+/// - **CPU**: scale with available cores. The bounded pipeline queues cap how far encoding
+///   can run ahead of indexing, so more sessions improve throughput without the unbounded
+///   memory growth that motivated the queue bounds — this is the fast default.
+/// - **Accelerators** (CoreML/CUDA/DirectML/MIGraphX): keep a single session by default,
+///   since each one duplicates the model in device memory. Users can raise it explicitly.
+fn default_index_parallel_sessions(execution_provider: ExecutionProvider) -> usize {
+    match execution_provider {
+        ExecutionProvider::Cpu => crate::config::get_default_cpu_parallel_sessions(),
+        _ => DEFAULT_INDEX_ACCEL_PARALLEL_SESSIONS,
+    }
+}
+
 /// Bounded channel capacity between the index and metadata stages.
 /// Larger than the pooled queue because metadata rows are lightweight
 /// (just unit refs + doc IDs, no embedding data).
 const METADATA_QUEUE_CAPACITY: usize = 8;
+
+fn compiled_accelerated_execution_provider() -> Option<ExecutionProvider> {
+    if cfg!(feature = "cuda") {
+        Some(ExecutionProvider::Cuda)
+    } else if cfg!(feature = "tensorrt") {
+        Some(ExecutionProvider::TensorRT)
+    } else if cfg!(feature = "coreml") {
+        Some(ExecutionProvider::CoreML)
+    } else if cfg!(feature = "directml") {
+        Some(ExecutionProvider::DirectML)
+    } else if cfg!(feature = "migraphx") {
+        Some(ExecutionProvider::MIGraphX)
+    } else {
+        None
+    }
+}
+
+fn execution_provider_for_acceleration_mode(mode: AccelerationMode) -> ExecutionProvider {
+    match mode {
+        AccelerationMode::ForceCpu => ExecutionProvider::Cpu,
+        AccelerationMode::ForceGpu => {
+            compiled_accelerated_execution_provider().unwrap_or(ExecutionProvider::Cuda)
+        }
+        AccelerationMode::Auto => {
+            compiled_accelerated_execution_provider().unwrap_or(ExecutionProvider::Cpu)
+        }
+    }
+}
+
+#[cfg(all(
+    not(feature = "cuda"),
+    any(feature = "coreml", feature = "directml", feature = "migraphx")
+))]
+fn indexing_execution_provider_for_acceleration_mode(mode: AccelerationMode) -> ExecutionProvider {
+    match mode {
+        AccelerationMode::ForceCpu => ExecutionProvider::Cpu,
+        AccelerationMode::ForceGpu => {
+            compiled_accelerated_execution_provider().unwrap_or(ExecutionProvider::Cuda)
+        }
+        AccelerationMode::Auto if cfg!(feature = "coreml") => {
+            // CoreML retains substantial per-shape state during bulk document encoding.
+            // Keep Auto indexing memory-bounded; users can still opt into CoreML with
+            // --force-gpu, and search query encoding continues to prefer CoreML.
+            ExecutionProvider::Cpu
+        }
+        AccelerationMode::Auto => {
+            compiled_accelerated_execution_provider().unwrap_or(ExecutionProvider::Cpu)
+        }
+    }
+}
 
 struct ParsedFileResult {
     path: PathBuf,
@@ -336,7 +420,7 @@ fn prepare_deduplicated_chunk(unit_chunk: &[SortedUnit]) -> PreparedChunk {
 
 fn run_encode_stage(
     receiver: mpsc::Receiver<TokenizedChunk>,
-    sender: mpsc::Sender<RawEncodedChunk>,
+    sender: mpsc::SyncSender<RawEncodedChunk>,
     model: Colbert,
 ) -> Result<()> {
     while let Ok(chunk) = receiver.recv() {
@@ -356,7 +440,7 @@ fn run_encode_stage(
 
 fn run_tokenize_stage(
     receiver: mpsc::Receiver<PreparedChunk>,
-    sender: mpsc::Sender<TokenizedChunk>,
+    sender: mpsc::SyncSender<TokenizedChunk>,
     model: Colbert,
 ) -> Result<()> {
     while let Ok(chunk) = receiver.recv() {
@@ -468,7 +552,7 @@ fn run_index_stage(
         // chunk's embeddings into residual codes. All encoded chunks are collected
         // in memory and written to disk in a single atomic operation at the end,
         // which avoids a partially-written index if the process is interrupted.
-        let (dedup_tx, dedup_rx) = mpsc::sync_channel::<ChunkForCoding>(8);
+        let (dedup_tx, dedup_rx) = mpsc::sync_channel::<ChunkForCoding>(CODING_QUEUE_CAPACITY);
         let coding_index_path = index_path.clone();
         let coding_config = initial_create_config.clone();
         let coding_force_cpu = update_config.force_cpu;
@@ -666,9 +750,9 @@ fn run_chunk_pipeline(
         pb,
     } = pipeline;
 
-    let (tokenize_tx, tokenize_rx) = mpsc::channel::<PreparedChunk>();
-    let (encode_tx, encode_rx) = mpsc::channel::<TokenizedChunk>();
-    let (pool_tx, pool_rx) = mpsc::channel::<RawEncodedChunk>();
+    let (tokenize_tx, tokenize_rx) = mpsc::sync_channel::<PreparedChunk>(PIPELINE_QUEUE_CAPACITY);
+    let (encode_tx, encode_rx) = mpsc::sync_channel::<TokenizedChunk>(PIPELINE_QUEUE_CAPACITY);
+    let (pool_tx, pool_rx) = mpsc::sync_channel::<RawEncodedChunk>(PIPELINE_QUEUE_CAPACITY);
     let (index_tx, index_rx) =
         mpsc::sync_channel::<PooledChunkForIndex>(POOLED_EMBEDDING_QUEUE_CAPACITY);
     let (metadata_tx, metadata_rx) =
@@ -940,8 +1024,9 @@ impl IndexBuilder {
                             .context("Failed to initialize ONNX Runtime")?;
 
                         (
-                            self.parallel_sessions
-                                .unwrap_or_else(crate::config::get_default_cpu_parallel_sessions),
+                            self.parallel_sessions.unwrap_or_else(|| {
+                                default_index_parallel_sessions(ExecutionProvider::Cpu)
+                            }),
                             ExecutionProvider::Cpu,
                         )
                     }
@@ -990,9 +1075,9 @@ impl IndexBuilder {
                             )
                         } else {
                             (
-                                self.parallel_sessions.unwrap_or_else(
-                                    crate::config::get_default_cpu_parallel_sessions,
-                                ),
+                                self.parallel_sessions.unwrap_or_else(|| {
+                                    default_index_parallel_sessions(ExecutionProvider::Cpu)
+                                }),
                                 ExecutionProvider::Cpu,
                             )
                         }
@@ -1013,7 +1098,7 @@ impl IndexBuilder {
 
                 (
                     self.parallel_sessions
-                        .unwrap_or_else(crate::config::get_default_cpu_parallel_sessions),
+                        .unwrap_or_else(|| default_index_parallel_sessions(ExecutionProvider::Cpu)),
                     ExecutionProvider::Cpu,
                 )
             };
@@ -1023,21 +1108,17 @@ impl IndexBuilder {
             let (num_sessions, execution_provider) = {
                 let _ = num_units;
 
+                let execution_provider = indexing_execution_provider_for_acceleration_mode(
+                    env_acceleration_mode_lossy(),
+                );
+
                 crate::onnx_runtime::ensure_onnx_runtime()
                     .context("Failed to initialize ONNX Runtime")?;
 
-                let provider = if cfg!(feature = "directml") {
-                    ExecutionProvider::DirectML
-                } else if cfg!(feature = "migraphx") {
-                    ExecutionProvider::MIGraphX
-                } else {
-                    ExecutionProvider::CoreML
-                };
-
                 (
                     self.parallel_sessions
-                        .unwrap_or_else(crate::config::get_default_cpu_parallel_sessions),
-                    provider,
+                        .unwrap_or_else(|| default_index_parallel_sessions(execution_provider)),
+                    execution_provider,
                 )
             };
 
@@ -1099,7 +1180,7 @@ impl IndexBuilder {
 
         let num_sessions = self
             .parallel_sessions
-            .unwrap_or_else(crate::config::get_default_cpu_parallel_sessions);
+            .unwrap_or_else(|| default_index_parallel_sessions(ExecutionProvider::Cpu));
         let batch = crate::config::DEFAULT_BATCH_SIZE_CPU;
 
         let model = crate::stderr::with_suppressed_stderr(|| {
@@ -3307,21 +3388,7 @@ impl Searcher {
         let index_path = vector_dir.to_str().unwrap().to_string();
 
         let acceleration_mode = env_acceleration_mode_lossy();
-        let execution_provider = match acceleration_mode {
-            AccelerationMode::ForceGpu => ExecutionProvider::Cuda,
-            AccelerationMode::ForceCpu => ExecutionProvider::Cpu,
-            AccelerationMode::Auto => {
-                if cfg!(feature = "coreml") {
-                    ExecutionProvider::CoreML
-                } else if cfg!(feature = "directml") {
-                    ExecutionProvider::DirectML
-                } else if cfg!(feature = "migraphx") {
-                    ExecutionProvider::MIGraphX
-                } else {
-                    ExecutionProvider::Cpu
-                }
-            }
-        };
+        let execution_provider = execution_provider_for_acceleration_mode(acceleration_mode);
 
         #[cfg(feature = "cuda")]
         match acceleration_mode {
@@ -3387,21 +3454,7 @@ impl Searcher {
         let index_path = vector_dir.to_str().unwrap().to_string();
 
         let acceleration_mode = env_acceleration_mode_lossy();
-        let execution_provider = match acceleration_mode {
-            AccelerationMode::ForceGpu => ExecutionProvider::Cuda,
-            AccelerationMode::ForceCpu => ExecutionProvider::Cpu,
-            AccelerationMode::Auto => {
-                if cfg!(feature = "coreml") {
-                    ExecutionProvider::CoreML
-                } else if cfg!(feature = "directml") {
-                    ExecutionProvider::DirectML
-                } else if cfg!(feature = "migraphx") {
-                    ExecutionProvider::MIGraphX
-                } else {
-                    ExecutionProvider::Cpu
-                }
-            }
-        };
+        let execution_provider = execution_provider_for_acceleration_mode(acceleration_mode);
 
         #[cfg(feature = "cuda")]
         match acceleration_mode {
@@ -4182,6 +4235,54 @@ fn prompt_large_index_confirmation(num_units: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_force_cpu_execution_provider_is_cpu() {
+        assert_eq!(
+            execution_provider_for_acceleration_mode(AccelerationMode::ForceCpu),
+            ExecutionProvider::Cpu
+        );
+    }
+
+    #[test]
+    fn test_auto_execution_provider_uses_compiled_accelerator_or_cpu() {
+        let expected = compiled_accelerated_execution_provider().unwrap_or(ExecutionProvider::Cpu);
+
+        assert_eq!(
+            execution_provider_for_acceleration_mode(AccelerationMode::Auto),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_accelerator_indexing_parallel_default_is_memory_bounded() {
+        // Accelerator providers keep one session by default: each is a full model copy in
+        // device memory.
+        assert_eq!(DEFAULT_INDEX_ACCEL_PARALLEL_SESSIONS, 1);
+        assert_eq!(
+            default_index_parallel_sessions(ExecutionProvider::CoreML),
+            1
+        );
+    }
+
+    #[test]
+    fn test_cpu_indexing_parallel_default_scales_with_cores() {
+        // CPU indexing defaults to the cores-based session count for speed; the bounded
+        // pipeline queues keep memory in check regardless of session count.
+        assert_eq!(
+            default_index_parallel_sessions(ExecutionProvider::Cpu),
+            crate::config::get_default_cpu_parallel_sessions()
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "coreml", not(feature = "cuda")))]
+    fn test_auto_indexing_provider_avoids_coreml() {
+        assert_eq!(
+            indexing_execution_provider_for_acceleration_mode(AccelerationMode::Auto),
+            ExecutionProvider::Cpu
+        );
+    }
 
     #[test]
     fn test_glob_simple_extension() {

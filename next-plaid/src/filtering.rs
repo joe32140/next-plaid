@@ -1152,47 +1152,77 @@ pub fn delete(index_path: &str, subset: &[i64]) -> Result<usize> {
         crate::text_search::drop_temp_table(&conn, name);
     }
 
-    // Get column names (excluding _subset_)
-    let mut columns: Vec<String> = Vec::new();
-    {
-        let mut stmt = conn.prepare("PRAGMA table_info(METADATA)")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        for row in rows {
-            let col = row?;
-            if col != SUBSET_COLUMN {
-                columns.push(col);
+    // Re-sequence _subset_ IDs to be contiguous 0-based.
+    // Instead of copying the entire table (expensive for large tables with TEXT/BLOB
+    // columns), use range-based UPDATEs that only touch the integer primary key.
+    // Process gaps in ascending order so decremented values never collide.
+    let mut sorted_ids: Vec<i64> = subset.to_vec();
+    sorted_ids.sort_unstable();
+    sorted_ids.dedup();
+    // Keep ONLY the ids that were actually present and removed. The range-shift
+    // math below assumes `sorted_ids` is exactly the set of deleted `_subset_`
+    // values: a stray out-of-range or non-existent id would inflate the shift
+    // counts and corrupt every survivor's id. `_subset_` is contiguous 0..N-1
+    // before this call, so the pre-delete row count is (survivors + deleted).
+    let original_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM METADATA", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_or(0)
+        + deleted as i64;
+    sorted_ids.retain(|&id| id >= 0 && id < original_count);
+
+    let max_id: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COALESCE(MAX(\"{}\"), -1) FROM METADATA",
+                SUBSET_COLUMN
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+
+    if max_id >= 0 && !sorted_ids.is_empty() {
+        // For each gap left by deleted rows, shift all subsequent rows down.
+        // Merge into contiguous ranges: if IDs 5,6,7 were deleted, rows >= 8
+        // shift down by 3. We process from lowest gap upward.
+        //
+        // Build (range_start, range_end, shift) tuples. Consecutive deleted IDs
+        // form a single gap; the rows between two gaps all need the same shift
+        // (equal to the number of deleted IDs to their left).
+        let mut updates: Vec<(i64, i64, i64)> = Vec::new();
+        let mut i = 0;
+        while i < sorted_ids.len() {
+            // Advance past consecutive deleted IDs
+            let mut j = i + 1;
+            while j < sorted_ids.len() && sorted_ids[j] == sorted_ids[j - 1] + 1 {
+                j += 1;
             }
+            // Rows from sorted_ids[j-1]+1 up to (but not including) the next
+            // deleted ID need to shift down by j (total deletions so far).
+            let range_start = sorted_ids[j - 1] + 1;
+            let range_end = if j < sorted_ids.len() {
+                sorted_ids[j]
+            } else {
+                max_id + sorted_ids.len() as i64 + 1
+            };
+            if range_start < range_end {
+                updates.push((range_start, range_end, j as i64));
+            }
+            i = j;
+        }
+
+        for (from, to_excl, shift) in &updates {
+            conn.execute(
+                &format!(
+                    "UPDATE METADATA SET \"{}\" = \"{}\" - ?1 WHERE \"{}\" >= ?2 AND \"{}\" < ?3",
+                    SUBSET_COLUMN, SUBSET_COLUMN, SUBSET_COLUMN, SUBSET_COLUMN
+                ),
+                rusqlite::params![shift, from, to_excl],
+            )?;
         }
     }
-
-    let col_str = columns
-        .iter()
-        .map(|c| format!("\"{}\"", c))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    // Create temp table with re-indexed _subset_ values
-    let create_temp_sql = format!(
-        "CREATE TEMP TABLE METADATA_TEMP AS \
-         SELECT (ROW_NUMBER() OVER (ORDER BY \"{}\")) - 1 AS new_subset_id, {} \
-         FROM METADATA",
-        SUBSET_COLUMN, col_str
-    );
-    conn.execute(&create_temp_sql, [])?;
-
-    // Clear original table
-    conn.execute("DELETE FROM METADATA", [])?;
-
-    // Copy back with new IDs
-    let insert_back_sql = format!(
-        "INSERT INTO METADATA (\"{}\", {}) \
-         SELECT new_subset_id, {} FROM METADATA_TEMP",
-        SUBSET_COLUMN, col_str, col_str
-    );
-    conn.execute(&insert_back_sql, [])?;
-
-    // Drop temp table
-    conn.execute("DROP TABLE METADATA_TEMP", [])?;
 
     // Commit transaction
     conn.execute("COMMIT", [])?;
@@ -1987,6 +2017,54 @@ mod tests {
         assert_eq!(results[0]["name"], "Alice");
         assert_eq!(results[1]["_subset_"], 1);
         assert_eq!(results[1]["name"], "Diana");
+    }
+
+    /// Re-sequencing must be robust to ids that are not actually present: negative
+    /// or out-of-range ids passed in `subset` must be ignored, not folded into the
+    /// shift math. Without clamping, a negative id shifts row 0 to -1 (collision) and
+    /// an in-the-middle phantom over-shifts survivors — corrupting `_subset_` and thus
+    /// the metadata/FTS/IVF alignment. (Regression guard for the range-UPDATE path.)
+    #[test]
+    fn test_delete_resequence_ignores_out_of_range_and_negative_ids() {
+        let dir = setup_test_dir();
+        let path = dir.path().to_str().unwrap();
+
+        let metadata = vec![
+            json!({"name": "Alice"}),   // 0
+            json!({"name": "Bob"}),     // 1
+            json!({"name": "Charlie"}), // 2
+            json!({"name": "Diana"}),   // 3
+            json!({"name": "Eve"}),     // 4
+            json!({"name": "Frank"}),   // 5
+        ];
+        let doc_ids: Vec<i64> = (0..6).collect();
+        create(path, &metadata, &doc_ids).unwrap();
+
+        // Delete Bob(1) and Diana(3); -5 and 999 are not present and must be ignored.
+        let deleted = delete(path, &[1, 3, -5, 999]).unwrap();
+        assert_eq!(deleted, 2, "only the two present ids are removed");
+        assert_eq!(count(path).unwrap(), 4);
+
+        // Survivors keep order and renumber contiguously 0..3 with no collisions.
+        let rows = get(path, None, &[], None).unwrap();
+        let got: Vec<(i64, String)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r["_subset_"].as_i64().unwrap(),
+                    r["name"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, "Alice".into()),
+                (1, "Charlie".into()),
+                (2, "Eve".into()),
+                (3, "Frank".into()),
+            ]
+        );
     }
 
     #[test]

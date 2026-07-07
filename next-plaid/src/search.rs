@@ -89,6 +89,59 @@ fn colbert_score(query: &ArrayView2<f32>, doc: &ArrayView2<f32>) -> f32 {
     maxsim::maxsim_score(query, doc)
 }
 
+/// The query prepared once for Stage-2 scoring, in the representation the index
+/// requires. Building this once (rather than per document) hoists query-side
+/// work — int8 quantization for binary indexes — out of the per-candidate loop.
+enum ScoreQuery<'a> {
+    /// Binary index: query kept as int8 codes for the asymmetric int8 x 1-bit
+    /// MaxSim kernel (the `q·b = 2·Σ_{b=+1} q − Σ q` identity, integer adds only).
+    Binary(crate::binary::QueryI8),
+    /// Float / residual index: the caller's full-precision query, borrowed —
+    /// standard ColBERT MaxSim needs no per-query preparation.
+    Float(&'a Array2<f32>),
+}
+
+/// Prepare the query for the index's Stage-2 scoring path, once per search.
+fn prepare_score_query<'a>(
+    index: &crate::index::MmapIndex,
+    query: &'a Array2<f32>,
+) -> ScoreQuery<'a> {
+    if index.metadata.binary {
+        ScoreQuery::Binary(crate::binary::quantize_query_i8(&query.view()))
+    } else {
+        ScoreQuery::Float(query)
+    }
+}
+
+/// Exact MaxSim of the prepared query against document `doc_id`.
+///
+/// For binary indexes this scores the int8 query directly against the document's
+/// stored 1-bit signs via the asymmetric `2P − T` kernel — no decompression to
+/// float. Otherwise the residual codes are decompressed and scored with
+/// full-precision ColBERT MaxSim.
+fn exact_doc_score(
+    index: &crate::index::MmapIndex,
+    query: &ScoreQuery,
+    doc_id: usize,
+) -> Option<f32> {
+    match query {
+        ScoreQuery::Binary(q8) => {
+            let start = index.doc_offsets[doc_id];
+            let end = index.doc_offsets[doc_id + 1];
+            let doc_bits = index.mmap_residuals.slice_rows(start, end);
+            Some(crate::binary::maxsim_binary_i8(
+                q8,
+                &doc_bits,
+                index.codec.embedding_dim(),
+            ))
+        }
+        ScoreQuery::Float(q) => {
+            let doc = index.get_document_embeddings(doc_id).ok()?;
+            Some(colbert_score(&q.view(), &doc.view()))
+        }
+    }
+}
+
 /// Wrapper for f32 to use with BinaryHeap (implements Ord)
 #[derive(Clone, Copy, PartialEq)]
 struct OrdF32(f32);
@@ -476,16 +529,17 @@ pub fn search_one_mmap(
         });
     }
 
-    // Compute exact scores with decompressed embeddings
-    // Use chunked processing to limit concurrent memory from parallel decompression
+    // Compute exact scores. Binary indexes score against an int8 query; the
+    // full-precision query is used for the float (residual) path.
+    // Chunked processing limits concurrent memory from parallel decompression.
+    let exact_query = prepare_score_query(index, query);
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
         .par_chunks(DECOMPRESS_CHUNK_SIZE)
         .flat_map(|chunk| {
             chunk
                 .iter()
                 .filter_map(|&doc_id| {
-                    let doc_embeddings = index.get_document_embeddings(doc_id as usize).ok()?;
-                    let score = colbert_score(&query.view(), &doc_embeddings.view());
+                    let score = exact_doc_score(index, &exact_query, doc_id as usize)?;
                     Some((doc_id, score))
                 })
                 .collect::<Vec<_>>()
@@ -600,16 +654,17 @@ fn search_one_mmap_batched(
         });
     }
 
-    // Compute exact scores with decompressed embeddings
-    // Use chunked processing to limit concurrent memory from parallel decompression
+    // Compute exact scores. Binary indexes score against an int8 query; the
+    // full-precision query is used for the float (residual) path.
+    // Chunked processing limits concurrent memory from parallel decompression.
+    let exact_query = prepare_score_query(index, query);
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
         .par_chunks(DECOMPRESS_CHUNK_SIZE)
         .flat_map(|chunk| {
             chunk
                 .iter()
                 .filter_map(|&doc_id| {
-                    let doc_embeddings = index.get_document_embeddings(doc_id as usize).ok()?;
-                    let score = colbert_score(&query.view(), &doc_embeddings.view());
+                    let score = exact_doc_score(index, &exact_query, doc_id as usize)?;
                     Some((doc_id, score))
                 })
                 .collect::<Vec<_>>()

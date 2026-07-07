@@ -279,6 +279,47 @@ pub fn pad_sequences(sequences: &[Array2<f32>], pad_value: f32) -> (Array2<f32>,
     (padded, lengths)
 }
 
+/// True when this process is an x86_64 binary being translated by Rosetta 2 on
+/// Apple Silicon — a silently slow configuration: the SIMD kernels dispatch to
+/// x86 paths under emulation instead of native NEON/SDOT (measured ~7× slower
+/// for binary MaxSim). Callers (CLIs, servers) should surface a one-time
+/// warning suggesting a native arm64 build.
+///
+/// Always `false` for native builds; the sysctl only exists on macOS and only
+/// reports 1 for translated processes.
+pub fn running_under_rosetta() -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        use std::os::raw::{c_char, c_int, c_void};
+        extern "C" {
+            fn sysctlbyname(
+                name: *const c_char,
+                oldp: *mut c_void,
+                oldlenp: *mut usize,
+                newp: *mut c_void,
+                newlen: usize,
+            ) -> c_int;
+        }
+        let mut val: c_int = 0;
+        let mut len = std::mem::size_of::<c_int>();
+        let name = c"sysctl.proc_translated";
+        let ok = unsafe {
+            sysctlbyname(
+                name.as_ptr(),
+                &mut val as *mut c_int as *mut c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        ok == 0 && val == 1
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

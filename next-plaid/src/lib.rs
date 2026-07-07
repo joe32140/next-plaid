@@ -12,6 +12,7 @@ extern crate blas_src;
 #[cfg(feature = "openblas")]
 extern crate openblas_src;
 
+pub mod binary;
 pub mod codec;
 #[cfg(feature = "_cuda")]
 pub mod cuda;
@@ -20,6 +21,8 @@ pub mod embeddings;
 pub mod error;
 pub mod filtering;
 pub mod index;
+#[doc(hidden)] // benchmarking comparator tier; not part of the stability surface
+pub mod int8;
 pub mod kmeans;
 pub mod maxsim;
 pub mod mmap;

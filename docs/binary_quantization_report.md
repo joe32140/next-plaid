@@ -919,3 +919,37 @@ against nbits=4. Binarizability is a property of checkpoint × dimension;
 given a binarization-aware 128-dim checkpoint, `binary: true` dominates the
 residual codec on every axis measured here — quality within 1.3%, 3.8×
 faster queries, 2.6× smaller index, same build cost.
+
+## 14. NE33 — base LateOn ablation: what the regularization buys (2026-07-07)
+
+Same harness, `lightonai/LateOn` (no regularization, dim=128):
+
+| scheme | index (MB) | B/token | iso NDCG@10 | dep NDCG@10 | mean ms |
+|---|---:|---:|---:|---:|---:|
+| residual nbits=4 | 185.0 | 64 | 0.7639 | 0.7639 | 38.3* |
+| residual nbits=2 | 108.7 | 32 | 0.7595 | 0.7595 | 19.3 |
+| binary int8×1-bit | 70.6 | 16 | 0.7451 | 0.7451 | 5.7 |
+
+\*residual-nbits4 profiled concurrently with the numpy verification job;
+its latency is contaminated by core contention — NE32's ~21 ms is the clean
+number (the binary and nbits=2 rows ran after contention ended and match
+NE32 within noise). Numpy brute force: float 0.7626, binary-doc 0.7449 →
+97.7% retention, again matching the rust pipeline (97.5%).
+
+The ablation, LateOn base → LateOn-regularized (identical float ceiling,
+0.7626 vs 0.7629):
+
+| | base | regularized | delta |
+|---|---:|---:|---:|
+| binary NDCG@10 (deployed) | 0.7451 | 0.7513 | +0.62pt |
+| retention vs residual4 | 97.5% | 98.7% | +1.2pt |
+
+Two readings. First, the base 128-dim LateOn checkpoint is *already* highly
+binarizable — 97.5% retention with no binarization-aware training — so the
+NE31 collapse (6%) is attributable to the checkpoint family × dim=48, not to
+missing regularization per se; capacity comes first, training pressure
+second (consistent with §8.1's two-ledger account). Second, the
+regularization closes ~1/3 of the remaining gap to the float ceiling for
+free — float NDCG is unchanged (0.7626 → 0.7629) — so it is a strict
+improvement for anyone intending to deploy `binary: true`, just not the
+difference between working and broken at this dimension.

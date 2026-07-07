@@ -431,6 +431,7 @@ its 55 live axes on ArguAna).
 | H34 | Edge-model saturation is partly *imported* by Stella-style L2 embedding distillation (‖y−ŷ‖² is offset-sensitive, unlike score-KD) | **Supported (mechanism live, class-general)** | StellaV5 μ-frac 0.644 / 6% dead; bge-base 0.794 / 19% — offset-heavy is the single-vector norm; L2 imports it, downstream KD-only provably can't remove it; source attribution (Stella vs Ettin default, NE24) open (NE29) |
 | H35 | Training *through* the codec (α-STE inside the contrastive CE — the BPR pairing) improves saturated-checkpoint **rescue** beyond repulsion alone at matched budget | **Supported (small, uniform; replicated)** | NE28: best arm on both subjects carries STE (+2–4 pts); side flips with headroom (two-sided at 48d; one-sided at 128d; the 48d one-sided harm was WEIGHT not side — α=0.1 ≈ control, NE30a). Under the FULL recipe (mixture+self-KD), doc-STE still wins 11/12 cells vs the no-STE control and replicates at seed 43 within ±0.007 (NE30b/c/d) |
 | H36 | The KD anchor's float preservation is limited by anchor-data **domain coverage**, not KD weight | **Supported** | doubling KD:IB from 1:2 to 1:1 leaves SciFact float drift unchanged (−0.025 → −0.028) while gates pass wherever the mixture covers the domain; the seven LightOn subsets contain no scientific text (NE30b′) |
+| H37 | Code-aware training transfers **across codecs** (robustness is a property of where signal sits, not of the specific code trained through) | **Supported (n=1 direction, FDE→sign)** | LateOn-regularized, trained only through MUVERA/SMVE SimHash projections, posts fleet-best axis-aligned sign robustness (NF i8×b 0.3742, 97.0% ret) it was never trained for; reciprocal sign→FDE direction untested (NE33) |
 
 ---
 
@@ -722,7 +723,64 @@ drop** (gate: variant float within 0.010 of base on every eval corpus).
   program's closing result.
 - **Caveat for release:** all NE30 runs were eval-only (`save_strategy="no"`); the
   validated recipe is frozen but the variant *weights* were not persisted. A
-  save+push rerun costs ~$1 (32m) / ~$4 (LFM).
+  save+push rerun costs ~$1 (32m) / ~$4 (LFM). (Fixed: `save_to` now persists
+  weights to the volume before eval; the v2 ship-run uses it.)
+- **v2 ship-run (bs64, lr 2e-5, GTE-teacher KD, 50k mixture; H100, weights SAVED
+  to `volume:/cache/variants/edge-32m-binary-v2`):** float **above base on 2/4**
+  (NF +0.0047, **ArguAna +0.0062** — the corpus where base is weakest), SciDocs
+  −0.0053 PASS, SciFact −0.0117 (narrow FAIL, but the external teacher **halved**
+  v1's −0.025 drift). i8×b 0.3270/0.6888/0.2957/0.1433 (ret 87–94%); geometry
+  dead 0/64, sign_cos 0.803 (fourth checkpoint to converge on the v2 signature).
+  vs v1 (bs16/self-KD/20k): v2 wins float everywhere and ArguAna binary
+  (+0.009), loses NF binary (0.3270 vs 0.3397) — teacher/batch/volume changed
+  together (the disentangling bs16-v2 arm OOM'd and was not rerun for budget), so
+  the NF-binary dip is unattributed. Registered "float>base on ≥3/4" prediction:
+  MISSED (2/4); magnitudes half of predicted. "Outperform its own" verdict:
+  **partially achieved, teacher-limited** — next lever is a stronger teacher
+  (cross-encoder rerank of the same tuples), not more batch.
+
+## 11.6 NE33 — audit of `lightonai/LateOn-regularized`: cross-codec transfer in the wild (2026-07-07)
+
+LightOn released a regularized LateOn trained for **MUVERA/SMVE** robustness
+([blog](https://huggingface.co/blog/lightonai/lateon-regularization)): loss =
+`(1−α)·MaxSim contrastive + α·contrastive on the projected (FDE) representations`,
+STE through the projection, fixed random projections, cheap supervised stage.
+Structurally, that is exactly our α-recipe with the codec swapped: **sign() →
+SimHash-bucketed FDE**. Their reported result: MUVERA rk=0 NDCG 2.89 → 40.80 with
+PLAID held (55.28 → 55.72); geometry MORE anisotropic (corpus stable rank −26%,
+top-eigenvalue share 21.3 → 27.0%) — "the model learned which dimensions to
+concentrate into."
+
+Our fleet probe of the released checkpoint (nfcorpus/arguana, exhaustive MaxSim):
+
+| | float | i8×i8 | i8×b | b×b | ret (÷i8×i8) |
+|---|--:|--:|--:|--:|--:|
+| NFCorpus | 0.3836 | 0.3857 | **0.3742** | 0.3593 | **97.0%** |
+| ArguAna | 0.3531 | **0.3280** | 0.2946 | 0.2322 | 89.8% (83.4% vs float) |
+
+sign-health: dead 18/128 (14%), mean|balance| 0.506, **effR 1.40**, sign_cos 0.431.
+
+Findings:
+1. **Cross-codec transfer (new — they did not measure sign quantization):**
+   training through the SimHash/FDE code also bought axis-aligned **sign**
+   robustness — 97.0% NF retention at LateOn-level float, the fleet-best absolute
+   i8×b we have measured (0.3742 > v2's 0.3229, > our best rescue 0.3487-LFM).
+   Trained code-robustness generalizes across codecs (direction tested: FDE→sign).
+2. **Law 3 in the wild:** effR 1.40 is the most collapsed spectrum we have ever
+   measured — below raw ModernBERT streams — on the best binarizer in the fleet.
+   Unsupervised spectral scalars do not decide binary fate (H3, H24 vindicated at
+   production scale); their "learned which dimensions to concentrate into" is the
+   two-ledgers insight, independently derived.
+3. **New issue for them: int8 QUERY quantization regresses on ArguAna** —
+   i8×i8 0.3280 vs float 0.3531 (−7.1%), unique in the fleet (int8 lossless
+   everywhere else, all sessions). Their blog doesn't cover quantization; worth
+   reporting upstream before anyone runs it behind an int8-query pipeline.
+4. **The recipe family closes:** BPR 2021 (STE×contrastive through sign,
+   single-vector) ≡ our α-STE / NE28-NE30 (sign, multi-vector) ≡ LightOn
+   MUVERA-STE (FDE, multi-vector). "Train through the code you serve" now has
+   three independent instances — and the robustness it buys is not codec-local.
+   Proposed reciprocal test (H37): evaluate our sign-trained NE30 variants under
+   MUVERA — does sign→FDE transfer hold in the other direction?
 - **Infra note:** three run-pairs died to client-side cancellations during a local
   network flake (03:2x–04:2x UTC); cancellations do NOT trigger Modal `retries`.
   Now standard: `modal run --detach`, RESULT dict logged remotely, base-eval +
@@ -832,3 +890,32 @@ Repro: `python scripts/embed_beir_colbert.py --data <scifact> --out <bundle>
 --model mixedbread-ai/mxbai-edge-colbert-v0-17m` then
 `cargo run --release --features accelerate --example binary_ndcg -- <bundle>`
 (add `--target aarch64-apple-darwin` on Apple Silicon with an x86 toolchain).
+
+## 13. NE32 — same pipeline, LateOn-regularized (dim=128): the counterpoint (2026-07-07)
+
+Identical dataset and harness as NE31 (SciFact, 5,183 docs, 300 judged
+queries), only the checkpoint changed: `lightonai/LateOn-regularized`
+(dim=128, 1.19M doc tokens), embedded via pylate 1.4. Apple M4, native
+aarch64 + Accelerate.
+
+| scheme | build (s) | index (MB) | B/token | vs f32 | iso NDCG@10 | dep NDCG@10 | mean ms | p50 | p95 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| residual nbits=4 | 45.1 | 184.8 | 64 | 8× | 0.7615 | 0.7615 | 21.1 | 20.7 | 25.2 |
+| residual nbits=2 | 50.2 | 108.5 | 32 | 16× | 0.7605 | 0.7605 | 18.8 | 18.2 | 22.2 |
+| binary int8×1-bit | 48.2 | 70.4 | 16 | 32× | 0.7513 | 0.7513 | **5.6** | 5.3 | 8.9 |
+
+Independent numpy brute force: float exhaustive 0.7629, sign-binarized docs
+0.7512 → **98.5% retention**, matching the rust pipeline (98.7%) to within
+rounding — the deployed two-stage keeps 100% of the isolated ceiling for
+every scheme on this corpus.
+
+Side-by-side with NE31, this is the thesis in one table: the identical codec
+and identical search machinery go from **6% retention / no speedup**
+(edge-17m, dim=48, no binarization pressure) to **98.7% retention / 3.8×
+end-to-end speedup** (LateOn-regularized, dim=128). At dim=128 the fused
+NEON SDOT kernel engages and Stage-2 drops from decompress+GEMM (21.1 ms) to
+integer 2P−T on the stored bits (5.6 ms), while the index shrinks 2.6×
+against nbits=4. Binarizability is a property of checkpoint × dimension;
+given a binarization-aware 128-dim checkpoint, `binary: true` dominates the
+residual codec on every axis measured here — quality within 1.3%, 3.8×
+faster queries, 2.6× smaller index, same build cost.

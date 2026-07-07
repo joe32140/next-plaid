@@ -693,6 +693,7 @@ fn run_index_stage(
                         &chunk.embeddings,
                         &codec_artifacts.codec,
                         coding_force_cpu,
+                        coding_config.binary,
                     )?;
                     encoded_chunks.push(encoded);
                 }

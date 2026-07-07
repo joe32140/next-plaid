@@ -59,6 +59,16 @@ fn main() -> Result<()> {
     // highlighter agree on whether to emit ANSI escapes.
     color::init(cli.color);
 
+    // An x86_64 build translated by Rosetta 2 runs the emulated x86 SIMD
+    // kernels instead of native NEON — measured ~7x slower scoring. Stderr
+    // only, so piped/JSON output stays clean.
+    if next_plaid::utils::running_under_rosetta() {
+        eprintln!(
+            "[colgrep] warning: running under Rosetta 2 emulation on Apple Silicon; \
+             install the native arm64 build (or an aarch64 Rust toolchain) for ~7x faster search"
+        );
+    }
+
     let env_mode = env_acceleration_mode()?;
     let acceleration_mode = if cli.force_cpu {
         AccelerationMode::ForceCpu

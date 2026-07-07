@@ -784,6 +784,15 @@ pub fn update_index(
     let metadata_path = index_dir.join("metadata.json");
     let metadata = Metadata::load_from_path(index_dir)?;
 
+    // Incremental update re-encodes through the residual codec; appending
+    // residual rows to a 1-bit sign store would corrupt it. Guarded here (the
+    // root of every update entry point) so no wrapper can bypass it.
+    if metadata.binary {
+        return Err(Error::Update(
+            "incremental update is not yet supported for binary indexes; rebuild instead".into(),
+        ));
+    }
+
     let num_existing_chunks = metadata.num_chunks;
     let old_num_documents = metadata.num_documents;
     let old_total_embeddings = metadata.num_embeddings;
@@ -1102,6 +1111,9 @@ pub fn update_index(
         num_documents: total_num_documents,
         embedding_dim,
         next_plaid_compatible: true,
+        // update_index rejects binary indexes on entry, so this is always a
+        // residual index.
+        binary: false,
     };
 
     emit_update_progress("metadata_write", "writing index metadata");

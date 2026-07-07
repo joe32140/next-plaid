@@ -784,3 +784,51 @@ isotropy PR/eff-rank, sign_cos). Deployed = next-plaid PLAID. Retention = int8×
 | base (LateOn-unsup) | 0.7398 | 0.3570 | 0.2431 | 0.1893 |
 | control (+contrastive) | 0.7400 | 0.3719 | 0.2643 | 0.1910 |
 | treatment (+STE α=0.4) | 0.7396 | 0.3625 | 0.2820 | 0.1935 |
+
+## 12. NE31 — SciFact × mxbai-edge-colbert-v0-17m: end-to-end pipeline profile (2026-07-07)
+
+First full-pipeline measurement on real BEIR data with a low-dim edge model,
+run on the next-plaid index itself (not the python decomposition). Setup:
+SciFact (5,183 docs, 1.38M doc tokens, 300 judged queries), embedded once
+with `mixedbread-ai/mxbai-edge-colbert-v0-17m` (dim=48) via
+`scripts/embed_beir_colbert.py`; three index configs profiled by
+`examples/binary_ndcg.rs` on an Apple M4 (native aarch64 + Accelerate).
+Build = `create_with_kmeans` wall clock; latency = per-query `search` in the
+deployed regime (top_k=10, PLAID defaults), after one warmup query.
+
+| scheme | build (s) | index (MB) | B/token | vs f32 | iso NDCG@10 | dep NDCG@10 | mean ms | p50 | p95 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| residual nbits=4 | 29.1 | 99.0 | 24 | 8× | 0.3818 | 0.3819 | 17.7 | 17.6 | 18.9 |
+| residual nbits=2 | 30.3 | 65.8 | 12 | 16× | 0.3859 | 0.3859 | 17.6 | 17.6 | 19.0 |
+| binary int8×1-bit | 30.7 | 49.2 | 6 | 32× | 0.0308 | 0.0322 | 19.8 | 19.8 | 21.3 |
+
+Independent verification (pure numpy, exhaustive brute force over all docs,
+no next-plaid code): float MaxSim NDCG@10 = 0.3675; sign-binarized docs =
+0.0233 → **6.3% retention**. The rust pipeline tracks both ends faithfully
+(residual ≈ float ceiling at ~104% of exhaustive due to int8-query rounding
+noise being negligible; binary matches the numpy collapse), so the failure is
+the quantizer on this model, not the search machinery.
+
+Reading through the capacity ledger of §8.1: dim=48 gives each token a
+48-bit budget — 2.7× less than the dim=128 models where the synthetic
+scaffold and the LateOn fleet sit — and this checkpoint was not trained with
+any binarization pressure. The collapse (6% retention vs ~99% synthetic at
+dim=128) is the strongest datapoint yet that binarizability is a property of
+the checkpoint × dimension, not of the codec: nbits=2 on the same embeddings
+retains 101% (0.386 vs 0.382 at nbits=4), so even 2-bit magnitude
+information rescues what signs alone cannot carry at this dimension.
+
+Practical takeaways: (1) do not default `binary: true` for dim<64 edge
+models without a binarization-aware checkpoint (§11.3's training recipes are
+the remedy to test — NE30's STE treatment is the natural candidate);
+(2) residual nbits=2 is the sweet spot for this model — 16× compression,
+retention ≥ nbits=4, same latency; (3) latency is flat across schemes here
+because dim=48 keeps the fused dim=128 kernels out of play and Stage-2 cost
+is dominated by the shared candidate pipeline — the binary row pays a small
+penalty on the per-pair fallback path, another argument for generalizing the
+fused kernels beyond dim=128 if edge models become a target.
+
+Repro: `python scripts/embed_beir_colbert.py --data <scifact> --out <bundle>
+--model mixedbread-ai/mxbai-edge-colbert-v0-17m` then
+`cargo run --release --features accelerate --example binary_ndcg -- <bundle>`
+(add `--target aarch64-apple-darwin` on Apple Silicon with an x86 toolchain).

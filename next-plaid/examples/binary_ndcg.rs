@@ -91,28 +91,56 @@ fn regime_params(deployed: bool, n_docs: usize) -> SearchParameters {
     }
 }
 
-/// Build an index with the given config and return (mean NDCG@10, bytes/token).
+/// Total bytes under a directory (index footprint on disk).
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            total += if p.is_dir() {
+                dir_size(&p)
+            } else {
+                entry.metadata().map(|m| m.len()).unwrap_or(0)
+            };
+        }
+    }
+    total
+}
+
+/// One quantization config, profiled end to end on a single index build.
+struct Profile {
+    name: &'static str,
+    build_s: f64,
+    index_bytes: u64,
+    bytes_per_token: usize,
+    iso_ndcg: f64,
+    dep_ndcg: f64,
+    /// Deployed-regime per-query search latency (ms): mean, p50, p95.
+    lat_mean: f64,
+    lat_p50: f64,
+    lat_p95: f64,
+}
+
+/// NDCG over judged queries; times each search call when `lat` is given.
 #[allow(clippy::too_many_arguments)]
-fn evaluate(
-    name: &str,
-    config: &IndexConfig,
+fn run_queries(
+    index: &MmapIndex,
     params: &SearchParameters,
-    docs: &[Array2<f32>],
     corpus_ids: &[String],
     queries: &[Array2<f32>],
     query_ids: &[String],
     qrels: &Qrels,
-) -> (f64, usize) {
-    let dir = std::env::temp_dir().join(format!("np_ndcg_{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    let index = MmapIndex::create_with_kmeans(docs, dir.to_str().unwrap(), config).unwrap();
-    let bytes_per_token = index.mmap_residuals.ncols();
-
+    mut lat: Option<&mut Vec<f64>>,
+) -> f64 {
     let mut sum_ndcg = 0.0;
     let mut counted = 0;
     for (q, qid) in queries.iter().zip(query_ids) {
         let Some(rels) = qrels.get(qid) else { continue };
+        let t = std::time::Instant::now();
         let result = index.search(q, params, None).unwrap();
+        if let Some(v) = lat.as_deref_mut() {
+            v.push(t.elapsed().as_secs_f64() * 1e3);
+        }
         let ranked: Vec<String> = result
             .passage_ids
             .iter()
@@ -121,8 +149,74 @@ fn evaluate(
         sum_ndcg += ndcg_at_k(&ranked, rels, 10);
         counted += 1;
     }
+    sum_ndcg / counted as f64
+}
+
+/// Build the index once (timed), measure its disk footprint, then run the
+/// isolated and deployed regimes on that same index, timing deployed searches.
+#[allow(clippy::too_many_arguments)]
+fn profile(
+    name: &'static str,
+    config: &IndexConfig,
+    docs: &[Array2<f32>],
+    corpus_ids: &[String],
+    queries: &[Array2<f32>],
+    query_ids: &[String],
+    qrels: &Qrels,
+    deployed_only: bool,
+) -> Profile {
+    let dir = std::env::temp_dir().join(format!("np_ndcg_{name}"));
     let _ = std::fs::remove_dir_all(&dir);
-    (sum_ndcg / counted as f64, bytes_per_token)
+
+    let t = std::time::Instant::now();
+    let index = MmapIndex::create_with_kmeans(docs, dir.to_str().unwrap(), config).unwrap();
+    let build_s = t.elapsed().as_secs_f64();
+    let index_bytes = dir_size(&dir);
+    let bytes_per_token = index.mmap_residuals.ncols();
+
+    let iso_ndcg = if deployed_only {
+        f64::NAN
+    } else {
+        run_queries(
+            &index,
+            &regime_params(false, docs.len()),
+            corpus_ids,
+            queries,
+            query_ids,
+            qrels,
+            None,
+        )
+    };
+
+    // Warm the deployed path once (lazy merges, page cache), then measure.
+    let dep_params = regime_params(true, docs.len());
+    let _ = index.search(&queries[0], &dep_params, None);
+    let mut lat = Vec::new();
+    let dep_ndcg = run_queries(
+        &index,
+        &dep_params,
+        corpus_ids,
+        queries,
+        query_ids,
+        qrels,
+        Some(&mut lat),
+    );
+    lat.sort_by(|a, b| a.total_cmp(b));
+    let pct = |p: f64| lat[((lat.len() - 1) as f64 * p) as usize];
+    let lat_mean = lat.iter().sum::<f64>() / lat.len() as f64;
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Profile {
+        name,
+        build_s,
+        index_bytes,
+        bytes_per_token,
+        iso_ndcg,
+        dep_ndcg,
+        lat_mean,
+        lat_p50: pct(0.5),
+        lat_p95: pct(0.95),
+    }
 }
 
 fn main() {
@@ -147,95 +241,110 @@ fn main() {
     let dim = docs[0].ncols();
     println!("docs={} queries={} dim={dim}\n", docs.len(), queries.len());
 
-    let base = IndexConfig {
-        nbits: 4,
+    let mk = |nbits: usize, binary: bool| IndexConfig {
+        nbits,
+        binary,
         seed: Some(42),
         ..Default::default()
-    };
-    let residual = IndexConfig {
-        binary: false,
-        ..base.clone()
-    };
-    let binary = IndexConfig {
-        binary: true,
-        ..base
     };
 
     // The exhaustive (probe-all) isolated pass is redundant when the Python
     // decomposition already gives that ceiling and is slow on big corpora, so
     // NDCG_DEPLOYED_ONLY=1 skips it and reports just the deployed PLAID number.
     let deployed_only = std::env::var("NDCG_DEPLOYED_ONLY").is_ok();
-    let f32_bytes = dim * 4;
-    println!(
-        "{:<22} {:>10} {:>10} {:>14} {:>10}",
-        "scheme", "isolated", "deployed", "doc bytes/tok", "vs f32"
-    );
 
-    // Each row: quantizer-isolated ceiling (probe all, no pruning) next to the
-    // deployed PLAID number (n_ivf_probe=8, n_full_scores=4096, pruning ON).
-    let retained = |name: &str, config: &IndexConfig| -> (f64, f64) {
-        let iso = if deployed_only {
-            f64::NAN
-        } else {
-            evaluate(
-                name,
-                config,
-                &regime_params(false, docs.len()),
-                &docs,
-                &corpus_ids,
-                &queries,
-                &query_ids,
-                &qrels,
-            )
-            .0
-        };
-        let (dep, bytes) = evaluate(
+    let configs: Vec<(&'static str, IndexConfig)> = vec![
+        ("residual-nbits4", mk(4, false)),
+        ("residual-nbits2", mk(2, false)),
+        ("binary-int8x1bit", mk(4, true)),
+    ];
+
+    let mut rows = Vec::new();
+    for (name, config) in &configs {
+        eprintln!("profiling {name} ...");
+        rows.push(profile(
             name,
             config,
-            &regime_params(true, docs.len()),
             &docs,
             &corpus_ids,
             &queries,
             &query_ids,
             &qrels,
-        );
-        println!(
-            "{name:<22} {iso:>10.4} {dep:>10.4} {bytes:>14} {:>9}x",
-            f32_bytes / bytes
-        );
-        (iso, dep)
-    };
+            deployed_only,
+        ));
+    }
 
-    let (res_iso, res_dep) = retained("residual (nbits=4)", &residual);
-    let (bin_iso, bin_dep) = retained("binary (int8 x 1-bit)", &binary);
-
+    let f32_bytes = dim * 4;
+    let total_tokens: usize = docs.iter().map(|d| d.nrows()).sum();
     println!(
-        "\nbinary retains {:.1}% (deployed) of residual NDCG@10",
-        100.0 * bin_dep / res_dep
+        "pipeline profile ({} docs, {} doc tokens, {} judged queries, dim={dim}):\n",
+        docs.len(),
+        total_tokens,
+        queries.len()
     );
-    if !deployed_only {
+    println!(
+        "{:<18} {:>9} {:>11} {:>9} {:>7} {:>10} {:>10} {:>8} {:>8} {:>8}",
+        "scheme",
+        "build(s)",
+        "index(MB)",
+        "B/token",
+        "vs f32",
+        "iso NDCG",
+        "dep NDCG",
+        "mean ms",
+        "p50 ms",
+        "p95 ms"
+    );
+    for r in &rows {
         println!(
-            "binary retains {:.1}% (isolated) of residual; deployed two-stage keeps \
-             {:.1}% (residual) / {:.1}% (binary) of the isolated ceiling",
-            100.0 * bin_iso / res_iso,
-            100.0 * res_dep / res_iso,
-            100.0 * bin_dep / bin_iso
+            "{:<18} {:>9.2} {:>11.2} {:>9} {:>6}x {:>10.4} {:>10.4} {:>8.2} {:>8.2} {:>8.2}",
+            r.name,
+            r.build_s,
+            r.index_bytes as f64 / 1e6,
+            r.bytes_per_token,
+            f32_bytes / r.bytes_per_token,
+            r.iso_ndcg,
+            r.dep_ndcg,
+            r.lat_mean,
+            r.lat_p50,
+            r.lat_p95
         );
     }
 
-    // Machine-readable line for the Modal harness to parse (NDCG_JSON=1).
-    if std::env::var("NDCG_JSON").is_ok() {
+    let res4 = &rows[0];
+    let bin = &rows[2];
+    println!(
+        "\nbinary retains {:.1}% (deployed) of residual-nbits4 NDCG@10 at {:.1}x less doc storage",
+        100.0 * bin.dep_ndcg / res4.dep_ndcg,
+        res4.bytes_per_token as f64 / bin.bytes_per_token as f64
+    );
+    if !deployed_only {
         println!(
-            "NDCG_JSON {{\"docs\":{},\"queries\":{},\"dim\":{},\
-             \"residual_isolated\":{:.6},\"residual_deployed\":{:.6},\
-             \"binary_isolated\":{:.6},\"binary_deployed\":{:.6}}}",
+            "binary retains {:.1}% (isolated); deployed two-stage keeps {:.1}% (residual4) / {:.1}% (binary) of the isolated ceiling",
+            100.0 * bin.iso_ndcg / res4.iso_ndcg,
+            100.0 * res4.dep_ndcg / res4.iso_ndcg,
+            100.0 * bin.dep_ndcg / bin.iso_ndcg
+        );
+    }
+
+    // Machine-readable line (NDCG_JSON=1).
+    if std::env::var("NDCG_JSON").is_ok() {
+        let json_rows: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "{{\"name\":\"{}\",\"build_s\":{:.3},\"index_bytes\":{},\"bytes_per_token\":{},\"iso_ndcg\":{:.6},\"dep_ndcg\":{:.6},\"lat_mean_ms\":{:.3},\"lat_p50_ms\":{:.3},\"lat_p95_ms\":{:.3}}}",
+                    r.name, r.build_s, r.index_bytes, r.bytes_per_token,
+                    r.iso_ndcg, r.dep_ndcg, r.lat_mean, r.lat_p50, r.lat_p95
+                )
+            })
+            .collect();
+        println!(
+            "NDCG_JSON {{\"docs\":{},\"queries\":{},\"dim\":{},\"schemes\":[{}]}}",
             docs.len(),
             queries.len(),
             dim,
-            res_iso,
-            res_dep,
-            bin_iso,
-            bin_dep
+            json_rows.join(",")
         );
     }
 }

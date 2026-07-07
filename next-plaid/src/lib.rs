@@ -12,6 +12,7 @@ extern crate blas_src;
 #[cfg(feature = "openblas")]
 extern crate openblas_src;
 
+pub mod binary;
 pub mod codec;
 #[cfg(feature = "_cuda")]
 pub mod cuda;

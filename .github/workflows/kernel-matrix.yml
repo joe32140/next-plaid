@@ -1,0 +1,113 @@
+name: Kernel Matrix
+
+# Cross-platform correctness + microbenchmark matrix for the asymmetric
+# binary-quantization kernels (lightonai/next-plaid#155).
+#
+# Each job runs the full next-plaid test suite in release mode (the SIMD
+# kernels are pinned bit-exact to a scalar integer reference, so this is the
+# per-architecture correctness gate) and then examples/kernel_bench, whose
+# force_* entry points bench every kernel the host ISA supports.
+#
+# Runner ISA coverage:
+#   ubuntu-24.04       x86_64   AVX2 SAD guaranteed; AVX-512 VNNI is a runner
+#                               lottery (Xeon 8370C: yes / EPYC 7763: no),
+#                               hence two draws
+#   ubuntu-24.04-arm   aarch64  NEON SDOT (Neoverse, dotprod)
+#   macos-latest       aarch64  NEON SDOT (Apple Silicon) + Accelerate BLAS
+#   windows-latest     x86_64   AVX2 SAD + MSVC build check (allowed to fail)
+
+on:
+  push:
+    branches: [ci-kernel-matrix]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  kernels:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86-draw1
+            os: ubuntu-24.04
+            flags: --features openblas
+            experimental: false
+          - name: linux-x86-draw2
+            os: ubuntu-24.04
+            flags: --features openblas
+            experimental: false
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            flags: --features openblas
+            experimental: false
+          - name: macos-arm64
+            os: macos-latest
+            flags: --features accelerate
+            experimental: false
+          - name: windows-x86
+            os: windows-latest
+            flags: ""
+            experimental: true
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install OpenBLAS
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - name: CPU / ISA info
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux)
+              CPU=$(lscpu | sed -n 's/Model name:[[:space:]]*//p' | head -1)
+              ISA=$(grep -o -w -E 'avx2|avx512f|avx512vnni|asimddp' /proc/cpuinfo | sort -u | tr '\n' ' ')
+              ;;
+            macOS)
+              CPU=$(sysctl -n machdep.cpu.brand_string)
+              ISA=$(sysctl -n hw.optional.arm.FEAT_DotProd 2>/dev/null | sed 's/^1$/dotprod/')
+              ;;
+            Windows)
+              CPU=$(pwsh -NoProfile -Command '(Get-CimInstance Win32_Processor).Name')
+              ISA="(see kernel_bench: which fused kernels report)"
+              ;;
+          esac
+          echo "CPU: $CPU"
+          echo "ISA: $ISA"
+          echo "arch: $(rustc -vV | sed -n 's/host: //p')"
+          {
+            echo "### ${{ matrix.name }} — $CPU"
+            echo ""
+            echo "ISA: \`${ISA:-n/a}\` · host: \`$(rustc -vV | sed -n 's/host: //p')\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Correctness — test suite in release (kernels pinned to scalar reference)
+        shell: bash
+        run: cargo test -p next-plaid --release ${{ matrix.flags }}
+
+      - name: kernel_bench
+        shell: bash
+        run: |
+          cargo run --release -p next-plaid --example kernel_bench ${{ matrix.flags }} | tee bench.txt
+          {
+            echo '```'
+            cat bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload bench output
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-bench-${{ matrix.name }}
+          path: bench.txt

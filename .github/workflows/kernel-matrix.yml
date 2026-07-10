@@ -96,10 +96,15 @@ jobs:
         shell: bash
         run: cargo test -p next-plaid --release ${{ matrix.flags }}
 
-      - name: kernel_bench
+      - name: kernel_bench (dim sweep)
         shell: bash
         run: |
-          cargo run --release -p next-plaid --example kernel_bench ${{ matrix.flags }} | tee bench.txt
+          # 48/64/96/128: dims real ColBERT models ship at; 256: the fused
+          # kernels' monomorphization boundary (G=4 zmm / NG=8 ymm / C=16).
+          for d in 48 64 96 128 256; do
+            cargo run --release -p next-plaid --example kernel_bench ${{ matrix.flags }} -- "$d" | tee -a bench.txt
+            echo "" >> bench.txt
+          done
           {
             echo '```'
             cat bench.txt

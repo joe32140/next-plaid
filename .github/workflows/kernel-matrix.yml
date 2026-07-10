@@ -71,7 +71,7 @@ jobs:
           case "$RUNNER_OS" in
             Linux)
               CPU=$(lscpu | sed -n 's/Model name:[[:space:]]*//p' | head -1)
-              ISA=$(grep -o -w -E 'avx2|avx512f|avx512vnni|asimddp' /proc/cpuinfo | sort -u | tr '\n' ' ')
+              ISA=$(grep -o -w -E 'avx2|avx512f|avx512_vnni|asimddp' /proc/cpuinfo | sort -u | tr '\n' ' ')
               ;;
             macOS)
               CPU=$(sysctl -n machdep.cpu.brand_string)

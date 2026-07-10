@@ -15,9 +15,10 @@
 //! Scoring kernels (all exact w.r.t. the stored signs; benchmarked in
 //! `examples/kernel_bench.rs`):
 //!   * [`maxsim_binary_i8`] — the search-path default. Dispatches to a fused
-//!     doc-token-outer kernel for `dim == 128` (AVX-512 VNNI `vpdpbusd` or
-//!     AVX2 masked-SAD on x86_64, SDOT on aarch64), else a per-pair bit-native
-//!     `2P − T` SIMD dot (NEON / AVX2 / scalar).
+//!     doc-token-outer kernel for byte-aligned dims (`dim % 8 == 0`, up to
+//!     256): AVX-512 VNNI `vpdpbusd` or AVX2 masked-SAD on x86_64, SDOT on
+//!     aarch64. Ragged or larger dims take a per-pair bit-native `2P − T`
+//!     SIMD dot (NEON / AVX2 / scalar).
 //!   * [`maxsim_binary`] — decode to +/-1 f32 then BLAS GEMM; reference only.
 
 use ndarray::{Array2, ArrayView2, Axis};
@@ -38,15 +39,19 @@ pub struct QueryI8 {
     /// Per-row sum of the int8 codes — the `T` in the `2P − T` identity.
     /// Hoisted here so no kernel recomputes it per candidate document.
     pub sums: Vec<i32>,
-    /// Row-major biased codes (`x ^ 0x80`, i.e. `x + 128` viewed as `u8`) —
+    /// Row-major biased codes (`x ^ 0x80`, i.e. `x + 128` viewed as `u8`) at a
+    /// row stride of `dim` rounded up to 32 lanes, zero-filled beyond `dim` —
     /// the query layout consumed by the AVX2 masked-SAD kernel, where the sum
-    /// of selected biased bytes is `P + 128 · popcount(doc bits)`.
+    /// of selected biased bytes is `P + 128 · popcount(doc bits)`. Padding
+    /// lanes are never selected (their doc bits are zero-extended), so the
+    /// fill value cannot reach the score.
     pub biased: Vec<u8>,
-    /// Plane-major query codes (`planes[qi*128 + p*16 + k] = values[qi][k*8+p]`)
-    /// — the layout matching `extract_planes_128`'s doc-side expansion,
-    /// consumed by the fused NEON SDOT kernel.
-    /// Populated only for `dim == 128`; empty otherwise.
-    pub planes: Vec<i8>,
+    /// Row-major signed codes at a row stride of `dim` rounded up to 64 lanes,
+    /// zero-filled beyond `dim` — the query layout consumed by the fused
+    /// AVX-512 VNNI and NEON SDOT kernels, whose vector loads read whole
+    /// 64-/16-lane groups. Zero padding keeps partial tail groups exact: a
+    /// padding lane contributes `anything · 0 = 0`.
+    pub padded: Vec<i8>,
 }
 
 /// Quantize a query to symmetric per-row int8, keeping the integer codes.
@@ -73,27 +78,38 @@ pub fn quantize_query_i8(query: &ArrayView2<f32>) -> QueryI8 {
     let sums = (0..n)
         .map(|i| v[i * dim..(i + 1) * dim].iter().map(|&x| x as i32).sum())
         .collect();
-    let biased = v.iter().map(|&x| (x as u8) ^ 0x80).collect();
-    let planes = if dim == 128 {
-        let mut p = vec![0i8; n * 128];
-        for qi in 0..n {
-            for pl in 0..8 {
-                for k in 0..16 {
-                    p[qi * 128 + pl * 16 + k] = v[qi * 128 + k * 8 + pl];
-                }
-            }
+    let bs = biased_stride(dim);
+    let ps = padded_stride(dim);
+    let mut biased = vec![0u8; n * bs];
+    let mut padded = vec![0i8; n * ps];
+    for i in 0..n {
+        for (d, &x) in v[i * dim..(i + 1) * dim].iter().enumerate() {
+            biased[i * bs + d] = (x as u8) ^ 0x80;
+            padded[i * ps + d] = x;
         }
-        p
-    } else {
-        Vec::new()
-    };
+    }
     QueryI8 {
         values,
         scales,
         sums,
         biased,
-        planes,
+        padded,
     }
+}
+
+/// Row stride, in lanes, of [`QueryI8::biased`]: `dim` rounded up to the
+/// 32-lane ymm groups the AVX2 masked-SAD kernel loads.
+#[inline]
+fn biased_stride(dim: usize) -> usize {
+    dim.div_ceil(32) * 32
+}
+
+/// Row stride, in lanes, of [`QueryI8::padded`]: `dim` rounded up to the
+/// 64-lane zmm groups the AVX-512 VNNI kernel loads (also a multiple of the
+/// NEON kernel's 16-lane chunks).
+#[inline]
+fn padded_stride(dim: usize) -> usize {
+    dim.div_ceil(64) * 64
 }
 
 /// Dot product of an int8 query token against one packed ±1 document token,
@@ -283,38 +299,97 @@ fn dot_pm1(q: &[i8], t: i32, bits: &[u8], dim: usize) -> i32 {
     }
 }
 
-/// AVX-512 VNNI fused MaxSim for `dim == 128`.
+/// Little-endian zero-extended load of packed bytes `8g..8g+8` of one doc
+/// token's row — the 64 sign bits of dim group `g`. Bytes past the row are
+/// zero-extended; a cleared bit selects nothing, so tail groups stay exact.
 ///
-/// Doc-token-outer loop: each token's 128 sign bits are expanded ONCE, in
-/// registers, to two zmm vectors of `0/1` bytes (broadcast + `pshufb` +
-/// `vptestmb` + `maskz_mov` — ~10 instructions), amortized over every query
-/// token. Scoring is two `vpdpbusd` (u8 × i8 dot-accumulate — the x86 twin of
-/// the NEON SDOT in mixedbread's kernel): `P = Σ mask_d · q_d`, `score = 2P − T`.
-/// Doc tokens go in blocks of 4 so the horizontal reductions collapse into
-/// `phaddd` pairs and the per-query running max stays vectorized (`pmaxsd`).
+/// This runs once per group per doc token, so whole groups must compile to a
+/// single unaligned load and the tail group to a shifted overlapping load —
+/// the safe-slice route (`get` + `try_into`) round-trips through a stack
+/// buffer (or a `memcpy` call), costing a store-forward per group per token.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn group_bits_u64(row: &[u8], g: usize) -> u64 {
+    let off = g * 8;
+    let len = row.len();
+    if off + 8 <= len {
+        // SAFETY: in bounds for 8 bytes by the check above.
+        unsafe { (row.as_ptr().add(off) as *const u64).read_unaligned() }
+    } else if len >= 8 {
+        // Tail group: read the row's LAST 8 bytes (in bounds, overlapping the
+        // previous group) and shift byte `off` down to bit 0; the top fills
+        // with zeros. `off < len`, so the shift stays below 64.
+        // SAFETY: `len - 8 >= 0` by the check above.
+        let w = unsafe { (row.as_ptr().add(len - 8) as *const u64).read_unaligned() };
+        w >> (8 * (off + 8 - len))
+    } else {
+        // Row shorter than one group (dim < 64, so this is group 0): assemble.
+        let mut w = 0u64;
+        for (k, &b) in row[off..].iter().enumerate() {
+            w |= (b as u64) << (8 * k);
+        }
+        w
+    }
+}
+
+/// 32-bit sibling of [`group_bits_u64`] for the AVX2 kernel's ymm groups.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn group_bits_u32(row: &[u8], g: usize) -> u32 {
+    let off = g * 4;
+    let len = row.len();
+    if off + 4 <= len {
+        // SAFETY: in bounds for 4 bytes by the check above.
+        unsafe { (row.as_ptr().add(off) as *const u32).read_unaligned() }
+    } else if len >= 4 {
+        // SAFETY: `len - 4 >= 0` by the check above.
+        let w = unsafe { (row.as_ptr().add(len - 4) as *const u32).read_unaligned() };
+        w >> (8 * (off + 4 - len))
+    } else {
+        let mut w = 0u32;
+        for (k, &b) in row[off..].iter().enumerate() {
+            w |= (b as u32) << (8 * k);
+        }
+        w
+    }
+}
+
+/// AVX-512 VNNI fused MaxSim for byte-aligned dims, monomorphized over the
+/// per-token zmm group count `G = ceil(dim/64)` (dims ≤ 256 keep the block's
+/// `4·G` expanded masks register-resident).
+///
+/// Doc-token-outer loop: each token's sign bits are expanded ONCE, in
+/// registers, to `G` zmm vectors of `0/1` bytes (u64 broadcast + `pshufb` +
+/// `vptestmb` + `maskz_mov` — ~5 instructions per group), amortized over
+/// every query token. Scoring is one `vpdpbusd` per group (u8 × i8
+/// dot-accumulate — the x86 twin of the NEON SDOT in mixedbread's kernel):
+/// `P = Σ mask_d · q_d`, `score = 2P − T`. Doc tokens go in blocks of 4 so
+/// the horizontal reductions collapse into `phaddd` pairs and the per-query
+/// running max stays vectorized (`pmaxsd`).
+///
+/// Queries come from [`QueryI8::padded`] (row stride `G·64`, zero-filled) and
+/// tail-group doc bytes are zero-extended, so partial groups score exactly:
+/// every padding lane contributes `0`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-unsafe fn maxsim_vnni128(
-    q_all: &[i8],
+unsafe fn maxsim_vnni<const G: usize>(
+    q_pad: &[i8],
     sums: &[i32],
     scales: &[f32],
     d_all: &[u8],
-    n_q: usize,
+    pdim: usize,
     n_d: usize,
 ) -> f32 {
     use std::arch::x86_64::*;
-    // After `broadcast_i32x4` every 128-bit chunk holds all 16 packed bytes;
-    // chunk c of the LOW zmm covers dims 16c..16c+16 = packed bytes 2c, 2c+1
-    // (HIGH zmm: bytes 8..16). Indices replicate byte k across its 8 lanes.
-    const IDX_LO: [i8; 64] = [
+    let n_q = sums.len();
+    debug_assert!(q_pad.len() >= n_q * G * 64);
+    // After `set1_epi64` every 128-bit chunk holds the group's 8 packed bytes
+    // (twice); chunk c covers dims 16c..16c+16 = packed bytes 2c, 2c+1.
+    // Indices replicate byte k across its 8 lanes.
+    const IDX: [i8; 64] = [
         0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3,
         3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7,
         7, 7, 7, 7,
-    ];
-    const IDX_HI: [i8; 64] = [
-        8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11,
-        11, 11, 11, 11, 11, 12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13, 14, 14,
-        14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15,
     ];
     // MSB-first bit selector per lane group (dim 8k -> 0x80), as in `binarize`.
     const SEL: [i8; 64] = [
@@ -324,21 +399,16 @@ unsafe fn maxsim_vnni128(
         0x04, 0x02, 0x01, -128, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01, -128, 0x40, 0x20, 0x10,
         0x08, 0x04, 0x02, 0x01,
     ];
-    let idx_lo = _mm512_loadu_si512(IDX_LO.as_ptr() as *const __m512i);
-    let idx_hi = _mm512_loadu_si512(IDX_HI.as_ptr() as *const __m512i);
+    let idx = _mm512_loadu_si512(IDX.as_ptr() as *const __m512i);
     let sel = _mm512_loadu_si512(SEL.as_ptr() as *const __m512i);
     let one = _mm512_set1_epi8(1);
 
-    // Expand one 16-byte packed token into two zmm of 0/1 bytes.
+    // Expand one group's 64 packed sign bits into a zmm of 0/1 bytes.
     macro_rules! expand {
-        ($ptr:expr) => {{
-            let bc = _mm512_broadcast_i32x4(_mm_loadu_si128($ptr as *const __m128i));
-            let klo = _mm512_test_epi8_mask(_mm512_shuffle_epi8(bc, idx_lo), sel);
-            let khi = _mm512_test_epi8_mask(_mm512_shuffle_epi8(bc, idx_hi), sel);
-            (
-                _mm512_maskz_mov_epi8(klo, one),
-                _mm512_maskz_mov_epi8(khi, one),
-            )
+        ($w:expr) => {{
+            let bc = _mm512_set1_epi64($w as i64);
+            let k = _mm512_test_epi8_mask(_mm512_shuffle_epi8(bc, idx), sel);
+            _mm512_maskz_mov_epi8(k, one)
         }};
     }
     // Sum the 16 i32 lanes of a zmm down to an xmm of 4 partial lanes.
@@ -353,28 +423,29 @@ unsafe fn maxsim_vnni128(
     // per doc slot in the block). Tail blocks replicate the last token, which
     // cannot change a max.
     let mut best = vec![i32::MIN; n_q * 4];
-    let dp = d_all.as_ptr();
-    let qp = q_all.as_ptr();
+    let qp = q_pad.as_ptr();
     let mut db = 0usize;
     while db < n_d {
-        let i1 = (db + 1).min(n_d - 1);
-        let i2 = (db + 2).min(n_d - 1);
-        let i3 = (db + 3).min(n_d - 1);
-        let (m00, m01) = expand!(dp.add(db * 16));
-        let (m10, m11) = expand!(dp.add(i1 * 16));
-        let (m20, m21) = expand!(dp.add(i2 * 16));
-        let (m30, m31) = expand!(dp.add(i3 * 16));
+        let mut masks = [[_mm512_setzero_si512(); G]; 4];
+        for (t, m) in masks.iter_mut().enumerate() {
+            let d = (db + t).min(n_d - 1);
+            let row = &d_all[d * pdim..(d + 1) * pdim];
+            for (g, slot) in m.iter_mut().enumerate() {
+                *slot = expand!(group_bits_u64(row, g));
+            }
+        }
         for (qi, &sum) in sums.iter().enumerate() {
-            let q0 = _mm512_loadu_si512(qp.add(qi * 128) as *const __m512i);
-            let q1 = _mm512_loadu_si512(qp.add(qi * 128 + 64) as *const __m512i);
-            let z = _mm512_setzero_si512();
-            let a0 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(z, m00, q0), m01, q1);
-            let a1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(z, m10, q0), m11, q1);
-            let a2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(z, m20, q0), m21, q1);
-            let a3 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(z, m30, q0), m31, q1);
+            let q = qp.add(qi * G * 64);
+            let mut acc = [_mm512_setzero_si512(); 4];
+            for g in 0..G {
+                let qv = _mm512_loadu_si512(q.add(g * 64) as *const __m512i);
+                for (a, m) in acc.iter_mut().zip(&masks) {
+                    *a = _mm512_dpbusd_epi32(*a, m[g], qv);
+                }
+            }
             // [P0, P1, P2, P3] for the 4 doc tokens of this block.
-            let h01 = _mm_hadd_epi32(fold4!(a0), fold4!(a1));
-            let h23 = _mm_hadd_epi32(fold4!(a2), fold4!(a3));
+            let h01 = _mm_hadd_epi32(fold4!(acc[0]), fold4!(acc[1]));
+            let h23 = _mm_hadd_epi32(fold4!(acc[2]), fold4!(acc[3]));
             let p4 = _mm_hadd_epi32(h01, h23);
             let sc = _mm_sub_epi32(_mm_slli_epi32(p4, 1), _mm_set1_epi32(sum));
             let bp = best.as_mut_ptr().add(qi * 4) as *mut __m128i;
@@ -392,25 +463,63 @@ unsafe fn maxsim_vnni128(
     total
 }
 
-/// AVX2 masked-SAD fused MaxSim for `dim == 128` (no AVX-512 required).
+/// Monomorphization dispatch for [`maxsim_vnni`]: `g = ceil(dim/64) ∈ 1..=4`.
 ///
-/// Doc-token-outer: expand each token's bits ONCE into four ymm `0xFF/0x00`
+/// # Safety
+/// Same contract as [`maxsim_vnni`]: AVX-512 F/BW/VNNI present, `q_pad` rows
+/// at stride `g·64`, doc rows of `pdim` bytes.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn maxsim_vnni_dyn(
+    g: usize,
+    q_pad: &[i8],
+    sums: &[i32],
+    scales: &[f32],
+    d_all: &[u8],
+    pdim: usize,
+    n_d: usize,
+) -> f32 {
+    match g {
+        1 => maxsim_vnni::<1>(q_pad, sums, scales, d_all, pdim, n_d),
+        2 => maxsim_vnni::<2>(q_pad, sums, scales, d_all, pdim, n_d),
+        3 => maxsim_vnni::<3>(q_pad, sums, scales, d_all, pdim, n_d),
+        4 => maxsim_vnni::<4>(q_pad, sums, scales, d_all, pdim, n_d),
+        _ => unreachable!("fused kernels cover dims <= 256"),
+    }
+}
+
+/// AVX2 masked-SAD fused MaxSim for byte-aligned dims, monomorphized over the
+/// per-token ymm group count `NG = ceil(dim/32)` (dims ≤ 256; no AVX-512
+/// required).
+///
+/// Doc-token-outer: expand each token's bits ONCE into `NG` ymm `0xFF/0x00`
 /// masks (broadcast + `pshufb` + `pcmpeqb`), amortized over all query tokens.
 /// Scoring uses the biased-SAD identity: with `qb = q + 128` stored as `u8`,
 /// `SAD(qb & mask, 0) = P + 128 · popcount(bits)`, so
 /// `P = SAD − 128·popcount` and `score = 2P − T`. Every scoring op
 /// (`pand`/`psadbw`/`paddq`) is a cheap 1-µop instruction — no widening chains.
+///
+/// Queries come from [`QueryI8::biased`] (row stride `NG·32`, zero-filled)
+/// and tail-group doc bytes are zero-extended, so padding lanes are never
+/// selected and reach neither the SAD nor the popcount.
+///
+/// `popcnt` is enabled alongside AVX2 so `count_ones` compiles to the
+/// instruction rather than a ~17-op SWAR sequence per group per token (every
+/// AVX2 CPU has it — it predates AVX2 by two µarch generations — but the
+/// dispatcher still verifies at runtime).
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn maxsim_avx2_sad128(
-    qb_all: &[u8],
+#[target_feature(enable = "avx2,popcnt")]
+unsafe fn maxsim_avx2_sad<const NG: usize>(
+    qb_pad: &[u8],
     sums: &[i32],
     scales: &[f32],
     d_all: &[u8],
-    n_q: usize,
+    pdim: usize,
     n_d: usize,
 ) -> f32 {
     use std::arch::x86_64::*;
+    let n_q = sums.len();
+    debug_assert!(qb_pad.len() >= n_q * NG * 32);
     const IDX: [i8; 32] = [
         0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3,
         3, 3,
@@ -424,44 +533,31 @@ unsafe fn maxsim_avx2_sad128(
     let sel = _mm256_loadu_si256(SEL.as_ptr() as *const __m256i);
     let zero = _mm256_setzero_si256();
 
-    // 0xFF mask ymm for dims 32g..32g+32 of the token at `bp`.
-    macro_rules! mask32 {
-        ($bp:expr, $g:expr) => {{
-            let w = ($bp.add($g * 4) as *const u32).read_unaligned();
-            let bytes = _mm256_shuffle_epi8(_mm256_set1_epi32(w as i32), idx);
-            _mm256_cmpeq_epi8(_mm256_and_si256(bytes, sel), sel)
-        }};
-    }
-
     let mut best = vec![i32::MIN; n_q];
-    let qp = qb_all.as_ptr();
-    for d in 0..n_d {
-        let bp = d_all.as_ptr().add(d * 16);
-        let m0 = mask32!(bp, 0);
-        let m1 = mask32!(bp, 1);
-        let m2 = mask32!(bp, 2);
-        let m3 = mask32!(bp, 3);
-        let cnt = ((bp as *const u64).read_unaligned().count_ones()
-            + (bp.add(8) as *const u64).read_unaligned().count_ones()) as i32;
+    let qp = qb_pad.as_ptr();
+    // `chunks_exact` walks doc rows with an additive pointer — no per-token
+    // index multiply or slice bounds check in front of the query loop.
+    for row in d_all.chunks_exact(pdim).take(n_d) {
+        // 0xFF mask ymm per 32-dim group, plus the token's total popcount.
+        let mut masks = [_mm256_setzero_si256(); NG];
+        let mut cnt = 0i32;
+        for (g, m) in masks.iter_mut().enumerate() {
+            let w = group_bits_u32(row, g);
+            cnt += w.count_ones() as i32;
+            let bytes = _mm256_shuffle_epi8(_mm256_set1_epi32(w as i32), idx);
+            *m = _mm256_cmpeq_epi8(_mm256_and_si256(bytes, sel), sel);
+        }
         for qi in 0..n_q {
-            let q = qp.add(qi * 128);
-            let s0 = _mm256_sad_epu8(
-                _mm256_and_si256(m0, _mm256_loadu_si256(q as *const __m256i)),
-                zero,
-            );
-            let s1 = _mm256_sad_epu8(
-                _mm256_and_si256(m1, _mm256_loadu_si256(q.add(32) as *const __m256i)),
-                zero,
-            );
-            let s2 = _mm256_sad_epu8(
-                _mm256_and_si256(m2, _mm256_loadu_si256(q.add(64) as *const __m256i)),
-                zero,
-            );
-            let s3 = _mm256_sad_epu8(
-                _mm256_and_si256(m3, _mm256_loadu_si256(q.add(96) as *const __m256i)),
-                zero,
-            );
-            let s = _mm256_add_epi64(_mm256_add_epi64(s0, s1), _mm256_add_epi64(s2, s3));
+            let q = qp.add(qi * NG * 32);
+            // Two alternating accumulators keep the SAD sums a balanced tree
+            // instead of one serial add dependency chain.
+            let mut acc = [_mm256_setzero_si256(); 2];
+            for (g, m) in masks.iter().enumerate() {
+                let qv = _mm256_loadu_si256(q.add(g * 32) as *const __m256i);
+                acc[g & 1] =
+                    _mm256_add_epi64(acc[g & 1], _mm256_sad_epu8(_mm256_and_si256(*m, qv), zero));
+            }
+            let s = _mm256_add_epi64(acc[0], acc[1]);
             let x = _mm_add_epi64(_mm256_castsi256_si128(s), _mm256_extracti128_si256(s, 1));
             let sad = _mm_cvtsi128_si64(_mm_add_epi64(x, _mm_unpackhi_epi64(x, x))) as i32;
             let score = 2 * (sad - 128 * cnt) - sums[qi];
@@ -476,6 +572,36 @@ unsafe fn maxsim_avx2_sad128(
         total += best[qi] as f32 * scales[qi];
     }
     total
+}
+
+/// Monomorphization dispatch for [`maxsim_avx2_sad`]:
+/// `ng = ceil(dim/32) ∈ 1..=8`.
+///
+/// # Safety
+/// Same contract as [`maxsim_avx2_sad`]: AVX2 present, `qb_pad` rows at
+/// stride `ng·32`, doc rows of `pdim` bytes.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn maxsim_avx2_sad_dyn(
+    ng: usize,
+    qb_pad: &[u8],
+    sums: &[i32],
+    scales: &[f32],
+    d_all: &[u8],
+    pdim: usize,
+    n_d: usize,
+) -> f32 {
+    match ng {
+        1 => maxsim_avx2_sad::<1>(qb_pad, sums, scales, d_all, pdim, n_d),
+        2 => maxsim_avx2_sad::<2>(qb_pad, sums, scales, d_all, pdim, n_d),
+        3 => maxsim_avx2_sad::<3>(qb_pad, sums, scales, d_all, pdim, n_d),
+        4 => maxsim_avx2_sad::<4>(qb_pad, sums, scales, d_all, pdim, n_d),
+        5 => maxsim_avx2_sad::<5>(qb_pad, sums, scales, d_all, pdim, n_d),
+        6 => maxsim_avx2_sad::<6>(qb_pad, sums, scales, d_all, pdim, n_d),
+        7 => maxsim_avx2_sad::<7>(qb_pad, sums, scales, d_all, pdim, n_d),
+        8 => maxsim_avx2_sad::<8>(qb_pad, sums, scales, d_all, pdim, n_d),
+        _ => unreachable!("fused kernels cover dims <= 256"),
+    }
 }
 
 /// `sdot vD.4s, vN.16b, vM.16b` — signed int8 dot product into i32x4, via inline
@@ -503,86 +629,112 @@ unsafe fn sdot_asm(
     out
 }
 
-/// NEON SDOT fused MaxSim for `dim == 128` (aarch64 with `dotprod`).
+/// NEON SDOT fused MaxSim for byte-aligned dims up to 256 (aarch64 with
+/// `dotprod`).
 ///
-/// The ARM analog of `maxsim_vnni128`: doc-token-outer, so each token's 128
-/// sign bits are expanded ONCE — 8 NEON shift+mask ops into the plane-major
-/// `0/1` layout of `extract_planes_128` — and amortized over every query
-/// token. Scoring SDOTs the hoisted plane-major query row (built once per
-/// query in [`quantize_query_i8`]) against the expanded planes:
-/// `P = Σ mask_d · q_d`, `score = 2P − T`. Doc tokens go in blocks of 4 so the
-/// four SDOT accumulator chains stay independent, the horizontal reductions
-/// collapse into `vpaddq` pairs, and the per-query running max stays
-/// vectorized (`vmaxq_s32`).
+/// The ARM analog of `maxsim_vnni`: doc-token-outer, so each token's sign
+/// bits are expanded ONCE — broadcast + `vtst` + `vbsl` per 16-dim chunk into
+/// a ±1 `i8` stack tile — and amortized over every query token. Scoring
+/// SDOTs the query's natural-order int8 lanes ([`QueryI8::padded`], zero
+/// beyond `dim`) straight against the ±1 lanes: SDOT is a true signed×signed
+/// dot, so each accumulator lane sums `q_d · s_d` directly and no `2P − T`
+/// detour is needed (unlike `vpdpbusd`/`psadbw`, which force the 0/1-mask
+/// identity on x86). Padding bits expand to −1 but meet a zero query lane,
+/// so partial tail chunks score exactly. Doc tokens go in blocks of 4 with
+/// two SDOT accumulator chains per token (8 independent chains hide SDOT
+/// latency), the horizontal reductions collapse into `vpaddq` pairs, and the
+/// per-query running max stays vectorized (`vmaxq_s32`).
 ///
-/// The expansion lives in a 512-byte stack tile, never the index: doc bytes
-/// read per token stay 16 (packed bits), not 128 (stored planes), which is
-/// what wins once the candidate set outgrows L2 — index-time plane extraction
-/// measured no faster than this on Apple M4 while costing 8× the memory.
+/// The expansion lives in a ≤1 KiB stack tile, never the index: doc bytes
+/// read per token stay `pdim` (packed bits), not `8·pdim` (expanded lanes),
+/// which is what wins once the candidate set outgrows L2 — index-time
+/// expansion measured no faster than this on Apple M4 while costing 8× the
+/// memory.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "dotprod")]
-unsafe fn maxsim_neon128(
-    q_planes: &[i8],
-    sums: &[i32],
+unsafe fn maxsim_neon<const C: usize>(
+    q_pad: &[i8],
+    q_stride: usize,
     scales: &[f32],
     d_all: &[u8],
-    n_q: usize,
+    pdim: usize,
     n_d: usize,
 ) -> f32 {
     use std::arch::aarch64::*;
+    let n_q = scales.len();
+    // C = 16-dim chunks per token: 2 packed bytes each, the last chunk
+    // possibly holding a single byte (dim % 16 == 8). Monomorphized so the
+    // chunk loops fully unroll with static addressing (mirrors
+    // `maxsim_vnni<G>`; a runtime chunk count costs ~55% at dim = 128).
+    let c = C;
+    debug_assert_eq!(c, pdim.div_ceil(2));
+    debug_assert!(c * 16 <= q_stride, "query stride must cover all chunks");
+    debug_assert!(q_pad.len() >= n_q * q_stride);
+    // Per-lane bit-select mask: MSB-first within each byte (dim 8k -> 0x80).
+    const SEL: [u8; 16] = [
+        0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01, 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02,
+        0x01,
+    ];
+    let sel = vld1q_u8(SEL.as_ptr());
+    let pos = vdupq_n_s8(1);
+    let neg = vdupq_n_s8(-1);
 
-    debug_assert_eq!(q_planes.len(), n_q * 128);
     // Per-query running max over doc tokens, 4 lanes per query token (one lane
     // per doc slot in the block). Tail blocks replicate the last token, which
     // cannot change a max.
     let mut best = vec![i32::MIN; n_q * 4];
-    let mut planes = [0i8; 4 * 128];
+    // ±1 expansion of the current block's 4 doc tokens, chunk-major per token
+    // (dims ≤ 256 → c ≤ 16 → 4·c·16 ≤ 1024 bytes).
+    let mut tile = [0i8; 4 * 16 * 16];
     let mut db = 0usize;
     while db < n_d {
         for t in 0..4 {
             let d = (db + t).min(n_d - 1);
-            let m: &mut [i8; 128] = (&mut planes[t * 128..t * 128 + 128])
-                .try_into()
-                .expect("128-byte tile slot");
-            extract_planes_128(&d_all[d * 16..d * 16 + 16], m);
-        }
-        let pp = planes.as_ptr();
-        for (qi, &sum) in sums.iter().enumerate() {
-            let qp = q_planes.as_ptr().add(qi * 128);
-            let q0 = vld1q_s8(qp);
-            let q1 = vld1q_s8(qp.add(16));
-            let q2 = vld1q_s8(qp.add(32));
-            let q3 = vld1q_s8(qp.add(48));
-            let q4 = vld1q_s8(qp.add(64));
-            let q5 = vld1q_s8(qp.add(80));
-            let q6 = vld1q_s8(qp.add(96));
-            let q7 = vld1q_s8(qp.add(112));
-            // One doc token: 8 SDOTs over two accumulators (depth 4 per chain,
-            // enough to hide SDOT latency across the 4 tokens of the block).
-            macro_rules! tok {
-                ($off:expr) => {{
-                    let mut a = vdupq_n_s32(0);
-                    let mut b = vdupq_n_s32(0);
-                    a = sdot_asm(a, q0, vld1q_s8(pp.add($off)));
-                    b = sdot_asm(b, q1, vld1q_s8(pp.add($off + 16)));
-                    a = sdot_asm(a, q2, vld1q_s8(pp.add($off + 32)));
-                    b = sdot_asm(b, q3, vld1q_s8(pp.add($off + 48)));
-                    a = sdot_asm(a, q4, vld1q_s8(pp.add($off + 64)));
-                    b = sdot_asm(b, q5, vld1q_s8(pp.add($off + 80)));
-                    a = sdot_asm(a, q6, vld1q_s8(pp.add($off + 96)));
-                    b = sdot_asm(b, q7, vld1q_s8(pp.add($off + 112)));
-                    vaddq_s32(a, b)
-                }};
+            let row = &d_all[d * pdim..(d + 1) * pdim];
+            for ch in 0..c {
+                let b0 = row[ch * 2];
+                let b1 = if ch * 2 + 1 < pdim {
+                    row[ch * 2 + 1]
+                } else {
+                    0
+                };
+                // Broadcast byte0 to lanes 0..8 and byte1 to lanes 8..16, then
+                // turn each lane's bit into ±1.
+                let bitbytes = vcombine_u8(vdup_n_u8(b0), vdup_n_u8(b1));
+                let pm1 = vbslq_s8(vtstq_u8(bitbytes, sel), pos, neg);
+                vst1q_s8(tile.as_mut_ptr().add((t * c + ch) * 16), pm1);
             }
-            let t0 = tok!(0);
-            let t1 = tok!(128);
-            let t2 = tok!(256);
-            let t3 = tok!(384);
-            // Pairwise-add tree -> [P0, P1, P2, P3] for the block's 4 tokens.
-            let p4 = vpaddq_s32(vpaddq_s32(t0, t1), vpaddq_s32(t2, t3));
-            let sc = vsubq_s32(vshlq_n_s32::<1>(p4), vdupq_n_s32(sum));
+        }
+        let tp = tile.as_ptr();
+        for qi in 0..n_q {
+            let q = q_pad.as_ptr().add(qi * q_stride);
+            // Two SDOT accumulator chains per doc token, fed in chunk pairs.
+            let mut a = [vdupq_n_s32(0); 4];
+            let mut b = [vdupq_n_s32(0); 4];
+            let mut ch = 0usize;
+            while ch + 1 < c {
+                let q0 = vld1q_s8(q.add(ch * 16));
+                let q1 = vld1q_s8(q.add(ch * 16 + 16));
+                for (t, (at, bt)) in a.iter_mut().zip(b.iter_mut()).enumerate() {
+                    *at = sdot_asm(*at, q0, vld1q_s8(tp.add((t * c + ch) * 16)));
+                    *bt = sdot_asm(*bt, q1, vld1q_s8(tp.add((t * c + ch + 1) * 16)));
+                }
+                ch += 2;
+            }
+            if ch < c {
+                let q0 = vld1q_s8(q.add(ch * 16));
+                for (t, at) in a.iter_mut().enumerate() {
+                    *at = sdot_asm(*at, q0, vld1q_s8(tp.add((t * c + ch) * 16)));
+                }
+            }
+            // Pairwise-add tree -> [S0, S1, S2, S3]: lane t is the full
+            // `q · s` against doc token t of the block.
+            let s4 = vpaddq_s32(
+                vpaddq_s32(vaddq_s32(a[0], b[0]), vaddq_s32(a[1], b[1])),
+                vpaddq_s32(vaddq_s32(a[2], b[2]), vaddq_s32(a[3], b[3])),
+            );
             let bp = best.as_mut_ptr().add(qi * 4);
-            vst1q_s32(bp, vmaxq_s32(vld1q_s32(bp), sc));
+            vst1q_s32(bp, vmaxq_s32(vld1q_s32(bp), s4));
         }
         db += 4;
     }
@@ -606,6 +758,34 @@ impl QueryI8 {
     }
 }
 
+/// Monomorphization dispatch for [`maxsim_neon`]:
+/// `c = ceil(dim/16) = ceil(pdim/2) ∈ 1..=16`.
+///
+/// # Safety
+/// Same contract as [`maxsim_neon`]: `dotprod` present, `q_pad` rows at
+/// stride `q_stride ≥ c·16`, doc rows of `pdim` bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn maxsim_neon_dyn(
+    c: usize,
+    q_pad: &[i8],
+    q_stride: usize,
+    scales: &[f32],
+    d_all: &[u8],
+    pdim: usize,
+    n_d: usize,
+) -> f32 {
+    macro_rules! arm {
+        ($($n:literal),+) => {
+            match c {
+                $($n => maxsim_neon::<$n>(q_pad, q_stride, scales, d_all, pdim, n_d),)+
+                _ => unreachable!("fused kernels cover dims <= 256"),
+            }
+        };
+    }
+    arm!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+}
+
 /// Runtime gate for the fused AVX-512 VNNI kernel — single source of truth
 /// shared by the dispatcher and the benchmarking hook.
 #[cfg(target_arch = "x86_64")]
@@ -616,19 +796,28 @@ fn has_avx512_vnni() -> bool {
         && is_x86_feature_detected!("avx512f")
 }
 
+/// Runtime gate for the fused AVX2 masked-SAD kernel. The `popcnt` check is
+/// formal — no AVX2 CPU lacks it — but the kernel enables the feature, so the
+/// gate must prove it.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn has_avx2_popcnt() -> bool {
+    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("popcnt")
+}
+
 /// Fast asymmetric MaxSim: int8 query against a packed 1-bit document.
 ///
-/// Scores directly on the stored sign bits — no `f32` decode, integer adds
-/// only via the `2P − T` identity. Per query token the best `q · s` over
-/// document tokens is found in the integer domain, then scaled by that token's
-/// dequant scale and summed (matching float MaxSim exactly up to the query's
-/// int8 rounding).
+/// Scores directly on the stored sign bits — no `f32` decode, integer ops
+/// only (the `2P − T` identity on x86, native signed×signed SDOT on
+/// aarch64). Per query token the best `q · s` over document tokens is found
+/// in the integer domain, then scaled by that token's dequant scale and
+/// summed (matching float MaxSim exactly up to the query's int8 rounding).
 ///
-/// Dispatches once per call: for `dim == 128` this takes a fused
-/// doc-token-outer kernel — AVX-512 VNNI (`maxsim_vnni128`) or AVX2
-/// masked-SAD (`maxsim_avx2_sad128`) on x86_64, SDOT (`maxsim_neon128`)
-/// on aarch64; other dims take a per-pair SIMD dot with the feature check
-/// hoisted out of the loops.
+/// Dispatches once per call: byte-aligned dims (`dim % 8 == 0`, up to 256)
+/// take a fused doc-token-outer kernel — AVX-512 VNNI (`maxsim_vnni`) or
+/// AVX2 masked-SAD (`maxsim_avx2_sad`) on x86_64, SDOT (`maxsim_neon`) on
+/// aarch64; ragged and larger dims take a per-pair SIMD dot with the feature
+/// check hoisted out of the loops.
 pub fn maxsim_binary_i8(query: &QueryI8, doc_packed: &ArrayView2<u8>, dim: usize) -> f32 {
     let n_doc = doc_packed.nrows();
     let n_q = query.values.nrows();
@@ -651,22 +840,43 @@ pub fn maxsim_binary_i8(query: &QueryI8, doc_packed: &ArrayView2<u8>, dim: usize
         .expect("query values must be contiguous");
     let d_all = doc_packed.as_slice().expect("doc bits must be contiguous");
 
+    // The fused kernels cover byte-aligned dims up to 256 (`fused_dim`): the
+    // per-token masks stay register-resident (`ceil(dim/64) ≤ 4` zmm groups /
+    // `ceil(dim/32) ≤ 8` ymm groups) and the NEON ±1 tile stays ≤ 1 KiB.
+    // Ragged dims keep the per-pair path, which masks the last byte's
+    // padding bits per dimension instead of relying on them being zero.
     #[cfg(target_arch = "x86_64")]
     {
-        if dim == 128 && query.layouts_consistent() {
-            if has_avx512_vnni() {
+        if fused_dim(dim) && query.layouts_consistent() {
+            if has_avx512_vnni() && query.padded.len() == n_q * padded_stride(dim) {
                 return unsafe {
-                    maxsim_vnni128(q_all, &query.sums, &query.scales, d_all, n_q, n_doc)
+                    maxsim_vnni_dyn(
+                        dim.div_ceil(64),
+                        &query.padded,
+                        &query.sums,
+                        &query.scales,
+                        d_all,
+                        packed_dim(dim),
+                        n_doc,
+                    )
                 };
             }
-            if is_x86_feature_detected!("avx2") && query.biased.len() == n_q * 128 {
+            if has_avx2_popcnt() && query.biased.len() == n_q * biased_stride(dim) {
                 return unsafe {
-                    maxsim_avx2_sad128(&query.biased, &query.sums, &query.scales, d_all, n_q, n_doc)
+                    maxsim_avx2_sad_dyn(
+                        dim.div_ceil(32),
+                        &query.biased,
+                        &query.sums,
+                        &query.scales,
+                        d_all,
+                        packed_dim(dim),
+                        n_doc,
+                    )
                 };
             }
         }
         if is_x86_feature_detected!("avx2") {
-            // Generic dims: per-pair AVX2 dot, detection hoisted out of the loop.
+            // Other dims: per-pair AVX2 dot, detection hoisted out of the loop.
             let pdim = packed_dim(dim);
             let mut total = 0.0f32;
             for qi in 0..n_q {
@@ -688,13 +898,21 @@ pub fn maxsim_binary_i8(query: &QueryI8, doc_packed: &ArrayView2<u8>, dim: usize
 
     #[cfg(target_arch = "aarch64")]
     {
-        if dim == 128
+        if fused_dim(dim)
             && query.layouts_consistent()
-            && query.planes.len() == n_q * 128
+            && query.padded.len() == n_q * padded_stride(dim)
             && std::arch::is_aarch64_feature_detected!("dotprod")
         {
             return unsafe {
-                maxsim_neon128(&query.planes, &query.sums, &query.scales, d_all, n_q, n_doc)
+                maxsim_neon_dyn(
+                    packed_dim(dim).div_ceil(2),
+                    &query.padded,
+                    padded_stride(dim),
+                    &query.scales,
+                    d_all,
+                    packed_dim(dim),
+                    n_doc,
+                )
             };
         }
     }
@@ -742,26 +960,44 @@ pub fn maxsim_binary_i8_pairwise(query: &QueryI8, doc_packed: &ArrayView2<u8>, d
     maxsim_binary_i8_pairwise_inner(query, q_all, d_all, n_doc, dim)
 }
 
-/// Force the fused AVX-512 VNNI kernel (dim=128). `None` when unsupported.
+/// True when the fused kernels can score `dim`: byte-aligned and at most 256
+/// (see the dispatch note in [`maxsim_binary_i8`]).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline]
+fn fused_dim(dim: usize) -> bool {
+    dim.is_multiple_of(8) && (8..=256).contains(&dim)
+}
+
+/// Force the fused AVX-512 VNNI kernel. `None` when unsupported (needs
+/// AVX-512 VNNI and a byte-aligned dim ≤ 256).
 /// Benchmarking hook; not part of the stability surface.
 #[doc(hidden)]
 pub fn maxsim_binary_i8_force_vnni(query: &QueryI8, doc_packed: &ArrayView2<u8>) -> Option<f32> {
     #[cfg(target_arch = "x86_64")]
     {
-        if query.values.ncols() == 128
-            && doc_packed.ncols() == 16
+        let dim = query.values.ncols();
+        let n_q = query.values.nrows();
+        if fused_dim(dim)
+            && doc_packed.ncols() == packed_dim(dim)
             && query.layouts_consistent()
+            && query.padded.len() == n_q * padded_stride(dim)
             && has_avx512_vnni()
         {
             let n_doc = doc_packed.nrows();
-            let n_q = query.values.nrows();
             if n_doc == 0 || n_q == 0 {
                 return Some(0.0);
             }
-            let q_all = query.values.as_slice().expect("contiguous");
             let d_all = doc_packed.as_slice().expect("contiguous");
             return Some(unsafe {
-                maxsim_vnni128(q_all, &query.sums, &query.scales, d_all, n_q, n_doc)
+                maxsim_vnni_dyn(
+                    dim.div_ceil(64),
+                    &query.padded,
+                    &query.sums,
+                    &query.scales,
+                    d_all,
+                    packed_dim(dim),
+                    n_doc,
+                )
             });
         }
     }
@@ -769,7 +1005,8 @@ pub fn maxsim_binary_i8_force_vnni(query: &QueryI8, doc_packed: &ArrayView2<u8>)
     None
 }
 
-/// Force the fused AVX2 masked-SAD kernel (dim=128). `None` when unsupported.
+/// Force the fused AVX2 masked-SAD kernel. `None` when unsupported (needs
+/// AVX2 and a byte-aligned dim ≤ 256).
 /// Benchmarking hook; not part of the stability surface.
 #[doc(hidden)]
 pub fn maxsim_binary_i8_force_avx2_sad(
@@ -778,20 +1015,29 @@ pub fn maxsim_binary_i8_force_avx2_sad(
 ) -> Option<f32> {
     #[cfg(target_arch = "x86_64")]
     {
-        if query.values.ncols() == 128
-            && doc_packed.ncols() == 16
+        let dim = query.values.ncols();
+        let n_q = query.values.nrows();
+        if fused_dim(dim)
+            && doc_packed.ncols() == packed_dim(dim)
             && query.layouts_consistent()
-            && query.biased.len() == query.values.nrows() * 128
-            && is_x86_feature_detected!("avx2")
+            && query.biased.len() == n_q * biased_stride(dim)
+            && has_avx2_popcnt()
         {
             let n_doc = doc_packed.nrows();
-            let n_q = query.values.nrows();
             if n_doc == 0 || n_q == 0 {
                 return Some(0.0);
             }
             let d_all = doc_packed.as_slice().expect("contiguous");
             return Some(unsafe {
-                maxsim_avx2_sad128(&query.biased, &query.sums, &query.scales, d_all, n_q, n_doc)
+                maxsim_avx2_sad_dyn(
+                    dim.div_ceil(32),
+                    &query.biased,
+                    &query.sums,
+                    &query.scales,
+                    d_all,
+                    packed_dim(dim),
+                    n_doc,
+                )
             });
         }
     }
@@ -799,26 +1045,36 @@ pub fn maxsim_binary_i8_force_avx2_sad(
     None
 }
 
-/// Force the fused NEON SDOT kernel (dim=128). `None` when unsupported.
+/// Force the fused NEON SDOT kernel. `None` when unsupported (needs the
+/// `dotprod` feature and a byte-aligned dim ≤ 256).
 /// Benchmarking hook; not part of the stability surface.
 #[doc(hidden)]
 pub fn maxsim_binary_i8_force_neon(query: &QueryI8, doc_packed: &ArrayView2<u8>) -> Option<f32> {
     #[cfg(target_arch = "aarch64")]
     {
-        if query.values.ncols() == 128
-            && doc_packed.ncols() == 16
+        let dim = query.values.ncols();
+        let n_q = query.values.nrows();
+        if fused_dim(dim)
+            && doc_packed.ncols() == packed_dim(dim)
             && query.layouts_consistent()
-            && query.planes.len() == query.values.nrows() * 128
+            && query.padded.len() == n_q * padded_stride(dim)
             && std::arch::is_aarch64_feature_detected!("dotprod")
         {
             let n_doc = doc_packed.nrows();
-            let n_q = query.values.nrows();
             if n_doc == 0 || n_q == 0 {
                 return Some(0.0);
             }
             let d_all = doc_packed.as_slice().expect("contiguous");
             return Some(unsafe {
-                maxsim_neon128(&query.planes, &query.sums, &query.scales, d_all, n_q, n_doc)
+                maxsim_neon_dyn(
+                    packed_dim(dim).div_ceil(2),
+                    &query.padded,
+                    padded_stride(dim),
+                    &query.scales,
+                    d_all,
+                    packed_dim(dim),
+                    n_doc,
+                )
             });
         }
     }
@@ -852,54 +1108,6 @@ pub fn binarize(embeddings: &ArrayView2<f32>) -> Array2<u8> {
         }
     }
     packed
-}
-
-/// Extract the 8 bit-planes of one 128-dim (16-byte) packed doc token into a
-/// plane-major `0/1` `i8` buffer `m[128]`: `m[p*16 + k] = bit p of byte k`
-/// (MSB-first, so plane `p` holds dim `k*8 + p`).
-///
-/// On aarch64 this is 8 NEON shift+mask ops over the whole 16-byte vector —
-/// one shift yields one bit from all 16 bytes at once, hence the plane-major
-/// layout (an extraction scheme due to mixedbread's aarch64 kernel). Doc-side
-/// expansion step of `maxsim_neon128`.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-fn extract_planes_128(bits: &[u8], m: &mut [i8; 128]) {
-    use std::arch::aarch64::*;
-    unsafe {
-        let v = vld1q_u8(bits.as_ptr());
-        let one = vdupq_n_u8(1);
-        let p = m.as_mut_ptr();
-        vst1q_s8(
-            p.add(0),
-            vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8::<7>(v), one)),
-        );
-        vst1q_s8(
-            p.add(16),
-            vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8::<6>(v), one)),
-        );
-        vst1q_s8(
-            p.add(32),
-            vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8::<5>(v), one)),
-        );
-        vst1q_s8(
-            p.add(48),
-            vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8::<4>(v), one)),
-        );
-        vst1q_s8(
-            p.add(64),
-            vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8::<3>(v), one)),
-        );
-        vst1q_s8(
-            p.add(80),
-            vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8::<2>(v), one)),
-        );
-        vst1q_s8(
-            p.add(96),
-            vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8::<1>(v), one)),
-        );
-        vst1q_s8(p.add(112), vreinterpretq_s8_u8(vandq_u8(v, one)));
-    }
 }
 
 /// Decode packed sign bits back into a dense `±1` matrix of shape `[n, dim]`.
@@ -1129,81 +1337,129 @@ mod tests {
 
     #[test]
     fn fused_kernels_match_scalar_reference() {
-        // The fused dim=128 kernels (AVX-512 VNNI, AVX2 masked-SAD) and the
-        // dispatched entry point must reproduce the integer-exact scalar MaxSim.
-        // Doc counts cover every 4-block tail shape (VNNI replicates the last
-        // token to fill a block).
-        for &n_doc in &[1usize, 2, 3, 4, 5, 13, 80] {
-            let query = random(9, 128, 500 + n_doc as u64);
-            let doc = random(n_doc, 128, 600 + n_doc as u64);
-            let packed = binarize(&doc.view());
-            let q8 = quantize_query_i8(&query.view());
+        // The fused kernels (AVX-512 VNNI, AVX2 masked-SAD, NEON SDOT) and the
+        // dispatched entry point must reproduce the integer-exact scalar
+        // MaxSim for every byte-aligned dim shape: whole groups (64, 128,
+        // 256), partial tail groups (16, 48, 96), odd packed-byte counts
+        // (8, 72, 200), and the monomorphization bounds (8, 256). Doc counts
+        // cover every 4-block tail shape (the fused kernels replicate the
+        // last token to fill a block).
+        for &dim in &[8usize, 16, 48, 64, 72, 96, 128, 200, 256] {
+            let pdim = packed_dim(dim);
+            for &n_doc in &[1usize, 2, 3, 4, 5, 13, 80] {
+                let query = random(9, dim, 500 + dim as u64 + n_doc as u64);
+                let doc = random(n_doc, dim, 600 + dim as u64 + n_doc as u64);
+                let packed = binarize(&doc.view());
+                let q8 = quantize_query_i8(&query.view());
 
-            let q_all = q8.values.as_slice().unwrap();
-            let d_all = packed.as_slice().unwrap();
-            let mut want = 0.0f32;
-            for qi in 0..9 {
-                let q = &q_all[qi * 128..qi * 128 + 128];
-                let mut best = i32::MIN;
-                for d in 0..n_doc {
-                    let s = ref_dot(q, &d_all[d * 16..d * 16 + 16], 128);
-                    if s > best {
-                        best = s;
+                let q_all = q8.values.as_slice().unwrap();
+                let d_all = packed.as_slice().unwrap();
+                let mut want = 0.0f32;
+                for qi in 0..9 {
+                    let q = &q_all[qi * dim..qi * dim + dim];
+                    let mut best = i32::MIN;
+                    for d in 0..n_doc {
+                        let s = ref_dot(q, &d_all[d * pdim..d * pdim + pdim], dim);
+                        if s > best {
+                            best = s;
+                        }
+                    }
+                    want += best as f32 * q8.scales[qi];
+                }
+
+                let tol = 1e-4 * want.abs().max(1.0);
+                let got = maxsim_binary_i8(&q8, &packed.view(), dim);
+                assert!(
+                    (got - want).abs() <= tol,
+                    "dispatch dim={dim} n_doc={n_doc}: {got} vs {want}"
+                );
+                let pw = maxsim_binary_i8_pairwise(&q8, &packed.view(), dim);
+                assert!(
+                    (pw - want).abs() <= tol,
+                    "pairwise dim={dim} n_doc={n_doc}: {pw} vs {want}"
+                );
+                // On hardware with the features, the hooks must engage for
+                // every one of these dims — `is_some()` keeps this test from
+                // silently losing its fused coverage — and must agree.
+                if let Some(v) = maxsim_binary_i8_force_vnni(&q8, &packed.view()) {
+                    assert!(
+                        (v - want).abs() <= tol,
+                        "vnni dim={dim} n_doc={n_doc}: {v} vs {want}"
+                    );
+                }
+                if let Some(v) = maxsim_binary_i8_force_avx2_sad(&q8, &packed.view()) {
+                    assert!(
+                        (v - want).abs() <= tol,
+                        "avx2-sad dim={dim} n_doc={n_doc}: {v} vs {want}"
+                    );
+                }
+                if let Some(v) = maxsim_binary_i8_force_neon(&q8, &packed.view()) {
+                    assert!(
+                        (v - want).abs() <= tol,
+                        "neon dim={dim} n_doc={n_doc}: {v} vs {want}"
+                    );
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if has_avx512_vnni() {
+                        assert!(maxsim_binary_i8_force_vnni(&q8, &packed.view()).is_some());
+                    }
+                    if is_x86_feature_detected!("avx2") {
+                        assert!(maxsim_binary_i8_force_avx2_sad(&q8, &packed.view()).is_some());
                     }
                 }
-                want += best as f32 * q8.scales[qi];
-            }
-
-            let tol = 1e-4 * want.abs().max(1.0);
-            let got = maxsim_binary_i8(&q8, &packed.view(), 128);
-            assert!(
-                (got - want).abs() <= tol,
-                "dispatch n_doc={n_doc}: {got} vs {want}"
-            );
-            let pw = maxsim_binary_i8_pairwise(&q8, &packed.view(), 128);
-            assert!(
-                (pw - want).abs() <= tol,
-                "pairwise n_doc={n_doc}: {pw} vs {want}"
-            );
-            if let Some(v) = maxsim_binary_i8_force_vnni(&q8, &packed.view()) {
-                assert!((v - want).abs() <= tol, "vnni n_doc={n_doc}: {v} vs {want}");
-            }
-            if let Some(v) = maxsim_binary_i8_force_avx2_sad(&q8, &packed.view()) {
-                assert!(
-                    (v - want).abs() <= tol,
-                    "avx2-sad n_doc={n_doc}: {v} vs {want}"
-                );
-            }
-            if let Some(v) = maxsim_binary_i8_force_neon(&q8, &packed.view()) {
-                assert!((v - want).abs() <= tol, "neon n_doc={n_doc}: {v} vs {want}");
+                #[cfg(target_arch = "aarch64")]
+                if std::arch::is_aarch64_feature_detected!("dotprod") {
+                    assert!(maxsim_binary_i8_force_neon(&q8, &packed.view()).is_some());
+                }
             }
         }
     }
 
     #[test]
-    fn query_i8_sums_and_biased_are_consistent() {
-        let q8 = quantize_query_i8(&random(7, 128, 900).view());
-        let v = q8.values.as_slice().unwrap();
-        for qi in 0..7 {
-            let t: i32 = v[qi * 128..(qi + 1) * 128].iter().map(|&x| x as i32).sum();
-            assert_eq!(q8.sums[qi], t);
-        }
-        for (i, &b) in q8.biased.iter().enumerate() {
-            assert_eq!(b as i32, v[i] as i32 + 128);
-        }
-        // Plane-major layout: planes[qi*128 + p*16 + k] holds dim k*8 + p.
-        assert_eq!(q8.planes.len(), 7 * 128);
-        for qi in 0..7 {
-            for p in 0..8 {
-                for k in 0..16 {
-                    assert_eq!(q8.planes[qi * 128 + p * 16 + k], v[qi * 128 + k * 8 + p]);
+    fn query_i8_layouts_are_consistent() {
+        // Strides exercise every rounding case: 48 (both round to 64), 96
+        // (biased exact, padded rounds to 128), 128 (both exact), 130
+        // (ragged dim still gets well-formed layouts).
+        for &dim in &[48usize, 96, 128, 130] {
+            let n = 7;
+            let q8 = quantize_query_i8(&random(n, dim, 900 + dim as u64).view());
+            let v = q8.values.as_slice().unwrap();
+            for qi in 0..n {
+                let t: i32 = v[qi * dim..(qi + 1) * dim].iter().map(|&x| x as i32).sum();
+                assert_eq!(q8.sums[qi], t, "sums dim={dim}");
+            }
+            let bs = biased_stride(dim);
+            let ps = padded_stride(dim);
+            assert_eq!(q8.biased.len(), n * bs, "biased len dim={dim}");
+            assert_eq!(q8.padded.len(), n * ps, "padded len dim={dim}");
+            for qi in 0..n {
+                for d in 0..dim {
+                    assert_eq!(
+                        q8.biased[qi * bs + d] as i32,
+                        v[qi * dim + d] as i32 + 128,
+                        "biased dim={dim} [{qi},{d}]"
+                    );
+                    assert_eq!(
+                        q8.padded[qi * ps + d],
+                        v[qi * dim + d],
+                        "padded dim={dim} [{qi},{d}]"
+                    );
                 }
+                assert!(
+                    q8.biased[qi * bs + dim..(qi + 1) * bs]
+                        .iter()
+                        .all(|&b| b == 0),
+                    "biased padding dim={dim} row {qi}"
+                );
+                assert!(
+                    q8.padded[qi * ps + dim..(qi + 1) * ps]
+                        .iter()
+                        .all(|&p| p == 0),
+                    "padded padding dim={dim} row {qi}"
+                );
             }
         }
-        // Non-128 dims skip the plane layout.
-        assert!(quantize_query_i8(&random(3, 64, 901).view())
-            .planes
-            .is_empty());
     }
 
     #[test]
@@ -1242,7 +1498,9 @@ mod tests {
         // The fast int8 kernel must equal float MaxSim over the SAME int8 codes,
         // i.e. maxsim_binary on the dequantized query. This isolates the kernel
         // from query-quantization error (that error is measured separately).
-        for &dim in &[64usize, 128, 127] {
+        // Dims cover fused whole/partial groups (64, 96, 128, 200), a ragged
+        // per-pair dim (127), and a beyond-fused dim (320).
+        for &dim in &[64usize, 96, 127, 128, 200, 320] {
             let query = random(12, dim, 7 + dim as u64);
             let doc = random(50, dim, 8 + dim as u64);
             let packed = binarize(&doc.view());

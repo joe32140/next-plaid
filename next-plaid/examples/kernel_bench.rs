@@ -4,17 +4,18 @@
 //! Storage is FIXED at packed sign bits (32×) for every binary variant — the
 //! only thing that changes is the COMPUTE-time kernel:
 //!
-//!   A. per-pair 2P-T      — the fallback path for dims != 128 and CPUs
-//!                           without the fused kernels' features: a SIMD dot
-//!                           per (query, doc-token) pair on the packed bits.
-//!   F/G/H. fused kernels  — the dim=128 defaults: doc-token-outer, each doc
-//!                           token's bits expanded once in registers and
-//!                           amortized over all query tokens (AVX-512 VNNI /
-//!                           AVX2 masked-SAD / NEON SDOT).
+//!   A. per-pair 2P-T      — the fallback path for ragged dims (dim % 8 != 0),
+//!                           dims > 256, and CPUs without the fused kernels'
+//!                           features: a SIMD dot per (query, doc-token) pair
+//!                           on the packed bits.
+//!   F/G/H. fused kernels  — the byte-aligned-dim defaults (dim % 8 == 0, up
+//!                           to 256): doc-token-outer, each doc token's bits
+//!                           expanded once and amortized over all query tokens
+//!                           (AVX-512 VNNI / AVX2 masked-SAD / NEON SDOT).
 //!   C. decode -> f32 GEMM — maxsim_binary (decode to ±1 then BLAS), reference.
 //!
-//! Run:
-//!   cargo run -p next-plaid --release --example kernel_bench
+//! Run (dim defaults to 128):
+//!   cargo run -p next-plaid --release --example kernel_bench [-- <dim>]
 //!   cargo run -p next-plaid --release --features accelerate --example kernel_bench
 
 use std::time::{Duration, Instant};
@@ -31,7 +32,6 @@ use next_plaid::binary::{
     quantize_query_i8,
 };
 
-const DIM: usize = 128;
 const N_DOCS: usize = 4000;
 const DOC_TOKENS: usize = 80;
 const QUERY_TOKENS: usize = 32;
@@ -60,16 +60,20 @@ fn best_of<F: Fn() -> f32>(f: F) -> (Duration, f32) {
 }
 
 fn main() {
+    let dim: usize = std::env::args()
+        .nth(1)
+        .map(|s| s.parse().expect("dim must be a positive integer"))
+        .unwrap_or(128);
     println!(
         "int8 × 1-bit kernel microbenchmark\n\
-         dim={DIM} docs={N_DOCS} doc_tokens={DOC_TOKENS} query_tokens={QUERY_TOKENS} reps={REPS}\n\
+         dim={dim} docs={N_DOCS} doc_tokens={DOC_TOKENS} query_tokens={QUERY_TOKENS} reps={REPS}\n\
          (storage fixed at packed bits for A/C and the fused kernels)\n"
     );
 
     // One query, many docs — this is the Stage-2 rescore inner shape.
-    let query = randn(QUERY_TOKENS, DIM, 1);
+    let query = randn(QUERY_TOKENS, dim, 1);
     let docs_f32: Vec<Array2<f32>> = (0..N_DOCS)
-        .map(|i| randn(DOC_TOKENS, DIM, 100 + i as u64))
+        .map(|i| randn(DOC_TOKENS, dim, 100 + i as u64))
         .collect();
     let docs_bits: Vec<Array2<u8>> = docs_f32.iter().map(|d| binarize(&d.view())).collect();
 
@@ -90,7 +94,7 @@ fn main() {
     let (t_a, _) = best_of(|| {
         docs_bits
             .iter()
-            .map(|b| maxsim_binary_i8_pairwise(&q8, &b.view(), DIM))
+            .map(|b| maxsim_binary_i8_pairwise(&q8, &b.view(), dim))
             .sum()
     });
     // F/G: the fused doc-token-outer kernels behind the dispatched entry point.
@@ -124,13 +128,13 @@ fn main() {
     let (t_disp, _) = best_of(|| {
         docs_bits
             .iter()
-            .map(|b| maxsim_binary_i8(&q8, &b.view(), DIM))
+            .map(|b| maxsim_binary_i8(&q8, &b.view(), dim))
             .sum()
     });
     let (t_c, _) = best_of(|| {
         docs_bits
             .iter()
-            .map(|b| maxsim_binary(&qf.view(), &b.view(), DIM))
+            .map(|b| maxsim_binary(&qf.view(), &b.view(), dim))
             .sum()
     });
 
@@ -138,7 +142,7 @@ fn main() {
     let rel = |d: Duration| t_a.as_secs_f64() / d.as_secs_f64();
     println!("Per-doc Stage-2 latency (scoring 1 query's {QUERY_TOKENS} tokens vs a {DOC_TOKENS}-token doc):");
     println!(
-        "  A. per-pair 2P-T       (32x):  {:>7.3} us/doc   {:.2}x  (fallback: dims != 128)",
+        "  A. per-pair 2P-T       (32x):  {:>7.3} us/doc   {:.2}x  (fallback)",
         us(t_a),
         rel(t_a)
     );

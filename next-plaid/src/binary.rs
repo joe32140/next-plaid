@@ -12,8 +12,7 @@
 //! `q · s = Σ_d q_d · s_d`, so document precision can collapse to one bit per
 //! dimension while the ranking stays close to full precision.
 //!
-//! Scoring kernels (all exact w.r.t. the stored signs; benchmarked in
-//! `examples/kernel_bench.rs`):
+//! Scoring kernels (all exact w.r.t. the stored signs):
 //!   * [`maxsim_binary_i8`] — the search-path default. Dispatches to a fused
 //!     doc-token-outer kernel for byte-aligned dims (`dim % 8 == 0`, up to
 //!     256): AVX-512 VNNI `vpdpbusd` or AVX2 masked-SAD on x86_64, SDOT on

@@ -56,6 +56,14 @@ pub struct IndexConfigRequest {
     #[serde(default)]
     #[schema(example = "unicode61")]
     pub fts_tokenizer: Option<String>,
+    /// Store documents as 1-bit signs scored with asymmetric binary MaxSim
+    /// instead of residual quantization (default: false). ~4x smaller on disk
+    /// and faster to search than nbits=4, at a small ranking-quality cost;
+    /// intended for embedding dims >= 96. Set at creation time; documents can
+    /// be added only while the index stays at or below `start_from_scratch`.
+    #[serde(default)]
+    #[schema(example = false)]
+    pub binary: Option<bool>,
 }
 
 /// Response after declaring an index.
@@ -95,6 +103,10 @@ pub struct IndexConfigStored {
     #[serde(default = "default_fts_tokenizer")]
     #[schema(example = "unicode61")]
     pub fts_tokenizer: String,
+    /// Whether documents are stored as 1-bit signs (asymmetric binary MaxSim)
+    #[serde(default)]
+    #[schema(example = false)]
+    pub binary: bool,
 }
 
 fn default_start_from_scratch() -> usize {

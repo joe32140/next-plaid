@@ -173,6 +173,13 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hybrid_alpha: Option<f32>,
 
+    /// Store document embeddings as packed 1-bit signs (asymmetric binary
+    /// quantization) instead of residual codes. Default: false. Indexes are
+    /// ~4x smaller and searches faster, at a small ranking-quality cost.
+    /// Changing this setting re-embeds existing indexes on their next update.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary: Option<bool>,
+
     /// Extra directory/file patterns to ignore during indexing (on top of defaults)
     /// e.g., ["generated", "*.pb.go", "migrations"]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -275,6 +282,22 @@ impl Config {
     /// Clear the FP32 setting (revert to default INT8)
     pub fn clear_fp32(&mut self) {
         self.fp32 = None;
+    }
+
+    /// Check if document embeddings should be stored as 1-bit signs
+    /// (asymmetric binary quantization). Defaults to false (residual codes).
+    pub fn use_binary(&self) -> bool {
+        self.binary.unwrap_or(false)
+    }
+
+    /// Set whether to store document embeddings as 1-bit signs
+    pub fn set_binary(&mut self, binary: bool) {
+        self.binary = Some(binary);
+    }
+
+    /// Clear the binary storage setting (revert to default residual codes)
+    pub fn clear_binary(&mut self) {
+        self.binary = None;
     }
 
     /// Get the configured CoreML model cache directory, if any (issue #129).
@@ -921,6 +944,40 @@ mod tests {
         let restored: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.fp32, Some(true));
         assert!(restored.use_fp32());
+    }
+
+    #[test]
+    fn test_binary_defaults_off() {
+        let config = Config::default();
+        assert_eq!(config.binary, None);
+        assert!(!config.use_binary());
+        // Absent from JSON when unset (no behavior change for existing configs).
+        assert!(!serde_json::to_string(&config).unwrap().contains("binary"));
+    }
+
+    #[test]
+    fn test_binary_set_clear() {
+        let mut config = Config::default();
+        config.set_binary(true);
+        assert_eq!(config.binary, Some(true));
+        assert!(config.use_binary());
+
+        config.set_binary(false);
+        assert!(!config.use_binary());
+
+        config.clear_binary();
+        assert_eq!(config.binary, None);
+        assert!(!config.use_binary());
+    }
+
+    #[test]
+    fn test_binary_survives_serialization() {
+        let mut config = Config::default();
+        config.set_binary(true);
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.binary, Some(true));
+        assert!(restored.use_binary());
     }
 
     #[test]

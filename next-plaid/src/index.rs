@@ -1491,13 +1491,6 @@ impl MmapIndex {
             update_centroids, update_index,
         };
 
-        if self.metadata.binary {
-            return Err(Error::Search(
-                "incremental update is not yet supported for binary indexes; rebuild instead"
-                    .into(),
-            ));
-        }
-
         let path_str = self.path.clone();
         let index_path = std::path::Path::new(&path_str);
         let num_new_docs = embeddings.len();
@@ -1539,6 +1532,10 @@ impl MmapIndex {
                     n_samples_kmeans: config.n_samples_kmeans,
                     start_from_scratch: config.start_from_scratch,
                     force_cpu: config.force_cpu,
+                    // A rebuild from raw embeddings must keep the index's
+                    // storage scheme, or an update would silently convert a
+                    // binary index back to residual.
+                    binary: self.metadata.binary,
                     ..Default::default()
                 };
 
@@ -1556,6 +1553,20 @@ impl MmapIndex {
                 return Ok((start_doc_id..start_doc_id + num_new_docs as i64).collect());
             }
             // else: embeddings.npy is out of sync, fall through to buffer mode
+        }
+
+        // Binary indexes can only be updated through the start-from-scratch
+        // rebuild above (re-encoding from raw f32 embeddings). The buffer and
+        // centroid-expansion paths below append through the residual codec,
+        // which would corrupt a 1-bit sign store — and the expansion path
+        // deletes buffered documents before re-indexing, so the rejection must
+        // happen here, before any destructive step.
+        if self.metadata.binary {
+            return Err(Error::Update(
+                "binary indexes only support incremental updates while raw embeddings are \
+                 retained (num_documents <= start_from_scratch); rebuild the index instead"
+                    .into(),
+            ));
         }
 
         // Load buffer

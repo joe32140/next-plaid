@@ -16,6 +16,12 @@ class IndexConfig:
         fts_tokenizer: FTS5 tokenizer for full-text search over metadata.
             "unicode61" (default) for word-level search,
             "trigram" for code/substring search.
+        binary: Store documents as 1-bit signs scored with asymmetric binary
+            MaxSim instead of residual quantization (default: False).
+            ~4x smaller on disk and faster to search than nbits=4, at a small
+            ranking-quality cost; intended for embedding dims >= 96. Set at
+            creation time; documents can be added only while the index stays
+            at or below start_from_scratch.
     """
 
     nbits: int = 4
@@ -24,6 +30,7 @@ class IndexConfig:
     start_from_scratch: int = 999
     max_documents: Optional[int] = None
     fts_tokenizer: Optional[str] = None
+    binary: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -37,6 +44,8 @@ class IndexConfig:
             result["max_documents"] = self.max_documents
         if self.fts_tokenizer is not None:
             result["fts_tokenizer"] = self.fts_tokenizer
+        if self.binary:
+            result["binary"] = self.binary
         return result
 
 

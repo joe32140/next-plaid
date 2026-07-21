@@ -1,0 +1,131 @@
+//! End-to-end tests for asymmetric int8×LUT residual scoring: same index,
+//! `residual_asym` toggled per search — retrieval must agree with the float
+//! path (the two paths differ only by int8 quantization of the residual term
+//! and the float path's post-decompress renormalize, both quality-neutral).
+
+use ndarray::{Array2, Axis};
+use ndarray_rand::rand::SeedableRng;
+use ndarray_rand::rand_distr::StandardNormal;
+use ndarray_rand::RandomExt;
+use next_plaid::index::MmapIndex;
+use next_plaid::{IndexConfig, SearchParameters};
+use rand::rngs::StdRng;
+use tempfile::TempDir;
+
+fn random_docs(num_docs: usize, tokens: usize, dim: usize) -> Vec<Array2<f32>> {
+    let mut rng = StdRng::seed_from_u64(7);
+    (0..num_docs)
+        .map(|_| {
+            let mut emb: Array2<f32> =
+                Array2::random_using((tokens, dim), StandardNormal, &mut rng);
+            for mut row in emb.axis_iter_mut(Axis(0)) {
+                let norm = row.dot(&row).sqrt().max(1e-12);
+                row /= norm;
+            }
+            emb
+        })
+        .collect()
+}
+
+fn params(asym: bool) -> SearchParameters {
+    SearchParameters {
+        top_k: 5,
+        n_ivf_probe: 16,
+        residual_asym: asym,
+        ..Default::default()
+    }
+}
+
+/// Every document must retrieve itself at rank 1 through the LUT path, for
+/// every supported nbits.
+#[test]
+fn lut_path_retrieves_the_query_document() {
+    for &nbits in &[1usize, 2, 4] {
+        let docs = random_docs(50, 8, 64);
+        let dir = TempDir::new().unwrap();
+        let config = IndexConfig {
+            nbits,
+            batch_size: 64,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let index =
+            MmapIndex::create_with_kmeans(&docs, dir.path().to_str().unwrap(), &config).unwrap();
+        for (i, doc) in docs.iter().enumerate() {
+            let res = index.search(doc, &params(true), None).unwrap();
+            assert_eq!(
+                res.passage_ids[0], i as i64,
+                "nbits={nbits}: doc {i} did not self-retrieve via LUT path"
+            );
+        }
+    }
+}
+
+/// The LUT path and the float path must produce near-identical rankings on
+/// the same index: identical top-1 and high top-5 overlap for every query.
+#[test]
+fn lut_path_agrees_with_float_path() {
+    let docs = random_docs(80, 8, 64);
+    let dir = TempDir::new().unwrap();
+    let config = IndexConfig {
+        nbits: 4,
+        batch_size: 64,
+        seed: Some(42),
+        ..Default::default()
+    };
+    let index =
+        MmapIndex::create_with_kmeans(&docs, dir.path().to_str().unwrap(), &config).unwrap();
+
+    let mut overlap_total = 0usize;
+    for doc in docs.iter().take(30) {
+        let float = index.search(doc, &params(false), None).unwrap();
+        let lut = index.search(doc, &params(true), None).unwrap();
+        assert_eq!(
+            float.passage_ids[0], lut.passage_ids[0],
+            "top-1 disagreement between float and LUT paths"
+        );
+        overlap_total += lut
+            .passage_ids
+            .iter()
+            .filter(|id| float.passage_ids.contains(id))
+            .count();
+    }
+    // ≥ 4 of 5 average overlap: the paths differ only by int8 rounding and
+    // the float path's renormalize.
+    assert!(
+        overlap_total >= 30 * 4,
+        "top-5 overlap too low: {overlap_total}/150"
+    );
+}
+
+/// Scores from the LUT path must approximate the float path's scores: the
+/// centroid term is shared exactly, so differences come only from int8
+/// residual rounding and the renormalize.
+#[test]
+fn lut_scores_track_float_scores() {
+    let docs = random_docs(60, 8, 64);
+    let dir = TempDir::new().unwrap();
+    let config = IndexConfig {
+        nbits: 4,
+        batch_size: 64,
+        seed: Some(42),
+        ..Default::default()
+    };
+    let index =
+        MmapIndex::create_with_kmeans(&docs, dir.path().to_str().unwrap(), &config).unwrap();
+
+    for doc in docs.iter().take(10) {
+        let float = index.search(doc, &params(false), None).unwrap();
+        let lut = index.search(doc, &params(true), None).unwrap();
+        // Compare the top-1 scores (same doc per the agreement test). Docs are
+        // 8 tokens of unit vectors → MaxSim ∈ [-8, 8]; the two paths should
+        // agree within a few percent of that range.
+        let diff = (float.scores[0] - lut.scores[0]).abs();
+        assert!(
+            diff < 0.4,
+            "top-1 score diverged: float {} vs lut {}",
+            float.scores[0],
+            lut.scores[0]
+        );
+    }
+}

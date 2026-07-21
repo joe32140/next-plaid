@@ -45,6 +45,14 @@ pub struct SearchParameters {
     /// Default: Some(0.4)
     #[serde(default = "default_centroid_score_threshold")]
     pub centroid_score_threshold: Option<f32>,
+    /// Score residual candidates asymmetrically — int8 query × int8 LUT over
+    /// the stored codes plus the centroid term from the IVF probe matrix —
+    /// instead of decompress→f32 MaxSim. Compute-only: same index, same
+    /// storage, so the two modes can be A/B'd per search. Ignored for binary
+    /// indexes and on the batched-centroid path (no dense query×centroid
+    /// matrix there). Default off.
+    #[serde(default)]
+    pub residual_asym: bool,
 }
 
 fn default_centroid_batch_size() -> usize {
@@ -64,6 +72,7 @@ impl Default for SearchParameters {
             n_ivf_probe: 8,
             centroid_batch_size: default_centroid_batch_size(),
             centroid_score_threshold: default_centroid_score_threshold(),
+            residual_asym: false,
         }
     }
 }
@@ -99,18 +108,33 @@ enum ScoreQuery<'a> {
     /// Float / residual index: the caller's full-precision query, borrowed —
     /// standard ColBERT MaxSim needs no per-query preparation.
     Float(&'a Array2<f32>),
+    /// Residual index scored asymmetrically: int8 query codes plus the fused
+    /// byte→int8-weights LUT, scoring the stored codes directly (centroid
+    /// term from the dense query×centroid matrix; no decompression).
+    ResidualLut {
+        q8: crate::binary::QueryI8,
+        lut: crate::residual_lut::ResidualLut,
+    },
 }
 
 /// Prepare the query for the index's Stage-2 scoring path, once per search.
 fn prepare_score_query<'a>(
     index: &crate::index::MmapIndex,
     query: &'a Array2<f32>,
+    residual_asym: bool,
 ) -> ScoreQuery<'a> {
     if index.metadata.binary {
-        ScoreQuery::Binary(crate::binary::quantize_query_i8(&query.view()))
-    } else {
-        ScoreQuery::Float(query)
+        return ScoreQuery::Binary(crate::binary::quantize_query_i8(&query.view()));
     }
+    if residual_asym && index.codec.embedding_dim() <= crate::residual_lut::MAX_DIM {
+        if let Some(lut) = crate::residual_lut::quantize_lut(&index.codec) {
+            return ScoreQuery::ResidualLut {
+                q8: crate::binary::quantize_query_i8(&query.view()),
+                lut,
+            };
+        }
+    }
+    ScoreQuery::Float(query)
 }
 
 /// Exact MaxSim of the prepared query against document `doc_id`.
@@ -122,6 +146,7 @@ fn prepare_score_query<'a>(
 fn exact_doc_score(
     index: &crate::index::MmapIndex,
     query: &ScoreQuery,
+    cdot: Option<&Array2<f32>>,
     doc_id: usize,
 ) -> Option<f32> {
     match query {
@@ -138,6 +163,23 @@ fn exact_doc_score(
         ScoreQuery::Float(q) => {
             let doc = index.get_document_embeddings(doc_id).ok()?;
             Some(colbert_score(&q.view(), &doc.view()))
+        }
+        ScoreQuery::ResidualLut { q8, lut } => {
+            // Needs the dense query×centroid matrix for the centroid term;
+            // prepare_score_query never builds this arm on paths without it.
+            let cdot = cdot?;
+            let start = index.doc_offsets[doc_id];
+            let end = index.doc_offsets[doc_id + 1];
+            let packed = index.mmap_residuals.slice_rows(start, end);
+            let codes = index.mmap_codes.slice(start, end);
+            Some(crate::residual_lut::maxsim_residual_lut_i8(
+                q8,
+                &packed,
+                &codes,
+                &cdot.view(),
+                lut,
+                index.codec.embedding_dim(),
+            ))
         }
     }
 }
@@ -532,14 +574,19 @@ pub fn search_one_mmap(
     // Compute exact scores. Binary indexes score against an int8 query; the
     // full-precision query is used for the float (residual) path.
     // Chunked processing limits concurrent memory from parallel decompression.
-    let exact_query = prepare_score_query(index, query);
+    let exact_query = prepare_score_query(index, query, params.residual_asym);
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
         .par_chunks(DECOMPRESS_CHUNK_SIZE)
         .flat_map(|chunk| {
             chunk
                 .iter()
                 .filter_map(|&doc_id| {
-                    let score = exact_doc_score(index, &exact_query, doc_id as usize)?;
+                    let score = exact_doc_score(
+                        index,
+                        &exact_query,
+                        Some(&query_centroid_scores),
+                        doc_id as usize,
+                    )?;
                     Some((doc_id, score))
                 })
                 .collect::<Vec<_>>()
@@ -657,14 +704,17 @@ fn search_one_mmap_batched(
     // Compute exact scores. Binary indexes score against an int8 query; the
     // full-precision query is used for the float (residual) path.
     // Chunked processing limits concurrent memory from parallel decompression.
-    let exact_query = prepare_score_query(index, query);
+    // The batched-centroid path never materializes the dense query×centroid
+    // matrix the asymmetric residual arm needs for its centroid term, so it
+    // always scores residual candidates through the float path.
+    let exact_query = prepare_score_query(index, query, false);
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
         .par_chunks(DECOMPRESS_CHUNK_SIZE)
         .flat_map(|chunk| {
             chunk
                 .iter()
                 .filter_map(|&doc_id| {
-                    let score = exact_doc_score(index, &exact_query, doc_id as usize)?;
+                    let score = exact_doc_score(index, &exact_query, None, doc_id as usize)?;
                     Some((doc_id, score))
                 })
                 .collect::<Vec<_>>()

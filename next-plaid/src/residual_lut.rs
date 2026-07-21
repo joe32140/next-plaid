@@ -92,7 +92,7 @@ pub fn quantize_lut(codec: &ResidualCodec) -> Option<ResidualLut> {
 ///
 /// Scalar reference implementation; the SIMD paths must match it exactly on
 /// the integer accumulator (same contract as the binary kernels).
-pub fn maxsim_residual_lut_i8(
+pub fn maxsim_residual_lut_scalar(
     q8: &QueryI8,
     doc_packed: &ArrayView2<u8>,
     doc_codes: &[i64],
@@ -138,6 +138,105 @@ pub fn maxsim_residual_lut_i8(
         }
     }
     best.iter().sum()
+}
+
+/// Public entry: runtime-dispatched MaxSim over stored residual codes.
+///
+/// Uses the fused NEON SDOT path on aarch64 with `dotprod` for byte-aligned
+/// dims ≤ [`MAX_DIM`]; otherwise the scalar reference. All paths compute the
+/// identical integer accumulator, so results are bit-equal across dispatch.
+pub fn maxsim_residual_lut_i8(
+    q8: &QueryI8,
+    doc_packed: &ArrayView2<u8>,
+    doc_codes: &[i64],
+    cdot: &ArrayView2<f32>,
+    lut: &ResidualLut,
+    dim: usize,
+) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if dim.is_multiple_of(8)
+            && dim <= MAX_DIM
+            && std::arch::is_aarch64_feature_detected!("dotprod")
+        {
+            return unsafe {
+                neon::maxsim_residual_lut_neon(q8, doc_packed, doc_codes, cdot, lut, dim)
+            };
+        }
+    }
+    maxsim_residual_lut_scalar(q8, doc_packed, doc_codes, cdot, lut, dim)
+}
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use super::*;
+    use std::arch::aarch64::*;
+
+    /// Fused NEON path: expand each doc token's packed bytes once through the
+    /// fused table into a zero-padded weights buffer, then score all query
+    /// rows with SDOT against [`QueryI8::padded`] (whose zero lanes make the
+    /// buffer's padding contribute nothing).
+    ///
+    /// # Safety
+    /// Requires the `dotprod` CPU feature; `dim % 8 == 0 && dim <= MAX_DIM`.
+    pub(super) unsafe fn maxsim_residual_lut_neon(
+        q8: &QueryI8,
+        doc_packed: &ArrayView2<u8>,
+        doc_codes: &[i64],
+        cdot: &ArrayView2<f32>,
+        lut: &ResidualLut,
+        dim: usize,
+    ) -> f32 {
+        let nq = q8.values.nrows();
+        if nq == 0 || doc_packed.nrows() == 0 {
+            return 0.0;
+        }
+        let ps = crate::binary::padded_stride(dim);
+        let qp_base = q8.padded.as_ptr();
+        let sqw: Vec<f32> = q8.scales.iter().map(|&s| s * lut.scale).collect();
+        let mut best = vec![f32::NEG_INFINITY; nq];
+        let mut w = [0i8; MAX_DIM];
+
+        for (t, row) in doc_packed.axis_iter(Axis(0)).enumerate() {
+            let mut d = 0usize;
+            'expand: for &byte in row.iter() {
+                let base = byte as usize * lut.keys_per_byte;
+                for k in 0..lut.keys_per_byte {
+                    if d == dim {
+                        break 'expand;
+                    }
+                    w[d] = lut.fused[base + k];
+                    d += 1;
+                }
+            }
+            let cid = doc_codes[t] as usize;
+            let wp = w.as_ptr();
+            for (qi, best_qi) in best.iter_mut().enumerate() {
+                let qp = qp_base.add(qi * ps);
+                let mut a = vdupq_n_s32(0);
+                let mut b = vdupq_n_s32(0);
+                let mut k = 0usize;
+                // Partial tail chunks are exact: both sides zero-pad past dim.
+                while k < dim {
+                    a = crate::binary::sdot_asm(a, vld1q_s8(qp.add(k)), vld1q_s8(wp.add(k)));
+                    if k + 16 < dim {
+                        b = crate::binary::sdot_asm(
+                            b,
+                            vld1q_s8(qp.add(k + 16)),
+                            vld1q_s8(wp.add(k + 16)),
+                        );
+                    }
+                    k += 32;
+                }
+                let acc = vaddvq_s32(vaddq_s32(a, b));
+                let score = sqw[qi] * acc as f32 + cdot[[qi, cid]];
+                if score > *best_qi {
+                    *best_qi = score;
+                }
+            }
+        }
+        best.iter().sum()
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +310,55 @@ mod tests {
                     }
                     assert_eq!(got, expect, "nbits={nbits} dim={dim}");
                 }
+            }
+        }
+    }
+
+    /// The NEON path must equal the scalar reference bit-for-bit: both
+    /// compute the identical integer accumulator, and the float epilogue is
+    /// the same expression.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_kernel_matches_scalar_bitwise() {
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            return;
+        }
+        let mut rng = StdRng::seed_from_u64(23);
+        for &nbits in &[1usize, 2, 4] {
+            for &dim in &[8usize, 16, 40, 48, 128, 200, 256] {
+                let k = 12;
+                let codec = toy_codec(dim, nbits, k, &mut rng);
+                let lut = quantize_lut(&codec).unwrap();
+                let query = Array2::from_shape_fn((7, dim), |_| rng.gen_range(-1.0f32..1.0));
+                let q8 = crate::binary::quantize_query_i8(&query.view());
+                let res = Array2::from_shape_fn((13, dim), |_| rng.gen_range(-0.4f32..0.4));
+                let packed = codec.quantize_residuals(&res).unwrap();
+                let codes: Vec<i64> = (0..13).map(|_| rng.gen_range(0..k as i64)).collect();
+                let cdot = Array2::from_shape_fn((7, k), |_| rng.gen_range(-1.0f32..1.0));
+
+                let scalar = maxsim_residual_lut_scalar(
+                    &q8,
+                    &packed.view(),
+                    &codes,
+                    &cdot.view(),
+                    &lut,
+                    dim,
+                );
+                let neon = unsafe {
+                    super::neon::maxsim_residual_lut_neon(
+                        &q8,
+                        &packed.view(),
+                        &codes,
+                        &cdot.view(),
+                        &lut,
+                        dim,
+                    )
+                };
+                assert_eq!(
+                    scalar.to_bits(),
+                    neon.to_bits(),
+                    "nbits={nbits} dim={dim}: scalar {scalar} != neon {neon}"
+                );
             }
         }
     }

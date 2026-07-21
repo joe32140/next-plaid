@@ -125,6 +125,12 @@ struct Profile {
     lat_p95: f64,
     /// Deployed per-query NDCG@10, in judged-query order (for paired bootstrap).
     dep_per_query: Vec<f64>,
+    /// Same index re-scored with `residual_asym = true` (NaN/empty for binary).
+    asym_ndcg: f64,
+    asym_lat_mean: f64,
+    asym_lat_p50: f64,
+    asym_lat_p95: f64,
+    asym_per_query: Vec<f64>,
 }
 
 /// NDCG over judged queries; times each search call when `lat` is given.
@@ -210,6 +216,42 @@ fn profile(
     let pct = |p: f64| lat[((lat.len() - 1) as f64 * p) as usize];
     let lat_mean = lat.iter().sum::<f64>() / lat.len() as f64;
 
+    // A/B on the SAME index: asymmetric int8×LUT residual scoring (skipped
+    // for binary indexes, where Stage-2 is already asymmetric).
+    let (asym_ndcg, asym_per_query, mut asym_lat) = if config.binary {
+        (f64::NAN, Vec::new(), Vec::new())
+    } else {
+        let asym_params = SearchParameters {
+            residual_asym: true,
+            ..dep_params.clone()
+        };
+        let _ = index.search(&queries[0], &asym_params, None);
+        let mut alat = Vec::new();
+        let (n, pq) = run_queries(
+            &index,
+            &asym_params,
+            corpus_ids,
+            queries,
+            query_ids,
+            qrels,
+            Some(&mut alat),
+        );
+        (n, pq, alat)
+    };
+    asym_lat.sort_by(|a, b| a.total_cmp(b));
+    let apct = |p: f64| {
+        if asym_lat.is_empty() {
+            f64::NAN
+        } else {
+            asym_lat[((asym_lat.len() - 1) as f64 * p) as usize]
+        }
+    };
+    let asym_lat_mean = if asym_lat.is_empty() {
+        f64::NAN
+    } else {
+        asym_lat.iter().sum::<f64>() / asym_lat.len() as f64
+    };
+
     let _ = std::fs::remove_dir_all(&dir);
     Profile {
         name,
@@ -222,6 +264,11 @@ fn profile(
         lat_p50: pct(0.5),
         lat_p95: pct(0.95),
         dep_per_query,
+        asym_ndcg,
+        asym_lat_mean,
+        asym_lat_p50: apct(0.5),
+        asym_lat_p95: apct(0.95),
+        asym_per_query,
     }
 }
 
@@ -318,6 +365,20 @@ fn main() {
         );
     }
 
+    // A/B lines: float vs asymmetric int8×LUT scoring on the same index.
+    for r in rows.iter().filter(|r| r.asym_ndcg.is_finite()) {
+        println!(
+            "{:<18} asym-LUT: dep NDCG {:.4} (float {:.4}, Δ{:+.4})  mean {:.2} ms vs {:.2} ms ({:.2}x)",
+            r.name,
+            r.asym_ndcg,
+            r.dep_ndcg,
+            r.asym_ndcg - r.dep_ndcg,
+            r.asym_lat_mean,
+            r.lat_mean,
+            r.lat_mean / r.asym_lat_mean
+        );
+    }
+
     let by_name = |n: &str| rows.iter().find(|r| r.name == n).unwrap();
     let res4 = by_name("residual-nbits4");
     let bin = by_name("binary-int8x1bit");
@@ -340,12 +401,23 @@ fn main() {
         let json_rows: Vec<String> = rows
             .iter()
             .map(|r| {
+                let asym = if r.asym_ndcg.is_finite() {
+                    format!(
+                        "{{\"ndcg\":{:.6},\"lat_mean_ms\":{:.3},\"lat_p50_ms\":{:.3},\"lat_p95_ms\":{:.3},\"per_query\":[{}]}}",
+                        r.asym_ndcg, r.asym_lat_mean, r.asym_lat_p50, r.asym_lat_p95,
+                        r.asym_per_query.iter().map(|v| format!("{v:.5}"))
+                            .collect::<Vec<_>>().join(",")
+                    )
+                } else {
+                    "null".to_string()
+                };
                 format!(
-                    "{{\"name\":\"{}\",\"build_s\":{:.3},\"index_bytes\":{},\"bytes_per_token\":{},\"wide_ndcg\":{:.6},\"dep_ndcg\":{:.6},\"lat_mean_ms\":{:.3},\"lat_p50_ms\":{:.3},\"lat_p95_ms\":{:.3},\"per_query\":[{}]}}",
+                    "{{\"name\":\"{}\",\"build_s\":{:.3},\"index_bytes\":{},\"bytes_per_token\":{},\"wide_ndcg\":{:.6},\"dep_ndcg\":{:.6},\"lat_mean_ms\":{:.3},\"lat_p50_ms\":{:.3},\"lat_p95_ms\":{:.3},\"per_query\":[{}],\"asym\":{}}}",
                     r.name, r.build_s, r.index_bytes, r.bytes_per_token,
                     r.wide_ndcg, r.dep_ndcg, r.lat_mean, r.lat_p50, r.lat_p95,
                     r.dep_per_query.iter().map(|v| format!("{v:.5}"))
-                        .collect::<Vec<_>>().join(",")
+                        .collect::<Vec<_>>().join(","),
+                    asym
                 )
             })
             .collect();

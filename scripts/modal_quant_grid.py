@@ -325,7 +325,7 @@ def eval_cell(tag: str, dataset: str, size: int = 0, seed: int = 0,
 
     # -- exact-f32 ceiling on this subset from the precomputed score matrix --
     query_ids = json.load(open(f"{bundle}/query_ids.json"))
-    f32_ndcg = None
+    f32_ndcg, f32_per_query = None, None
     if os.path.exists(f"{bundle}/f32_scores.npy"):
         scores = np.load(f"{bundle}/f32_scores.npy", mmap_mode="r")[:, keep]
         kept_ids = [corpus_ids[i] for i in keep]
@@ -338,6 +338,7 @@ def eval_cell(tag: str, dataset: str, size: int = 0, seed: int = 0,
             vals.append(_ndcg10([rels.get(kept_ids[j], 0) for j in order],
                                 list(rels.values())))
         f32_ndcg = float(np.mean(vals))
+        f32_per_query = [round(v, 5) for v in vals]
 
     # -- Rust harness (residual-4/2/1 + binary-int8x1bit) --------------------
     env = dict(os.environ, NDCG_JSON="1")
@@ -358,7 +359,7 @@ def eval_cell(tag: str, dataset: str, size: int = 0, seed: int = 0,
     result = {
         "dataset": dataset, "tag": tag, "model_id": MODELS[tag],
         "size": size or n_docs, "n_docs_kept": int(len(keep)), "seed": seed,
-        "f32_ndcg": f32_ndcg, "harness": harness,
+        "f32_ndcg": f32_ndcg, "f32_per_query": f32_per_query, "harness": harness,
         "harness_sha": harness_sha, "arch": platform.machine(),
         "harness_wall_s": round(time.time() - t, 1),
         "date": time.strftime("%Y-%m-%d %H:%M:%S"),

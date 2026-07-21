@@ -123,6 +123,8 @@ struct Profile {
     lat_mean: f64,
     lat_p50: f64,
     lat_p95: f64,
+    /// Deployed per-query NDCG@10, in judged-query order (for paired bootstrap).
+    dep_per_query: Vec<f64>,
 }
 
 /// NDCG over judged queries; times each search call when `lat` is given.
@@ -135,9 +137,8 @@ fn run_queries(
     query_ids: &[String],
     qrels: &Qrels,
     mut lat: Option<&mut Vec<f64>>,
-) -> f64 {
-    let mut sum_ndcg = 0.0;
-    let mut counted = 0;
+) -> (f64, Vec<f64>) {
+    let mut per_q = Vec::new();
     for (q, qid) in queries.iter().zip(query_ids) {
         let Some(rels) = qrels.get(qid) else { continue };
         let t = std::time::Instant::now();
@@ -150,10 +151,9 @@ fn run_queries(
             .iter()
             .map(|&pid| corpus_ids[pid as usize].clone())
             .collect();
-        sum_ndcg += ndcg_at_k(&ranked, rels, 10);
-        counted += 1;
+        per_q.push(ndcg_at_k(&ranked, rels, 10));
     }
-    sum_ndcg / counted as f64
+    (per_q.iter().sum::<f64>() / per_q.len() as f64, per_q)
 }
 
 /// Build the index once (timed), measure its disk footprint, then run the
@@ -190,13 +190,14 @@ fn profile(
             qrels,
             None,
         )
+        .0
     };
 
     // Warm the deployed path once (lazy merges, page cache), then measure.
     let dep_params = regime_params(true, docs.len());
     let _ = index.search(&queries[0], &dep_params, None);
     let mut lat = Vec::new();
-    let dep_ndcg = run_queries(
+    let (dep_ndcg, dep_per_query) = run_queries(
         &index,
         &dep_params,
         corpus_ids,
@@ -220,6 +221,7 @@ fn profile(
         lat_mean,
         lat_p50: pct(0.5),
         lat_p95: pct(0.95),
+        dep_per_query,
     }
 }
 
@@ -339,9 +341,11 @@ fn main() {
             .iter()
             .map(|r| {
                 format!(
-                    "{{\"name\":\"{}\",\"build_s\":{:.3},\"index_bytes\":{},\"bytes_per_token\":{},\"wide_ndcg\":{:.6},\"dep_ndcg\":{:.6},\"lat_mean_ms\":{:.3},\"lat_p50_ms\":{:.3},\"lat_p95_ms\":{:.3}}}",
+                    "{{\"name\":\"{}\",\"build_s\":{:.3},\"index_bytes\":{},\"bytes_per_token\":{},\"wide_ndcg\":{:.6},\"dep_ndcg\":{:.6},\"lat_mean_ms\":{:.3},\"lat_p50_ms\":{:.3},\"lat_p95_ms\":{:.3},\"per_query\":[{}]}}",
                     r.name, r.build_s, r.index_bytes, r.bytes_per_token,
-                    r.wide_ndcg, r.dep_ndcg, r.lat_mean, r.lat_p50, r.lat_p95
+                    r.wide_ndcg, r.dep_ndcg, r.lat_mean, r.lat_p50, r.lat_p95,
+                    r.dep_per_query.iter().map(|v| format!("{v:.5}"))
+                        .collect::<Vec<_>>().join(",")
                 )
             })
             .collect();

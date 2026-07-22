@@ -30,7 +30,9 @@ use std::time::Instant;
 use ndarray::{s, Array1, Array2};
 use ndarray_npy::ReadNpyExt;
 use next_plaid::index::MmapIndex;
-use next_plaid::search::{exact_score_docs_prepared, stage1_shortlist, SearchParameters};
+use next_plaid::search::{
+    exact_score_docs_prepared, search_one_mmap, stage1_shortlist, SearchParameters,
+};
 use next_plaid::IndexConfig;
 
 fn unpack(concat: &Array2<f32>, lens: &Array1<i64>) -> Vec<Array2<f32>> {
@@ -202,14 +204,28 @@ fn main() {
                     std::hint::black_box(exact_score_docs_prepared(&index, q, cdot, ids, asym));
                 }));
             }
+            // The whole pipeline through the public API (stage-1 + prep +
+            // exact + sort/top-k) — the number a caller of `search` sees.
+            // Cross-check: e2e ≈ stage1 + prep + exact.
+            let sp = SearchParameters {
+                residual_asym: asym,
+                ..SearchParameters::default()
+            };
+            let mut e2e_ms = Vec::new();
+            for q in &queries {
+                e2e_ms.push(time3(|| {
+                    std::hint::black_box(search_one_mmap(&index, q, &sp, None).unwrap());
+                }));
+            }
             let (p_mean, _) = agg(prep_ms);
             let (e_mean, e_p50) = agg(exact_ms);
+            let (t_mean, t_p50) = agg(e2e_ms);
             if scheme == "float" {
                 float_mean = e_mean;
             }
             println!(
                 "{scheme:<8} prep {:7.0} µs   exact mean {e_mean:7.3} ms  p50 {e_p50:7.3} ms   \
-                 {:6.1} ns/token   {:.2}x vs float",
+                 {:6.1} ns/token   {:.2}x vs float   | e2e mean {t_mean:7.3} ms  p50 {t_p50:7.3} ms",
                 p_mean * 1e3,
                 e_mean * 1e6 / tok_per_q,
                 float_mean / e_mean,

@@ -368,6 +368,82 @@ def embed_onnx(tag: str, dataset: str, force: bool = False):
     return {"bundle": out, "meta": meta}
 
 
+@app.function(
+    image=onnx_image, cpu=8, memory=16384, timeout=3600,
+    secrets=[HF_SECRET], volumes={CACHE_DIR: hf_cache},
+)
+def batch_probe(n: int = 64):
+    """Discriminate weight-recipe vs runtime cause of the int8 collapse.
+
+    Both the vendor int8 export and our per-channel requant collapse under
+    the batch-32 encode (per-token cos to fp32 ~0.89 but all tokens cos
+    0.9995 to the global mean direction -> NDCG ~0). Dynamic-quant
+    ACTIVATION scales are per-call max-abs over the whole [batch*seq,
+    hidden] tensor; padding rows and cross-doc outliers exist only in the
+    batched call. Encode the same SciFact docs with model_int8.onnx at
+    batch=1 vs batch=32 against the fp32 reference and compare token
+    spread."""
+    import numpy as np
+    import onnxruntime as ort
+    from huggingface_hub import hf_hub_download
+    from transformers import AutoTokenizer
+
+    model_id = "mixedbread-ai/mxbai-edge-colbert-v0-17m"
+    cfg = json.load(open(hf_hub_download(model_id, "onnx_config.json")))
+    tok = AutoTokenizer.from_pretrained(model_id)
+    _, corpus_texts, *_ = _load_beir("scifact")
+    texts = [cfg["document_prefix"] + t for t in corpus_texts[:n]]
+
+    def run(sess, batch):
+        order = (np.argsort([-len(t) for t in texts]) if batch > 1
+                 else np.arange(len(texts)))
+        out = [None] * len(texts)
+        for s in range(0, len(texts), batch):
+            bidx = order[s:s + batch]
+            enc = tok([texts[i] for i in bidx], padding=True, truncation=True,
+                      max_length=cfg["document_length"], return_tensors="np")
+            feed = {i.name: enc[i.name].astype(np.int64)
+                    for i in sess.get_inputs() if i.name in enc}
+            emb = sess.run(None, feed)[0]
+            for r, i in enumerate(bidx):
+                keep = enc["attention_mask"][r].astype(bool)
+                e = emb[r][keep].astype(np.float32)
+                out[i] = e / np.maximum(
+                    np.linalg.norm(e, axis=1, keepdims=True), 1e-12)
+        return np.concatenate(out)
+
+    def spread(e):
+        mu = e.mean(0)
+        mu /= np.linalg.norm(mu)
+        s = e @ mu
+        return s.mean(), s.std()
+
+    fp32 = ort.InferenceSession(hf_hub_download(model_id, "model.onnx"),
+                                providers=["CPUExecutionProvider"])
+    ref = run(fp32, 1)
+    m, s = spread(ref)
+    _log(f"fp32 B=1   : spread(cos to mean dir) mean={m:.4f} std={s:.4f}")
+    del fp32
+
+    int8 = ort.InferenceSession(hf_hub_download(model_id, "model_int8.onnx"),
+                                providers=["CPUExecutionProvider"])
+    results = {"fp32_spread": [float(m), float(s)]}
+    for label, b in [("int8 B=1", 1), ("int8 B=32", 32)]:
+        e = run(int8, b)
+        cos = (e * ref).sum(1)
+        m, s = spread(e)
+        _log(f"{label:<11}: cos(fp32) mean={cos.mean():.4f} p5={np.percentile(cos, 5):.4f}"
+             f"  spread mean={m:.4f} std={s:.4f}")
+        results[label] = {"cos_fp32": float(cos.mean()),
+                          "spread": [float(m), float(s)]}
+    return results
+
+
+@app.local_entrypoint()
+def probe():
+    _log(f"batch_probe: {json.dumps(batch_probe.remote())}")
+
+
 def _ndcg10(ranked_rels, all_rels):
     """Harness-exact NDCG@10: gain 2^r - 1, discount 1/log2(i+2)."""
     import math

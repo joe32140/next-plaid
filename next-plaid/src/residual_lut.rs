@@ -370,12 +370,27 @@ mod neon {
                 }
                 i += 16;
             }
-            while i < pdim {
-                let base = row[i] as usize * kpb;
+            // Sub-16 tail: pad the remaining packed bytes into a zeroed
+            // 16-byte scratch, expand with the same tbl, and copy out only
+            // the valid lanes — a direct 16-lane store would clobber the
+            // next plane's already-written low bytes. This keeps narrow
+            // dims on the SIMD path (dim 48 at nbits 2/1 packs to 12/6
+            // bytes — under one chunk — and previously fell to a scalar
+            // walk). Bit-identical: the nibble tables are verified against
+            // the fused table over all 256 byte values, zero-pad included.
+            if i < pdim {
+                let rem = pdim - i;
+                let mut src = [0u8; 16];
+                src[..rem].copy_from_slice(&row[i..pdim]);
+                let v = vld1q_u8(src.as_ptr());
+                let hi = vshrq_n_u8(v, 4);
+                let lo = vandq_u8(v, low_mask);
+                let mut dst = [0i8; 16];
                 for k in 0..kpb {
-                    w[k * pdim + i] = lut.fused[base + k];
+                    let idx = if nib.from_hi[k] { hi } else { lo };
+                    vst1q_s8(dst.as_mut_ptr(), vqtbl1q_s8(tabs[k], idx));
+                    w[k * pdim + i..k * pdim + pdim].copy_from_slice(&dst[..rem]);
                 }
-                i += 1;
             }
             let cid = code as usize;
             let inv = inv_norms[t];
@@ -475,12 +490,26 @@ mod avx2 {
                 }
                 i += 16;
             }
-            while i < pdim {
-                let base = row[i] as usize * kpb;
+            // Sub-16 tail: same padded-scratch expand as the NEON kernel —
+            // see the comment there. Keeps narrow dims on pshufb instead of
+            // a scalar walk; copy-out of only the valid lanes protects the
+            // next plane's low bytes.
+            if i < pdim {
+                let rem = pdim - i;
+                let mut src = [0u8; 16];
+                src[..rem].copy_from_slice(&row[i..pdim]);
+                let v = _mm_loadu_si128(src.as_ptr() as *const __m128i);
+                let hi = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
+                let lo = _mm_and_si128(v, low_mask);
+                let mut dst = [0i8; 16];
                 for k in 0..kpb {
-                    w[k * pdim + i] = lut.fused[base + k];
+                    let idx = if nib.from_hi[k] { hi } else { lo };
+                    _mm_storeu_si128(
+                        dst.as_mut_ptr() as *mut __m128i,
+                        _mm_shuffle_epi8(tabs[k], idx),
+                    );
+                    w[k * pdim + i..k * pdim + pdim].copy_from_slice(&dst[..rem]);
                 }
-                i += 1;
             }
             let cid = code as usize;
             let inv = inv_norms[t];

@@ -106,3 +106,24 @@ Result: 196/196 tests pass locally (native arm64). The feature now works
 above the ~67M-token / ~335k-doc cliff; the compact matrix costs
 O(distinct-centroids) instead of O(K), which is also the right shape for
 the 1B regime.
+
+### 2026-07-22 — #30: dim-48 SIMD tail — fixed, with an honest negative
+
+The narrow-dim expand fix landed: sub-16-byte packed tails now pad into a
+16-byte scratch, expand with the same `tbl`/`pshufb`, and copy out only the
+valid lanes (a direct store would clobber the next plane's low bytes).
+Bit-exact by construction — the nibble tables are verified against the
+fused table over all 256 byte values — and the parity suite (dims incl. 40
+and 48 × nbits 1/2/4, `to_bits` equality) passes on native NEON; AVX2
+validates on CI.
+
+**Measured effect is small**: quick M4 sanity at dim 48 (300 docs, non-idle
+machine): asym r4 0.90→0.81 ms, r2 0.91→0.84, r1 flat (0.91→0.95 — within
+the ±15% noise floor; binary moved 0.15→0.18 with no code change). This is
+Class 04 chapter 09's amortization law: expand is charged once per doc
+token while the score core is charged per query row (~32×), so even an
+all-scalar expand was a minor share. The real dim-48 cost driver for
+edge17m is the per-(row,token) float fold + cdot gather epilogue — i.e.
+the on-hold vfold port (#32), not the expand. Kept the fix anyway: it is
+strictly correct, removes the "falls to scalar tail" asterisk from the
+final table, and the r4/r2 gain is real if modest.

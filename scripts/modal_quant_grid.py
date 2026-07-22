@@ -614,6 +614,78 @@ def ort_version(warm_fp32: bool = False):
     _log(f"version_probe: {json.dumps(version_probe.remote(warm_fp32))}")
 
 
+onnx_123_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "onnxruntime==1.23.0",  # colgrep pin — ORT version probe for the
+                        # int8-first-session bug (embed image pins 1.20.1)
+        "transformers>=4.48",
+        "numpy>=1.24",
+        "huggingface_hub>=0.23",
+        "hf_transfer>=0.1.6",
+    )
+    .env({
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "HF_HOME": CACHE_DIR,
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        "PYTHONUNBUFFERED": "1",
+    })
+)
+
+
+@app.function(
+    image=onnx_123_image, cpu=16, memory=16384, timeout=3600,
+    secrets=[HF_SECRET], volumes={CACHE_DIR: hf_cache},
+)
+def version_probe_123(warm_fp32: bool = False):
+    """int8-first-session bug check on the LATEST onnxruntime (x86).
+    Two batches of the 32 longest SciFact docs; healthy spread ~0.019,
+    collapsed ~0.006. Run once per order in SEPARATE modal runs — the bug
+    state is process-global."""
+    import numpy as np
+    import onnxruntime as ort
+    from huggingface_hub import hf_hub_download
+    from transformers import AutoTokenizer
+
+    model_id = "mixedbread-ai/mxbai-edge-colbert-v0-17m"
+    cfg = json.load(open(hf_hub_download(model_id, "onnx_config.json")))
+    tok = AutoTokenizer.from_pretrained(model_id)
+    _, corpus_texts, *_ = _load_beir("scifact")
+    texts = sorted((cfg["document_prefix"] + t for t in corpus_texts),
+                   key=len, reverse=True)[:64]
+
+    if warm_fp32:
+        f = ort.InferenceSession(hf_hub_download(model_id, "model.onnx"),
+                                 providers=["CPUExecutionProvider"])
+        w = tok(["[D] warmup"], return_tensors="np")
+        f.run(None, {i.name: w[i.name].astype(np.int64)
+                     for i in f.get_inputs() if i.name in w})
+        del f
+
+    sess = ort.InferenceSession(hf_hub_download(model_id, "model_int8.onnx"),
+                                providers=["CPUExecutionProvider"])
+    spreads = []
+    for s in range(0, 64, 32):
+        enc = tok(texts[s:s + 32], padding=True, truncation=True,
+                  max_length=cfg["document_length"], return_tensors="np")
+        emb = sess.run(None, {i.name: enc[i.name].astype(np.int64)
+                              for i in sess.get_inputs() if i.name in enc})[0]
+        e = emb[enc["attention_mask"].astype(bool)].astype(np.float32)
+        e /= np.maximum(np.linalg.norm(e, axis=1, keepdims=True), 1e-12)
+        mu = e.mean(0)
+        mu /= np.linalg.norm(mu)
+        spreads.append(float((e @ mu).std()))
+    _log(f"version_probe: ort={ort.__version__} warm_fp32={warm_fp32} "
+         f"spreads={[round(v, 4) for v in spreads]}")
+    return {"ort": ort.__version__, "warm_fp32": warm_fp32, "spreads": spreads}
+
+
+@app.local_entrypoint()
+def ort_version_123(warm_fp32: bool = False):
+    _log(f"version_probe_123: {json.dumps(version_probe_123.remote(warm_fp32))}")
+
+
 def _ndcg10(ranked_rels, all_rels):
     """Harness-exact NDCG@10: gain 2^r - 1, discount 1/log2(i+2)."""
     import math

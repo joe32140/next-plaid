@@ -207,8 +207,9 @@ pub fn exact_score_docs(
     } else {
         None
     };
+    // Parallel over docs like the production stage-2 candidate loop above.
     doc_ids
-        .iter()
+        .par_iter()
         .map(|&d| exact_doc_score(index, &sq, cdot.as_ref(), d).unwrap_or(f32::NEG_INFINITY))
         .collect()
 }

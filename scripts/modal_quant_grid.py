@@ -369,7 +369,7 @@ def embed_onnx(tag: str, dataset: str, force: bool = False):
 
 
 @app.function(
-    image=onnx_image, cpu=8, memory=16384, timeout=3600,
+    image=onnx_image, cpu=16, memory=16384, timeout=3600,
     secrets=[HF_SECRET], volumes={CACHE_DIR: hf_cache},
 )
 def batch_probe(n: int = 64, longest: bool = False):

@@ -23,11 +23,14 @@
 //! via [`crate::search::SearchParameters::residual_asym`] — the same index
 //! can be A/B'd with and without it.
 //!
-//! Two deliberate semantic deltas vs the float path, both quality-measured:
-//! the reconstruction is *not* renormalized (the float path L2-normalizes
-//! each decompressed token), and the residual term is int8-quantized.
+//! The float path L2-normalizes each decompressed token; this path applies
+//! the identical normalization via a cached per-token `1/||recon||`
+//! ([`compute_inv_norms`]) — measured as load-bearing (skipping it costs up
+//! to 0.17 NDCG@10 at nbits=1). The one remaining delta vs the float path is
+//! int8 quantization of the residual term (measured ≈ 0.001 NDCG@10).
 
 use ndarray::{ArrayView2, Axis};
+use rayon::prelude::*;
 
 use crate::binary::QueryI8;
 use crate::codec::ResidualCodec;
@@ -82,6 +85,48 @@ pub fn quantize_lut(codec: &ResidualCodec) -> Option<ResidualLut> {
     })
 }
 
+/// Per-token `1 / ||centroid + dequantized residual||` for a whole index —
+/// the exact normalization [`ResidualCodec::decompress`] applies to every
+/// reconstructed token (computed with the f32 bucket weights, so it
+/// normalizes by the same quantity the float path does).
+///
+/// This is *derived* data: recomputable from the stored codes at any time,
+/// cached once per index by `MmapIndex::residual_inv_norms`. Without it the
+/// asymmetric path scores un-normalized reconstructions, whose per-token
+/// norm spread MaxSim's argmax amplifies (measured: up to -0.17 NDCG@10 at
+/// nbits=1 on long-query corpora).
+pub fn compute_inv_norms(
+    codec: &ResidualCodec,
+    codes: &[i64],
+    packed: &ArrayView2<u8>,
+) -> Option<Vec<f32>> {
+    let weights = codec.bucket_weights.as_ref()?;
+    let lookup = codec.bucket_weight_indices_lookup.as_ref()?;
+    let dim = codec.embedding_dim();
+    Some(
+        (0..codes.len())
+            .into_par_iter()
+            .map(|t| {
+                let centroid = codec.centroids.row(codes[t] as usize);
+                let mut sq = 0.0f32;
+                let mut d = 0usize;
+                'row: for &byte in packed.row(t).iter() {
+                    let reversed = codec.byte_reversed_bits_map[byte as usize] as usize;
+                    for &bi in lookup.row(reversed).iter() {
+                        if d == dim {
+                            break 'row;
+                        }
+                        let v = centroid[d] + weights[bi];
+                        sq += v * v;
+                        d += 1;
+                    }
+                }
+                1.0 / sq.sqrt().max(1e-12)
+            })
+            .collect(),
+    )
+}
+
 /// MaxSim of an int8 query against one document's stored residual codes.
 ///
 /// * `doc_packed` — `[n_tokens, packed_dim]` packed residual rows (sliced
@@ -98,6 +143,7 @@ pub fn maxsim_residual_lut_scalar(
     doc_codes: &[i64],
     cdot: &ArrayView2<f32>,
     lut: &ResidualLut,
+    inv_norms: &[f32],
     dim: usize,
 ) -> f32 {
     debug_assert!(dim <= MAX_DIM);
@@ -125,13 +171,14 @@ pub fn maxsim_residual_lut_scalar(
             }
         }
         let cid = doc_codes[t] as usize;
+        let inv = inv_norms[t];
         for (qi, best_q) in best.iter_mut().enumerate() {
             let qrow = &qv[qi * dim..(qi + 1) * dim];
             let mut acc = 0i32;
             for (qd, wd) in qrow.iter().zip(&w[..dim]) {
                 acc += *qd as i32 * *wd as i32;
             }
-            let score = q8.scales[qi] * lut.scale * acc as f32 + cdot[[qi, cid]];
+            let score = (q8.scales[qi] * lut.scale * acc as f32 + cdot[[qi, cid]]) * inv;
             if score > *best_q {
                 *best_q = score;
             }
@@ -151,6 +198,7 @@ pub fn maxsim_residual_lut_i8(
     doc_codes: &[i64],
     cdot: &ArrayView2<f32>,
     lut: &ResidualLut,
+    inv_norms: &[f32],
     dim: usize,
 ) -> f32 {
     #[cfg(target_arch = "aarch64")]
@@ -160,11 +208,11 @@ pub fn maxsim_residual_lut_i8(
             && std::arch::is_aarch64_feature_detected!("dotprod")
         {
             return unsafe {
-                neon::maxsim_residual_lut_neon(q8, doc_packed, doc_codes, cdot, lut, dim)
+                neon::maxsim_residual_lut_neon(q8, doc_packed, doc_codes, cdot, lut, inv_norms, dim)
             };
         }
     }
-    maxsim_residual_lut_scalar(q8, doc_packed, doc_codes, cdot, lut, dim)
+    maxsim_residual_lut_scalar(q8, doc_packed, doc_codes, cdot, lut, inv_norms, dim)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -185,6 +233,7 @@ mod neon {
         doc_codes: &[i64],
         cdot: &ArrayView2<f32>,
         lut: &ResidualLut,
+        inv_norms: &[f32],
         dim: usize,
     ) -> f32 {
         let nq = q8.values.nrows();
@@ -210,6 +259,7 @@ mod neon {
                 }
             }
             let cid = doc_codes[t] as usize;
+            let inv = inv_norms[t];
             let wp = w.as_ptr();
             for (qi, best_qi) in best.iter_mut().enumerate() {
                 let qp = qp_base.add(qi * ps);
@@ -229,7 +279,7 @@ mod neon {
                     k += 32;
                 }
                 let acc = vaddvq_s32(vaddq_s32(a, b));
-                let score = sqw[qi] * acc as f32 + cdot[[qi, cid]];
+                let score = (sqw[qi] * acc as f32 + cdot[[qi, cid]]) * inv;
                 if score > *best_qi {
                     *best_qi = score;
                 }
@@ -335,6 +385,7 @@ mod tests {
                 let packed = codec.quantize_residuals(&res).unwrap();
                 let codes: Vec<i64> = (0..13).map(|_| rng.gen_range(0..k as i64)).collect();
                 let cdot = Array2::from_shape_fn((7, k), |_| rng.gen_range(-1.0f32..1.0));
+                let inv: Vec<f32> = (0..13).map(|_| rng.gen_range(0.5f32..1.5)).collect();
 
                 let scalar = maxsim_residual_lut_scalar(
                     &q8,
@@ -342,6 +393,7 @@ mod tests {
                     &codes,
                     &cdot.view(),
                     &lut,
+                    &inv,
                     dim,
                 );
                 let neon = unsafe {
@@ -351,6 +403,7 @@ mod tests {
                         &codes,
                         &cdot.view(),
                         &lut,
+                        &inv,
                         dim,
                     )
                 };
@@ -358,6 +411,75 @@ mod tests {
                     scalar.to_bits(),
                     neon.to_bits(),
                     "nbits={nbits} dim={dim}: scalar {scalar} != neon {neon}"
+                );
+            }
+        }
+    }
+
+    /// End-to-end decoder parity: the kernel with [`compute_inv_norms`] must
+    /// approximate `Σ_q max_t q · (recon_t / ||recon_t||)` — i.e. exactly
+    /// what the float path scores after `decompress` — with only int8
+    /// residual rounding as the difference.
+    #[test]
+    fn normalized_scoring_matches_decompress_reference() {
+        let mut rng = StdRng::seed_from_u64(31);
+        for &nbits in &[1usize, 2, 4] {
+            for &dim in &[48usize, 128] {
+                let k = 8;
+                let codec = toy_codec(dim, nbits, k, &mut rng);
+                let lut = quantize_lut(&codec).unwrap();
+                let weights = codec.bucket_weights.as_ref().unwrap();
+                let lookup = codec.bucket_weight_indices_lookup.as_ref().unwrap();
+
+                let query = Array2::from_shape_fn((6, dim), |_| rng.gen_range(-1.0f32..1.0));
+                let q8 = crate::binary::quantize_query_i8(&query.view());
+                let res = Array2::from_shape_fn((9, dim), |_| rng.gen_range(-0.3f32..0.3));
+                let packed = codec.quantize_residuals(&res).unwrap();
+                let codes: Vec<i64> = (0..9).map(|_| rng.gen_range(0..k as i64)).collect();
+                let cents = Array2::from_shape_fn((k, dim), |(i, d)| codec.centroids.row(i)[d]);
+                let cdot = query.dot(&cents.t());
+                let inv = compute_inv_norms(&codec, &codes, &packed.view()).unwrap();
+
+                let got = maxsim_residual_lut_i8(
+                    &q8,
+                    &packed.view(),
+                    &codes,
+                    &cdot.view(),
+                    &lut,
+                    &inv,
+                    dim,
+                );
+
+                // Reference: float query x exact normalized reconstruction.
+                let mut expect = 0.0f64;
+                for qi in 0..6 {
+                    let mut best = f64::NEG_INFINITY;
+                    for (t, &code) in codes.iter().enumerate() {
+                        // exact reconstruction (decompress semantics)
+                        let centroid = codec.centroids.row(code as usize);
+                        let mut recon = vec![0.0f64; dim];
+                        let mut d = 0usize;
+                        'r: for &byte in packed.row(t).iter() {
+                            let rev = codec.byte_reversed_bits_map[byte as usize] as usize;
+                            for &bi in lookup.row(rev).iter() {
+                                if d == dim {
+                                    break 'r;
+                                }
+                                recon[d] = centroid[d] as f64 + weights[bi] as f64;
+                                d += 1;
+                            }
+                        }
+                        let norm = recon.iter().map(|v| v * v).sum::<f64>().sqrt();
+                        let dot: f64 = (0..dim)
+                            .map(|d| query[[qi, d]] as f64 * recon[d] / norm)
+                            .sum();
+                        best = best.max(dot);
+                    }
+                    expect += best;
+                }
+                assert!(
+                    (got as f64 - expect).abs() < 0.05,
+                    "nbits={nbits} dim={dim}: got {got} expect {expect}"
                 );
             }
         }
@@ -380,9 +502,17 @@ mod tests {
                 let packed = codec.quantize_residuals(&res).unwrap();
                 let codes: Vec<i64> = (0..9).map(|_| rng.gen_range(0..k as i64)).collect();
                 let cdot = Array2::from_shape_fn((6, k), |_| rng.gen_range(-1.0f32..1.0));
+                let inv: Vec<f32> = (0..9).map(|_| rng.gen_range(0.5f32..1.5)).collect();
 
-                let got =
-                    maxsim_residual_lut_i8(&q8, &packed.view(), &codes, &cdot.view(), &lut, dim);
+                let got = maxsim_residual_lut_i8(
+                    &q8,
+                    &packed.view(),
+                    &codes,
+                    &cdot.view(),
+                    &lut,
+                    &inv,
+                    dim,
+                );
 
                 // f64 reference over the same integers
                 let mut expect = 0.0f64;
@@ -401,8 +531,9 @@ mod tests {
                                 d += 1;
                             }
                         }
-                        let s = q8.scales[qi] as f64 * lut.scale as f64 * acc as f64
-                            + cdot[[qi, codes[t] as usize]] as f64;
+                        let s = (q8.scales[qi] as f64 * lut.scale as f64 * acc as f64
+                            + cdot[[qi, codes[t] as usize]] as f64)
+                            * inv[t] as f64;
                         best = best.max(s);
                     }
                     expect += best;

@@ -168,6 +168,7 @@ fn exact_doc_score(
             // Needs the dense query×centroid matrix for the centroid term;
             // prepare_score_query never builds this arm on paths without it.
             let cdot = cdot?;
+            let inv_norms = index.residual_inv_norms()?;
             let start = index.doc_offsets[doc_id];
             let end = index.doc_offsets[doc_id + 1];
             let packed = index.mmap_residuals.slice_rows(start, end);
@@ -178,6 +179,7 @@ fn exact_doc_score(
                 &codes,
                 &cdot.view(),
                 lut,
+                &inv_norms[start..end],
                 index.codec.embedding_dim(),
             ))
         }
@@ -575,6 +577,10 @@ pub fn search_one_mmap(
     // full-precision query is used for the float (residual) path.
     // Chunked processing limits concurrent memory from parallel decompression.
     let exact_query = prepare_score_query(index, query, params.residual_asym);
+    if matches!(&exact_query, ScoreQuery::ResidualLut { .. }) {
+        // Build the per-token norm cache once, outside the parallel loop.
+        let _ = index.residual_inv_norms();
+    }
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
         .par_chunks(DECOMPRESS_CHUNK_SIZE)
         .flat_map(|chunk| {

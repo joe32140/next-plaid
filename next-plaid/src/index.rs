@@ -1055,6 +1055,10 @@ pub struct MmapIndex {
     pub mmap_codes: crate::mmap::MmapNpyArray1I64,
     /// Memory-mapped residuals array (public for search access)
     pub mmap_residuals: crate::mmap::MmapNpyArray2U8,
+    /// Lazily-computed per-token `1/||reconstruction||` for the asymmetric
+    /// residual scoring path — the same normalization `decompress` applies.
+    /// Derived data (function of codes + codec), built once on first use.
+    residual_inv_norms: std::sync::OnceLock<Option<Vec<f32>>>,
 }
 
 impl MmapIndex {
@@ -1176,6 +1180,7 @@ impl MmapIndex {
             doc_lengths,
             doc_offsets,
             mmap_codes,
+            residual_inv_norms: std::sync::OnceLock::new(),
             mmap_residuals,
         })
     }
@@ -1360,6 +1365,25 @@ impl MmapIndex {
     /// Get the embedding dimension.
     pub fn embedding_dim(&self) -> usize {
         self.codec.embedding_dim()
+    }
+
+    /// Per-token `1 / ||centroid + dequantized residual||`, cached on first
+    /// use. This is what makes asymmetric LUT scoring match the float path's
+    /// normalized reconstructions. `None` for binary indexes. The first call
+    /// streams the whole payload once (parallel, ~seconds per million
+    /// tokens); subsequent calls are free.
+    pub fn residual_inv_norms(&self) -> Option<&[f32]> {
+        self.residual_inv_norms
+            .get_or_init(|| {
+                if self.metadata.binary {
+                    return None;
+                }
+                let n = *self.doc_offsets.last()?;
+                let codes = self.mmap_codes.slice(0, n);
+                let packed = self.mmap_residuals.slice_rows(0, n);
+                crate::residual_lut::compute_inv_norms(&self.codec, &codes, &packed)
+            })
+            .as_deref()
     }
 
     /// Release all memory-mapped file handles.

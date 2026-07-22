@@ -1,13 +1,33 @@
 name: maxsim-bench
 
-# Cross-platform stage-2 MaxSim latency: GEMM (decompress+matmul) vs
-# asym-LUT (int8xLUT) vs binary (int8x1bit) through the production scoring
-# paths, mixedbread protocol (fixed candidate list, median of 9 after 2
-# warmups). Shared-VM numbers — ratios are the signal, absolutes are not.
-# Binary has fused SIMD on all three platforms (VNNI/AVX2-SAD on x86, SDOT
-# on aarch64); asym-LUT runs tbl+SDOT on aarch64 and pshufb+maddubs AVX2 on
-# x86. The test step runs the kernels' bit-exactness parity suite first, so
-# a bench row can never come from a kernel that diverges from the scalar
+# Cross-platform MaxSim latency at two altitudes, through the production
+# scoring paths. Shared-VM numbers — ratios are the signal, absolutes are not.
+#
+# 1. stage2 phase profile (real shapes): synthetic token values with the REAL
+#    per-doc/query token-length distributions of nfcorpus / scifact / fiqa
+#    (lens manifests committed under next-plaid/examples/shapes — latency
+#    depends on shapes, not values). Corpus-size ladder: nfcorpus 863k tokens,
+#    scifact 1.19M, fiqa capped at 15k docs ≈ 2.0M. Indexes are built ONCE in
+#    a dedicated ubuntu job (16 GB — a scifact-scale k-means build peaks well
+#    beyond the 7 GB macOS runners), cached across runs with actions/cache,
+#    and shared to all platforms as an artifact; profile jobs only mmap them.
+#    The on-disk format is little-endian npy, portable across all three
+#    architectures, and the deterministic LCG queries are identical
+#    everywhere, so shortlist fingerprints must match across platforms.
+#    Each profile row reports prep | exact MaxSim | end-to-end search_one_mmap
+#    (whole pipeline through the public API), float split into
+#    decompress + GEMM.
+#
+# 2. maxsim_bench: mixedbread protocol (fixed candidate list, one query,
+#    median of 9 after 2 warmups), synthetic 180/786-token docs, against both
+#    the default matrixmultiply float baseline and a vendor-BLAS build
+#    (Accelerate/AMX on macOS, OpenBLAS on Linux) — the baseline mixedbread's
+#    Float/Float row effectively uses.
+#
+# Binary has fused SIMD on all three platforms (VNNI/AVX2-SAD on x86, SDOT on
+# aarch64); asym-LUT runs tbl+SDOT on aarch64 and pshufb+maddubs AVX2 on x86.
+# The test step runs the kernels' bit-exactness parity suite first, so a
+# bench row can never come from a kernel that diverges from the scalar
 # reference.
 
 on:
@@ -15,8 +35,58 @@ on:
     branches: [feat/asymmetric-lut-residual]
   workflow_dispatch:
 
+env:
+  FIQA_CAP: 15000
+
 jobs:
+  build-indexes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build profiler
+        run: cargo build --release --example stage2_profile -p next-plaid
+
+      # Per-cell cache so partial progress persists if a later, larger build
+      # fails. Key = shapes manifest hash + format version (bump v1 manually
+      # if the index on-disk format or build config changes).
+      - name: cache nfcorpus indexes
+        uses: actions/cache@v4
+        with:
+          path: indexes/nfcorpus
+          key: stage2-idx-v1-nfcorpus-${{ hashFiles('next-plaid/examples/shapes/nfcorpus/*') }}
+      - name: cache scifact indexes
+        uses: actions/cache@v4
+        with:
+          path: indexes/scifact
+          key: stage2-idx-v1-scifact-${{ hashFiles('next-plaid/examples/shapes/scifact/*') }}
+      - name: cache fiqa indexes
+        uses: actions/cache@v4
+        with:
+          path: indexes/fiqa
+          key: stage2-idx-v1-fiqa-${{ env.FIQA_CAP }}-${{ hashFiles('next-plaid/examples/shapes/fiqa/*') }}
+
+      # /usr/bin/time -v prints "Maximum resident set size" — the KB/token
+      # scaling datum that decides how far the fiqa cap can rise. On a cache
+      # hit the profiler sees the markers and exits in seconds.
+      - name: build nfcorpus indexes (863k tokens)
+        run: BUILD_ONLY=1 INDEX_ROOT=indexes/nfcorpus /usr/bin/time -v ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/nfcorpus
+      - name: build scifact indexes (1.19M tokens)
+        run: BUILD_ONLY=1 INDEX_ROOT=indexes/scifact /usr/bin/time -v ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/scifact
+      - name: build fiqa indexes (capped, ~2.0M tokens)
+        run: BUILD_ONLY=1 INDEX_ROOT=indexes/fiqa /usr/bin/time -v ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa ${{ env.FIQA_CAP }}
+      - name: index sizes
+        run: du -sh indexes/*/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage2-indexes
+          path: indexes
+          retention-days: 3
+
   bench:
+    needs: build-indexes
     strategy:
       fail-fast: false
       matrix:
@@ -33,8 +103,18 @@ jobs:
         run: |
           cargo test --release -p next-plaid --lib residual_lut
           cargo test --release -p next-plaid --test residual_lut_integration
-      - name: stage2 phase profile (synthetic 2000 docs x 180 tokens)
-        run: ./target/release/examples/stage2_profile synth 2000
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: stage2-indexes
+          path: indexes
+      - name: stage2 phase profile — nfcorpus shapes (3,633 docs / 863k tokens)
+        run: INDEX_ROOT=indexes/nfcorpus ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/nfcorpus
+      - name: stage2 phase profile — scifact shapes (5,183 docs / 1.19M tokens)
+        run: INDEX_ROOT=indexes/scifact ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/scifact
+      - name: stage2 phase profile — fiqa shapes (15k docs / ~2.0M tokens)
+        run: INDEX_ROOT=indexes/fiqa ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa ${{ env.FIQA_CAP }}
+
       - name: bench (synthetic 500 docs x 180 tokens, dim 128)
         run: ./target/release/examples/maxsim_bench synth 500
       - name: bench (synthetic 500 docs x 786 tokens — mixedbread's doc shape)

@@ -110,10 +110,13 @@ enum ScoreQuery<'a> {
     Float(&'a Array2<f32>),
     /// Residual index scored asymmetrically: int8 query codes plus the fused
     /// byte→int8-weights LUT, scoring the stored codes directly (centroid
-    /// term from the dense query×centroid matrix; no decompression).
+    /// term from the dense query×centroid matrix; no decompression). The
+    /// plane-ordered query copy feeds the SIMD kernels' expand layout.
     ResidualLut {
         q8: crate::binary::QueryI8,
         lut: crate::residual_lut::ResidualLut,
+        /// `None` for non-byte-aligned dims, which score on the scalar path.
+        planes: Option<crate::residual_lut::QueryPlanes>,
     },
 }
 
@@ -128,10 +131,12 @@ fn prepare_score_query<'a>(
     }
     if residual_asym && index.codec.embedding_dim() <= crate::residual_lut::MAX_DIM {
         if let Some(lut) = crate::residual_lut::quantize_lut(&index.codec) {
-            return ScoreQuery::ResidualLut {
-                q8: crate::binary::quantize_query_i8(&query.view()),
-                lut,
-            };
+            let dim = index.codec.embedding_dim();
+            let q8 = crate::binary::quantize_query_i8(&query.view());
+            let planes = dim.is_multiple_of(8).then(|| {
+                crate::residual_lut::build_query_planes(&q8, lut.keys_per_byte, dim)
+            });
+            return ScoreQuery::ResidualLut { q8, lut, planes };
         }
     }
     ScoreQuery::Float(query)
@@ -164,7 +169,7 @@ fn exact_doc_score(
             let doc = index.get_document_embeddings(doc_id).ok()?;
             Some(colbert_score(&q.view(), &doc.view()))
         }
-        ScoreQuery::ResidualLut { q8, lut } => {
+        ScoreQuery::ResidualLut { q8, lut, planes } => {
             // Needs the dense query×centroid matrix for the centroid term;
             // prepare_score_query never builds this arm on paths without it.
             let cdot = cdot?;
@@ -175,6 +180,7 @@ fn exact_doc_score(
             let codes = index.mmap_codes.slice(start, end);
             Some(crate::residual_lut::maxsim_residual_lut_i8(
                 q8,
+                planes.as_ref(),
                 &packed,
                 &codes,
                 &cdot.view(),

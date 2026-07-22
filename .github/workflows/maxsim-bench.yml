@@ -4,9 +4,11 @@ name: maxsim-bench
 # asym-LUT (int8xLUT) vs binary (int8x1bit) through the production scoring
 # paths, mixedbread protocol (fixed candidate list, median of 9 after 2
 # warmups). Shared-VM numbers — ratios are the signal, absolutes are not.
-# Known state: on x86 the asym-LUT and binary int8 paths run the scalar
-# fallback (NEON-only kernels so far), so the x86 column quantifies what the
-# planned AVX2/VNNI kernels must recover.
+# Binary has fused SIMD on all three platforms (VNNI/AVX2-SAD on x86, SDOT
+# on aarch64); asym-LUT runs tbl+SDOT on aarch64 and pshufb+maddubs AVX2 on
+# x86. The test step runs the kernels' bit-exactness parity suite first, so
+# a bench row can never come from a kernel that diverges from the scalar
+# reference.
 
 on:
   push:
@@ -27,5 +29,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: build
         run: cargo build --release --example maxsim_bench -p next-plaid
+      - name: kernel parity tests (bit-exact vs scalar reference)
+        run: |
+          cargo test --release -p next-plaid --lib residual_lut
+          cargo test --release -p next-plaid --test residual_lut_integration
       - name: bench (synthetic 500 docs x 180 tokens, dim 128)
         run: ./target/release/examples/maxsim_bench synth 500

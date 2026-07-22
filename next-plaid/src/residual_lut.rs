@@ -56,6 +56,48 @@ pub struct ResidualLut {
     pub keys_per_byte: usize,
     /// Dequantization scale: `fused as f32 * scale ≈ bucket_weights`.
     pub scale: f32,
+    /// Nibble-factored form of `fused` for the SIMD expand paths.
+    pub nibble: Option<NibbleLut>,
+}
+
+/// The fused table factored per key position into 16-entry nibble tables —
+/// the shape NEON `tbl` / SSE `pshufb` consume (one in-register lookup per
+/// key position per 16 packed bytes, instead of a scalar walk over dims).
+///
+/// Codes are `nbits ∈ {1,2,4}` wide and bit-packing never crosses a nibble
+/// boundary, so key `k` of a packed byte is a function of exactly one of its
+/// nibbles. [`derive_nibble_lut`] builds each table from `fused` and then
+/// *verifies* the factorization over all 256 bytes, so the SIMD paths can
+/// never silently diverge from the scalar reference's table.
+pub struct NibbleLut {
+    /// Per key position: weights indexed by the source nibble's value.
+    pub tables: [[i8; 16]; 8],
+    /// Whether key `k` reads the byte's high nibble (else the low one).
+    pub from_hi: [bool; 8],
+}
+
+/// Factor `fused` into per-key nibble tables; `None` if any key position is
+/// not a function of a single nibble (never for the current codec — this
+/// guards future packing changes by failing back to the scalar path).
+fn derive_nibble_lut(fused: &[i8], keys_per_byte: usize) -> Option<NibbleLut> {
+    let mut tables = [[0i8; 16]; 8];
+    let mut from_hi = [false; 8];
+    for k in 0..keys_per_byte {
+        let hi: [i8; 16] = std::array::from_fn(|x| fused[(x << 4) * keys_per_byte + k]);
+        if (0..256).all(|b| fused[b * keys_per_byte + k] == hi[b >> 4]) {
+            tables[k] = hi;
+            from_hi[k] = true;
+            continue;
+        }
+        let lo: [i8; 16] = std::array::from_fn(|x| fused[x * keys_per_byte + k]);
+        if (0..256).all(|b| fused[b * keys_per_byte + k] == lo[b & 15]) {
+            tables[k] = lo;
+            from_hi[k] = false;
+            continue;
+        }
+        return None;
+    }
+    Some(NibbleLut { tables, from_hi })
 }
 
 /// Build the fused byte→weights table from a residual codec.
@@ -78,11 +120,47 @@ pub fn quantize_lut(codec: &ResidualCodec) -> Option<ResidualLut> {
             fused[byte * keys_per_byte + k] = vals[lookup[[reversed, k]]];
         }
     }
+    let nibble = derive_nibble_lut(&fused, keys_per_byte);
     Some(ResidualLut {
         fused,
         keys_per_byte,
         scale,
+        nibble,
     })
+}
+
+/// The int8 query permuted to *plane order*: plane `k` holds the dims byte
+/// position `i` carries at key `k` (`d = i·keys_per_byte + k`), so the SIMD
+/// expand can store each `tbl`/`pshufb` result contiguously instead of
+/// interleaving back to dim order. A dot product is permutation-invariant
+/// and the integer accumulator is order-invariant, so scores stay bit-equal
+/// to the scalar reference. Rows are zero-padded to
+/// [`crate::binary::padded_stride`] lanes (a multiple of both the NEON
+/// 16-lane and AVX2 32-lane chunk widths); padding contributes `q·0 = 0`.
+pub struct QueryPlanes {
+    pub data: Vec<i8>,
+    pub stride: usize,
+}
+
+/// Build [`QueryPlanes`] from already-quantized query codes. `dim` must be a
+/// multiple of 8 (the SIMD dispatch precondition), so every plane holds
+/// exactly `dim / keys_per_byte` lanes.
+pub fn build_query_planes(q8: &QueryI8, keys_per_byte: usize, dim: usize) -> QueryPlanes {
+    let nq = q8.values.nrows();
+    let stride = crate::binary::padded_stride(dim);
+    let pdim = dim / keys_per_byte;
+    let qv = q8.values.as_slice().expect("QueryI8.values is contiguous");
+    let mut data = vec![0i8; nq * stride];
+    for qi in 0..nq {
+        let row = &qv[qi * dim..(qi + 1) * dim];
+        let out = &mut data[qi * stride..qi * stride + dim];
+        for i in 0..pdim {
+            for k in 0..keys_per_byte {
+                out[k * pdim + i] = row[i * keys_per_byte + k];
+            }
+        }
+    }
+    QueryPlanes { data, stride }
 }
 
 /// Per-token `1 / ||centroid + dequantized residual||` for a whole index —
@@ -189,11 +267,14 @@ pub fn maxsim_residual_lut_scalar(
 
 /// Public entry: runtime-dispatched MaxSim over stored residual codes.
 ///
-/// Uses the fused NEON SDOT path on aarch64 with `dotprod` for byte-aligned
-/// dims ≤ [`MAX_DIM`]; otherwise the scalar reference. All paths compute the
-/// identical integer accumulator, so results are bit-equal across dispatch.
+/// With `planes` (and a nibble-factorable table) byte-aligned dims ≤
+/// [`MAX_DIM`] take a fused SIMD path — `tbl`+SDOT on aarch64 with
+/// `dotprod`, `pshufb`+`maddubs` on x86_64 with AVX2; otherwise the scalar
+/// reference. All paths compute the identical integer accumulator, so
+/// results are bit-equal across dispatch.
 pub fn maxsim_residual_lut_i8(
     q8: &QueryI8,
+    planes: Option<&QueryPlanes>,
     doc_packed: &ArrayView2<u8>,
     doc_codes: &[i64],
     cdot: &ArrayView2<f32>,
@@ -201,15 +282,27 @@ pub fn maxsim_residual_lut_i8(
     inv_norms: &[f32],
     dim: usize,
 ) -> f32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        if dim.is_multiple_of(8)
-            && dim <= MAX_DIM
-            && std::arch::is_aarch64_feature_detected!("dotprod")
-        {
-            return unsafe {
-                neon::maxsim_residual_lut_neon(q8, doc_packed, doc_codes, cdot, lut, inv_norms, dim)
-            };
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = planes;
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    if let (Some(planes), Some(nib)) = (planes, lut.nibble.as_ref()) {
+        if dim.is_multiple_of(8) && dim <= MAX_DIM {
+            #[cfg(target_arch = "aarch64")]
+            if std::arch::is_aarch64_feature_detected!("dotprod") {
+                return unsafe {
+                    neon::maxsim_residual_lut_neon(
+                        q8, planes, doc_packed, doc_codes, cdot, lut, nib, inv_norms, dim,
+                    )
+                };
+            }
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") {
+                return unsafe {
+                    avx2::maxsim_residual_lut_avx2(
+                        q8, planes, doc_packed, doc_codes, cdot, lut, nib, inv_norms, dim,
+                    )
+                };
+            }
         }
     }
     maxsim_residual_lut_scalar(q8, doc_packed, doc_codes, cdot, lut, inv_norms, dim)
@@ -220,20 +313,25 @@ mod neon {
     use super::*;
     use std::arch::aarch64::*;
 
-    /// Fused NEON path: expand each doc token's packed bytes once through the
-    /// fused table into a zero-padded weights buffer, then score all query
-    /// rows with SDOT against [`QueryI8::padded`] (whose zero lanes make the
-    /// buffer's padding contribute nothing).
+    /// Fused NEON path: expand each doc token's packed bytes through the
+    /// nibble tables with `tbl` — one lookup per key position per 16 packed
+    /// bytes, stored straight to that key's plane (no interleave) — then
+    /// score all query rows with SDOT against the matching
+    /// [`QueryPlanes`] rows (whose zero padding makes the buffer's padding
+    /// contribute nothing).
     ///
     /// # Safety
     /// Requires the `dotprod` CPU feature; `dim % 8 == 0 && dim <= MAX_DIM`.
     #[target_feature(enable = "dotprod")]
+    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn maxsim_residual_lut_neon(
         q8: &QueryI8,
+        planes: &QueryPlanes,
         doc_packed: &ArrayView2<u8>,
         doc_codes: &[i64],
         cdot: &ArrayView2<f32>,
         lut: &ResidualLut,
+        nib: &NibbleLut,
         inv_norms: &[f32],
         dim: usize,
     ) -> f32 {
@@ -241,25 +339,45 @@ mod neon {
         if nq == 0 || doc_packed.nrows() == 0 {
             return 0.0;
         }
-        let ps = crate::binary::padded_stride(dim);
-        let qp_base = q8.padded.as_ptr();
+        let kpb = lut.keys_per_byte;
+        let pdim = dim / kpb; // packed bytes per token (dim % 8 == 0)
+        let ps = planes.stride;
+        let qp_base = planes.data.as_ptr();
+        let d_all = doc_packed.as_slice().expect("doc bytes must be contiguous");
+        let pb = doc_packed.ncols();
+        let cd = cdot.as_slice().expect("cdot must be standard layout");
+        let ncent = cdot.ncols();
         let sqw: Vec<f32> = q8.scales.iter().map(|&s| s * lut.scale).collect();
         let mut best = vec![f32::NEG_INFINITY; nq];
         let mut w = [0i8; MAX_DIM];
+        let mut tabs = [vdupq_n_s8(0); 8];
+        for k in 0..kpb {
+            tabs[k] = vld1q_s8(nib.tables[k].as_ptr());
+        }
+        let low_mask = vdupq_n_u8(0x0F);
 
-        for (t, row) in doc_packed.axis_iter(Axis(0)).enumerate() {
-            let mut d = 0usize;
-            'expand: for &byte in row.iter() {
-                let base = byte as usize * lut.keys_per_byte;
-                for k in 0..lut.keys_per_byte {
-                    if d == dim {
-                        break 'expand;
-                    }
-                    w[d] = lut.fused[base + k];
-                    d += 1;
+        for (t, &code) in doc_codes.iter().enumerate() {
+            let row = &d_all[t * pb..t * pb + pb];
+            let wp = w.as_mut_ptr();
+            let mut i = 0usize;
+            while i + 16 <= pdim {
+                let v = vld1q_u8(row.as_ptr().add(i));
+                let hi = vshrq_n_u8(v, 4);
+                let lo = vandq_u8(v, low_mask);
+                for k in 0..kpb {
+                    let idx = if nib.from_hi[k] { hi } else { lo };
+                    vst1q_s8(wp.add(k * pdim + i), vqtbl1q_s8(tabs[k], idx));
                 }
+                i += 16;
             }
-            let cid = doc_codes[t] as usize;
+            while i < pdim {
+                let base = row[i] as usize * kpb;
+                for k in 0..kpb {
+                    w[k * pdim + i] = lut.fused[base + k];
+                }
+                i += 1;
+            }
+            let cid = code as usize;
             let inv = inv_norms[t];
             let wp = w.as_ptr();
             for (qi, best_qi) in best.iter_mut().enumerate() {
@@ -280,7 +398,113 @@ mod neon {
                     k += 32;
                 }
                 let acc = vaddvq_s32(vaddq_s32(a, b));
-                let score = (sqw[qi] * acc as f32 + cdot[[qi, cid]]) * inv;
+                let score = (sqw[qi] * acc as f32 + cd[qi * ncent + cid]) * inv;
+                if score > *best_qi {
+                    *best_qi = score;
+                }
+            }
+        }
+        best.iter().sum()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use super::*;
+    use std::arch::x86_64::*;
+
+    /// Fused AVX2 path, mirroring the NEON kernel: `pshufb` nibble-table
+    /// expansion into plane order, then a 32-lane `maddubs`/`madd` int8 dot
+    /// against the [`QueryPlanes`] rows.
+    ///
+    /// Exactness: both operands are clamped to ±127 at quantization, so
+    /// `_mm256_sign_epi8` never sees −128 and each `maddubs` pair-sum is
+    /// bounded by 2·127·127 < i16::MAX — the i32 accumulator is exact.
+    ///
+    /// # Safety
+    /// Requires AVX2; `dim % 8 == 0 && dim <= MAX_DIM`.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn maxsim_residual_lut_avx2(
+        q8: &QueryI8,
+        planes: &QueryPlanes,
+        doc_packed: &ArrayView2<u8>,
+        doc_codes: &[i64],
+        cdot: &ArrayView2<f32>,
+        lut: &ResidualLut,
+        nib: &NibbleLut,
+        inv_norms: &[f32],
+        dim: usize,
+    ) -> f32 {
+        let nq = q8.values.nrows();
+        if nq == 0 || doc_packed.nrows() == 0 {
+            return 0.0;
+        }
+        let kpb = lut.keys_per_byte;
+        let pdim = dim / kpb;
+        let ps = planes.stride;
+        let qp_base = planes.data.as_ptr();
+        let d_all = doc_packed.as_slice().expect("doc bytes must be contiguous");
+        let pb = doc_packed.ncols();
+        let cd = cdot.as_slice().expect("cdot must be standard layout");
+        let ncent = cdot.ncols();
+        let sqw: Vec<f32> = q8.scales.iter().map(|&s| s * lut.scale).collect();
+        let mut best = vec![f32::NEG_INFINITY; nq];
+        let mut w = [0i8; MAX_DIM];
+        let mut tabs = [_mm_setzero_si128(); 8];
+        for k in 0..kpb {
+            tabs[k] = _mm_loadu_si128(nib.tables[k].as_ptr() as *const __m128i);
+        }
+        let low_mask = _mm_set1_epi8(0x0F);
+        let ones = _mm256_set1_epi16(1);
+
+        for (t, &code) in doc_codes.iter().enumerate() {
+            let row = &d_all[t * pb..t * pb + pb];
+            let wp = w.as_mut_ptr();
+            let mut i = 0usize;
+            while i + 16 <= pdim {
+                let v = _mm_loadu_si128(row.as_ptr().add(i) as *const __m128i);
+                let hi = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
+                let lo = _mm_and_si128(v, low_mask);
+                for k in 0..kpb {
+                    let idx = if nib.from_hi[k] { hi } else { lo };
+                    _mm_storeu_si128(
+                        wp.add(k * pdim + i) as *mut __m128i,
+                        _mm_shuffle_epi8(tabs[k], idx),
+                    );
+                }
+                i += 16;
+            }
+            while i < pdim {
+                let base = row[i] as usize * kpb;
+                for k in 0..kpb {
+                    w[k * pdim + i] = lut.fused[base + k];
+                }
+                i += 1;
+            }
+            let cid = code as usize;
+            let inv = inv_norms[t];
+            let wp = w.as_ptr();
+            for (qi, best_qi) in best.iter_mut().enumerate() {
+                let qp = qp_base.add(qi * ps);
+                let mut acc = _mm256_setzero_si256();
+                let mut k = 0usize;
+                // Partial tail chunks are exact: both sides zero-pad past dim
+                // (w to MAX_DIM, query rows to their 64-lane stride).
+                while k < dim {
+                    let qv = _mm256_loadu_si256(qp.add(k) as *const __m256i);
+                    let wv = _mm256_loadu_si256(wp.add(k) as *const __m256i);
+                    let prod =
+                        _mm256_maddubs_epi16(_mm256_abs_epi8(wv), _mm256_sign_epi8(qv, wv));
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(prod, ones));
+                    k += 32;
+                }
+                let hi128 = _mm256_extracti128_si256(acc, 1);
+                let s128 = _mm_add_epi32(_mm256_castsi256_si128(acc), hi128);
+                let s64 = _mm_add_epi32(s128, _mm_srli_si128(s128, 8));
+                let s32 = _mm_add_epi32(s64, _mm_srli_si128(s64, 4));
+                let acc = _mm_cvtsi128_si32(s32);
+                let score = (sqw[qi] * acc as f32 + cd[qi * ncent + cid]) * inv;
                 if score > *best_qi {
                     *best_qi = score;
                 }
@@ -365,13 +589,43 @@ mod tests {
         }
     }
 
-    /// The NEON path must equal the scalar reference bit-for-bit: both
+    /// The fused table must factor into per-key nibble tables for every
+    /// nbits — the precondition of both SIMD expand paths.
+    #[test]
+    fn nibble_factorization_holds() {
+        let mut rng = StdRng::seed_from_u64(3);
+        for &nbits in &[1usize, 2, 4] {
+            let codec = toy_codec(64, nbits, 8, &mut rng);
+            let lut = quantize_lut(&codec).unwrap();
+            let nib = lut
+                .nibble
+                .as_ref()
+                .unwrap_or_else(|| panic!("nbits={nbits}: fused table not nibble-separable"));
+            for b in 0..256usize {
+                for k in 0..lut.keys_per_byte {
+                    let nibble = if nib.from_hi[k] { b >> 4 } else { b & 15 };
+                    assert_eq!(
+                        lut.fused[b * lut.keys_per_byte + k],
+                        nib.tables[k][nibble],
+                        "nbits={nbits} byte={b} key={k}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every SIMD path must equal the scalar reference bit-for-bit: all
     /// compute the identical integer accumulator, and the float epilogue is
     /// the same expression.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
-    fn neon_kernel_matches_scalar_bitwise() {
+    fn simd_kernel_matches_scalar_bitwise() {
+        #[cfg(target_arch = "aarch64")]
         if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if !is_x86_feature_detected!("avx2") {
             return;
         }
         let mut rng = StdRng::seed_from_u64(23);
@@ -380,8 +634,10 @@ mod tests {
                 let k = 12;
                 let codec = toy_codec(dim, nbits, k, &mut rng);
                 let lut = quantize_lut(&codec).unwrap();
+                let nib = lut.nibble.as_ref().expect("nibble tables");
                 let query = Array2::from_shape_fn((7, dim), |_| rng.gen_range(-1.0f32..1.0));
                 let q8 = crate::binary::quantize_query_i8(&query.view());
+                let planes = build_query_planes(&q8, lut.keys_per_byte, dim);
                 let res = Array2::from_shape_fn((13, dim), |_| rng.gen_range(-0.4f32..0.4));
                 let packed = codec.quantize_residuals(&res).unwrap();
                 let codes: Vec<i64> = (0..13).map(|_| rng.gen_range(0..k as i64)).collect();
@@ -397,21 +653,38 @@ mod tests {
                     &inv,
                     dim,
                 );
-                let neon = unsafe {
+                #[cfg(target_arch = "aarch64")]
+                let simd = unsafe {
                     super::neon::maxsim_residual_lut_neon(
                         &q8,
+                        &planes,
                         &packed.view(),
                         &codes,
                         &cdot.view(),
                         &lut,
+                        nib,
+                        &inv,
+                        dim,
+                    )
+                };
+                #[cfg(target_arch = "x86_64")]
+                let simd = unsafe {
+                    super::avx2::maxsim_residual_lut_avx2(
+                        &q8,
+                        &planes,
+                        &packed.view(),
+                        &codes,
+                        &cdot.view(),
+                        &lut,
+                        nib,
                         &inv,
                         dim,
                     )
                 };
                 assert_eq!(
                     scalar.to_bits(),
-                    neon.to_bits(),
-                    "nbits={nbits} dim={dim}: scalar {scalar} != neon {neon}"
+                    simd.to_bits(),
+                    "nbits={nbits} dim={dim}: scalar {scalar} != simd {simd}"
                 );
             }
         }
@@ -440,9 +713,11 @@ mod tests {
                 let cents = Array2::from_shape_fn((k, dim), |(i, d)| codec.centroids.row(i)[d]);
                 let cdot = query.dot(&cents.t());
                 let inv = compute_inv_norms(&codec, &codes, &packed.view()).unwrap();
+                let planes = build_query_planes(&q8, lut.keys_per_byte, dim);
 
                 let got = maxsim_residual_lut_i8(
                     &q8,
+                    Some(&planes),
                     &packed.view(),
                     &codes,
                     &cdot.view(),
@@ -504,9 +779,11 @@ mod tests {
                 let codes: Vec<i64> = (0..9).map(|_| rng.gen_range(0..k as i64)).collect();
                 let cdot = Array2::from_shape_fn((6, k), |_| rng.gen_range(-1.0f32..1.0));
                 let inv: Vec<f32> = (0..9).map(|_| rng.gen_range(0.5f32..1.5)).collect();
+                let planes = build_query_planes(&q8, lut.keys_per_byte, dim);
 
                 let got = maxsim_residual_lut_i8(
                     &q8,
+                    Some(&planes),
                     &packed.view(),
                     &codes,
                     &cdot.view(),

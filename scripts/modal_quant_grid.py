@@ -70,8 +70,14 @@ SCALE_SIZES = [4000, 7000, 14000, 28000, 0]  # 0 = full corpus
 # SAME embed_onnx code path, so fp32-vs-int8 encoder is the only variable —
 # deliberately NOT in MODELS so the pylate entrypoints don't pick them up.
 ONNX_TAGS = {
-    "edge17m_onnxf32": ("mixedbread-ai/mxbai-edge-colbert-v0-17m", "model.onnx"),
-    "edge17m_q8": ("mixedbread-ai/mxbai-edge-colbert-v0-17m", "model_int8.onnx"),
+    # tag: (model_id, onnx_file, requantize_in_container)
+    "edge17m_onnxf32": ("mixedbread-ai/mxbai-edge-colbert-v0-17m", "model.onnx", False),
+    # Vendor int8 export: measured anisotropy collapse (tokens vs global mean
+    # dir cos 0.9995 vs fp32's 0.9646; NDCG 0.001). Kept as the artifact row.
+    "edge17m_q8": ("mixedbread-ai/mxbai-edge-colbert-v0-17m", "model_int8.onnx", False),
+    # Our own per-channel dynamic quant of model.onnx: discriminates broken
+    # export from inherent int8 fragility of this checkpoint.
+    "edge17m_q8pc": ("mixedbread-ai/mxbai-edge-colbert-v0-17m", "model.onnx", True),
 }
 
 embed_image = (
@@ -97,6 +103,7 @@ onnx_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
         "onnxruntime==1.20.1",
+        "onnx>=1.16",  # required by onnxruntime.quantization
         "transformers>=4.48",
         "numpy>=1.24",
         "huggingface_hub>=0.23",
@@ -269,10 +276,20 @@ def embed_onnx(tag: str, dataset: str, force: bool = False):
         _log(f"embed_onnx[{dataset}/{tag}]: bundle exists, skipping")
         return {"bundle": out, "skipped": True}
 
-    model_id, onnx_file = ONNX_TAGS[tag]
+    model_id, onnx_file, requantize = ONNX_TAGS[tag]
     corpus_ids, corpus_texts, query_ids, query_texts, qrels = _load_beir(dataset)
     cfg = json.load(open(hf_hub_download(model_id, "onnx_config.json")))
     mpath = hf_hub_download(model_id, onnx_file)
+    if requantize:
+        from onnxruntime.quantization import QuantType, quantize_dynamic
+
+        qpath = "/tmp/model_q8pc.onnx"
+        quantize_dynamic(mpath, qpath, per_channel=True,
+                         weight_type=QuantType.QInt8)
+        _log(f"embed_onnx[{dataset}/{tag}]: per-channel dynamic quant "
+             f"{os.path.getsize(mpath) / 1e6:.1f} -> "
+             f"{os.path.getsize(qpath) / 1e6:.1f} MB")
+        mpath = qpath
     tok = AutoTokenizer.from_pretrained(model_id)
     opts = ort.SessionOptions()
     sess = ort.InferenceSession(mpath, opts, providers=["CPUExecutionProvider"])
@@ -335,7 +352,8 @@ def embed_onnx(tag: str, dataset: str, force: bool = False):
             json.dump(obj, f)
     meta = {
         "model_id": model_id, "tag": tag, "dataset": dataset, "dim": dim,
-        "onnx_file": onnx_file, "encoder": "onnxruntime-cpu",
+        "onnx_file": onnx_file, "requantized_per_channel": requantize,
+        "encoder": "onnxruntime-cpu",
         "onnxruntime": ort.__version__,
         "doc_prenorm_token_norms": doc_norms, "query_prenorm_token_norms": q_norms,
         "docs": len(corpus_ids), "queries": len(query_ids),

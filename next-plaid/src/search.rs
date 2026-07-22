@@ -220,6 +220,30 @@ pub fn exact_score_docs(
         .collect()
 }
 
+/// Like [`exact_score_docs`], but with the dense query×centroid matrix
+/// supplied by the caller — the production situation, where Stage-1 already
+/// computed it for IVF probing. Used by the stage-2 profiler so the LUT path
+/// is not charged twice for the centroid term. An empty `doc_ids` makes this
+/// a pure measurement of per-query preparation (int8 quantization, fused-LUT
+/// + planes build, and on first call the index's inv-norms cache).
+#[doc(hidden)]
+pub fn exact_score_docs_prepared(
+    index: &crate::index::MmapIndex,
+    query: &Array2<f32>,
+    cdot: &Array2<f32>,
+    doc_ids: &[usize],
+    residual_asym: bool,
+) -> Vec<f32> {
+    let sq = prepare_score_query(index, query, residual_asym);
+    if matches!(&sq, ScoreQuery::ResidualLut { .. }) {
+        let _ = index.residual_inv_norms();
+    }
+    doc_ids
+        .par_iter()
+        .map(|&d| exact_doc_score(index, &sq, Some(cdot), d).unwrap_or(f32::NEG_INFINITY))
+        .collect()
+}
+
 /// Wrapper for f32 to use with BinaryHeap (implements Ord)
 #[derive(Clone, Copy, PartialEq)]
 struct OrdF32(f32);
@@ -472,6 +496,86 @@ pub fn search_one_mmap(
         return search_one_mmap_batched(index, query, params, subset);
     }
 
+    let (query_centroid_scores, to_decompress) = stage1_shortlist(index, query, params, subset)?;
+
+    if to_decompress.is_empty() {
+        return Ok(QueryResult {
+            query_id: 0,
+            passage_ids: vec![],
+            scores: vec![],
+        });
+    }
+
+    // Compute exact scores. Binary indexes score against an int8 query; the
+    // full-precision query is used for the float (residual) path.
+    // Chunked processing limits concurrent memory from parallel decompression.
+    let exact_query = prepare_score_query(index, query, params.residual_asym);
+    if matches!(&exact_query, ScoreQuery::ResidualLut { .. }) {
+        // Build the per-token norm cache once, outside the parallel loop.
+        let _ = index.residual_inv_norms();
+    }
+    let mut exact_scores: Vec<(i64, f32)> = to_decompress
+        .par_chunks(DECOMPRESS_CHUNK_SIZE)
+        .flat_map(|chunk| {
+            chunk
+                .iter()
+                .filter_map(|&doc_id| {
+                    let score = exact_doc_score(
+                        index,
+                        &exact_query,
+                        Some(&query_centroid_scores),
+                        doc_id as usize,
+                    )?;
+                    Some((doc_id, score))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Sort by exact score
+    exact_scores.sort_by(|a, b| cmp_score_descending(a.1, b.1));
+
+    // Return top-k results
+    let result_count = params.top_k.min(exact_scores.len());
+    let passage_ids: Vec<i64> = exact_scores
+        .iter()
+        .take(result_count)
+        .map(|(id, _)| *id)
+        .collect();
+    let scores: Vec<f32> = exact_scores
+        .iter()
+        .take(result_count)
+        .map(|(_, s)| *s)
+        .collect();
+
+    Ok(QueryResult {
+        query_id: 0,
+        passage_ids,
+        scores,
+    })
+}
+
+/// Stage 1 of the standard (non-batched) search: dense query×centroid scores,
+/// per-token IVF cell selection, candidate gathering, approximate codes-only
+/// scoring, and pruning down to the exact-scoring shortlist. Everything a
+/// query pays *before* the Stage-2 kernels take over.
+///
+/// Returns the dense query×centroid matrix (reused by Stage-2 for the LUT
+/// path's centroid term) and the pruned candidate list, which is empty when
+/// nothing survives probing/filtering.
+///
+/// This is the production path — `search_one_mmap` calls it — exposed
+/// (hidden) so the stage-2 profiler measures the identical shortlist.
+#[doc(hidden)]
+pub fn stage1_shortlist(
+    index: &crate::index::MmapIndex,
+    query: &Array2<f32>,
+    params: &SearchParameters,
+    subset: Option<&[i64]>,
+) -> Result<(Array2<f32>, Vec<i64>)> {
+    let num_centroids = index.codec.num_centroids();
+    let num_query_tokens = query.nrows();
+
     // Standard path: compute full query-centroid scores upfront
     let query_centroid_scores = query.dot(&index.codec.centroids_view().t());
 
@@ -568,11 +672,7 @@ pub fn search_one_mmap(
     }
 
     if candidates.is_empty() {
-        return Ok(QueryResult {
-            query_id: 0,
-            passage_ids: vec![],
-            scores: vec![],
-        });
+        return Ok((query_centroid_scores, vec![]));
     }
 
     // Compute approximate scores
@@ -599,61 +699,7 @@ pub fn search_one_mmap(
     let n_decompress = (params.n_full_scores / 4).max(params.top_k);
     let to_decompress: Vec<i64> = top_candidates.into_iter().take(n_decompress).collect();
 
-    if to_decompress.is_empty() {
-        return Ok(QueryResult {
-            query_id: 0,
-            passage_ids: vec![],
-            scores: vec![],
-        });
-    }
-
-    // Compute exact scores. Binary indexes score against an int8 query; the
-    // full-precision query is used for the float (residual) path.
-    // Chunked processing limits concurrent memory from parallel decompression.
-    let exact_query = prepare_score_query(index, query, params.residual_asym);
-    if matches!(&exact_query, ScoreQuery::ResidualLut { .. }) {
-        // Build the per-token norm cache once, outside the parallel loop.
-        let _ = index.residual_inv_norms();
-    }
-    let mut exact_scores: Vec<(i64, f32)> = to_decompress
-        .par_chunks(DECOMPRESS_CHUNK_SIZE)
-        .flat_map(|chunk| {
-            chunk
-                .iter()
-                .filter_map(|&doc_id| {
-                    let score = exact_doc_score(
-                        index,
-                        &exact_query,
-                        Some(&query_centroid_scores),
-                        doc_id as usize,
-                    )?;
-                    Some((doc_id, score))
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    // Sort by exact score
-    exact_scores.sort_by(|a, b| cmp_score_descending(a.1, b.1));
-
-    // Return top-k results
-    let result_count = params.top_k.min(exact_scores.len());
-    let passage_ids: Vec<i64> = exact_scores
-        .iter()
-        .take(result_count)
-        .map(|(id, _)| *id)
-        .collect();
-    let scores: Vec<f32> = exact_scores
-        .iter()
-        .take(result_count)
-        .map(|(_, s)| *s)
-        .collect();
-
-    Ok(QueryResult {
-        query_id: 0,
-        passage_ids,
-        scores,
-    })
+    Ok((query_centroid_scores, to_decompress))
 }
 
 /// Memory-efficient batched search for MmapIndex with large centroid counts.

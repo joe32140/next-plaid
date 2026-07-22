@@ -59,7 +59,12 @@ jobs:
           - { cell: scifact,  shapes: scifact,  cap: "",      tags: "",          timeout: 45 }
           - { cell: fiqa15k,  shapes: fiqa,     cap: "15000", tags: "",          timeout: 120 }
           - { cell: fiqa4k,   shapes: fiqa,     cap: "4000",  tags: "r4,binary", timeout: 45 }
-          - { cell: fiqa52k,  shapes: fiqa,     cap: "52000", tags: "r4,binary", timeout: 300 }
+          # The 52k builds peak at 15.7 GB on a 16 GB runner — zero margin,
+          # and a runner OOM-death skips even always() steps, losing the
+          # cache. So: one JOB per index (independently banked) and halved
+          # rayon threads to shrink k-means scratch and buy real headroom.
+          - { cell: fiqa52k-r4,  shapes: fiqa,  cap: "52000", tags: "r4",     timeout: 300, threads: 2 }
+          - { cell: fiqa52k-bin, shapes: fiqa,  cap: "52000", tags: "binary", timeout: 300, threads: 2 }
     name: build-${{ matrix.cell }}
     runs-on: ubuntu-latest
     timeout-minutes: ${{ matrix.timeout }}
@@ -88,6 +93,7 @@ jobs:
       # per-index peak-RSS from /usr/bin/time -v.
       - name: build (${{ matrix.cell }})
         run: |
+          if [ -n "${{ matrix.threads }}" ]; then export RAYON_NUM_THREADS=${{ matrix.threads }}; fi
           TAGS="${{ matrix.tags }}"
           for t in $(echo "${TAGS:-r4,r2,r1,binary}" | tr ',' ' '); do
             BUILD_ONLY=1 INDEX_TAGS=$t INDEX_ROOT=indexes /usr/bin/time -v \

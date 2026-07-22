@@ -186,6 +186,33 @@ fn exact_doc_score(
     }
 }
 
+/// Bench-only stage-2 entry: exact MaxSim of `query` against `doc_ids`
+/// through the same prepared-query paths `search` uses (float decompression,
+/// asymmetric int8×LUT, or binary int8×1-bit). Includes the per-query
+/// preparation a real search pays (quantization, fused-LUT build, dense
+/// query×centroid matrix) but no IVF and no stage-1 — so one timed call is
+/// the full per-query cost of the exact scoring stage over a fixed
+/// candidate list. Not part of the search API.
+#[doc(hidden)]
+pub fn exact_score_docs(
+    index: &crate::index::MmapIndex,
+    query: &Array2<f32>,
+    doc_ids: &[usize],
+    residual_asym: bool,
+) -> Vec<f32> {
+    let sq = prepare_score_query(index, query, residual_asym);
+    let cdot = if matches!(&sq, ScoreQuery::ResidualLut { .. }) {
+        let _ = index.residual_inv_norms();
+        Some(query.dot(&index.codec.centroids_view().t()))
+    } else {
+        None
+    };
+    doc_ids
+        .iter()
+        .map(|&d| exact_doc_score(index, &sq, cdot.as_ref(), d).unwrap_or(f32::NEG_INFINITY))
+        .collect()
+}
+
 /// Wrapper for f32 to use with BinaryHeap (implements Ord)
 #[derive(Clone, Copy, PartialEq)]
 struct OrdF32(f32);

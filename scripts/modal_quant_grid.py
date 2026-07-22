@@ -450,6 +450,65 @@ def probe(n: int = 64, longest: bool = False):
     _log(f"batch_probe: {json.dumps(batch_probe.remote(n, longest))}")
 
 
+@app.function(
+    image=onnx_image, cpu=16, memory=32768, timeout=7200,
+    secrets=[HF_SECRET], volumes={CACHE_DIR: hf_cache},
+)
+def trajectory_probe():
+    """Full-corpus int8 encode replicating embed_onnx exactly (cpu=16,
+    SessionOptions(), global length sort, B=32), logging within-batch token
+    spread per batch. Healthy spread ~0.02; collapsed ~0.007. A mid-run drop
+    means cumulative session-state corruption (ORT dynamic-quant + shrinking
+    shapes); uniform collapse from batch 0 means an environment delta vs
+    batch_probe."""
+    import numpy as np
+    import onnxruntime as ort
+    from huggingface_hub import hf_hub_download
+    from transformers import AutoTokenizer
+
+    model_id = "mixedbread-ai/mxbai-edge-colbert-v0-17m"
+    cfg = json.load(open(hf_hub_download(model_id, "onnx_config.json")))
+    tok = AutoTokenizer.from_pretrained(model_id)
+    _, corpus_texts, *_ = _load_beir("scifact")
+    texts = [cfg["document_prefix"] + t for t in corpus_texts]
+
+    opts = ort.SessionOptions()
+    sess = ort.InferenceSession(hf_hub_download(model_id, "model_int8.onnx"),
+                                opts, providers=["CPUExecutionProvider"])
+    in_names = [i.name for i in sess.get_inputs()]
+
+    order = np.argsort([-len(t) for t in texts])
+    B = 32
+    spreads = []
+    for s in range(0, len(order), B):
+        bidx = order[s:s + B]
+        enc = tok([texts[i] for i in bidx], padding=True, truncation=True,
+                  max_length=cfg["document_length"], return_tensors="np")
+        feed = {n: enc[n].astype(np.int64) for n in in_names if n in enc}
+        emb = sess.run(None, feed)[0]
+        keep = enc["attention_mask"].astype(bool)
+        e = emb[keep].astype(np.float32)
+        e /= np.maximum(np.linalg.norm(e, axis=1, keepdims=True), 1e-12)
+        mu = e.mean(0)
+        mu /= np.linalg.norm(mu)
+        spreads.append(float((e @ mu).std()))
+        bi = s // B
+        if bi % 10 == 0 or spreads[-1] < 0.012:
+            _log(f"batch {bi:3d} seqlen={enc['input_ids'].shape[1]:3d} "
+                 f"spread={spreads[-1]:.4f}")
+    arr = np.array(spreads)
+    _log(f"trajectory: first10={arr[:10].mean():.4f} last10={arr[-10:].mean():.4f} "
+         f"min={arr.min():.4f} n_collapsed(<0.012)={int((arr < 0.012).sum())}/{len(arr)}")
+    return {"first10": float(arr[:10].mean()), "last10": float(arr[-10:].mean()),
+            "min": float(arr.min()), "spreads": [round(v, 5) for v in spreads]}
+
+
+@app.local_entrypoint()
+def trajectory():
+    r = trajectory_probe.remote()
+    _log(f"trajectory_probe: first10={r['first10']} last10={r['last10']} min={r['min']}")
+
+
 def _ndcg10(ranked_rels, all_rels):
     """Harness-exact NDCG@10: gain 2^r - 1, discount 1/log2(i+2)."""
     import math

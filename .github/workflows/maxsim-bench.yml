@@ -35,3 +35,5 @@ jobs:
           cargo test --release -p next-plaid --test residual_lut_integration
       - name: bench (synthetic 500 docs x 180 tokens, dim 128)
         run: ./target/release/examples/maxsim_bench synth 500
+      - name: bench (synthetic 500 docs x 786 tokens — mixedbread's doc shape)
+        run: SYNTH_TOKENS=786 ./target/release/examples/maxsim_bench synth 500

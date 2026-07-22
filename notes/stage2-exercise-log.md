@@ -107,6 +107,62 @@ above the ~67M-token / ~335k-doc cliff; the compact matrix costs
 O(distinct-centroids) instead of O(K), which is also the right shape for
 the 1B regime.
 
+### 2026-07-22 — #23a: bootstrap CIs on the quality grid (9 cells, 10k paired resamples)
+
+`scripts/m4_bootstrap_cis.py` over the sweep logs; full table saved to
+`~/beir-data/quant_grid/m4_results/bootstrap_cis.txt`. One recovery first:
+the aborted repeatability rerun had left a 61-byte stub over
+`scifact_gte.log`; the overnight original was intact in `.run1` and was
+restored (stub kept as `.rerun-aborted`).
+
+**Asym − float (acceptance test), 27 contrasts:** all point estimates
+within ±0.0021; CIs essentially inside ±0.005 (two upper bounds graze
++0.0052, in asym's favor). Three contrasts exclude zero — all POSITIVE
+(asym slightly better than float): arguana_lateon r1 +0.0009,
+nfcorpus_edge17m r4 +0.0009, scifact_edge17m r4 +0.0021. Quality
+neutrality is now an error-barred claim, and where it isn't neutral it
+favors the int8 path.
+
+**Binary − r1 (same 24 B/token):** model-dependent with tight CIs —
+edge17m −0.23..−0.45* (catastrophic), gte −0.056..−0.083*, lateon mixed
+(nfcorpus/scifact CIs cross zero; arguana −0.045*, the query-budget
+falsifier biting). Notable: nano-plaid's SciFact finding (binary > r1)
+does NOT generalize across models — on lateon they tie, on weaker models
+binary loses badly. "Binary is a per-model bet" now has numbers.
+
+**r4 − r1:** +0.007..+0.028, significant in 7/9 cells — residual bits buy
+measurable quality everywhere.
+
+### 2026-07-22 — #23b: scope claims in nano-plaid README (pushed 71353b8)
+
+The "a production port should expect 2–3×" paragraph now cites the
+measured outcome (2.2–6.3× vs compiled decompress+GEMM, 3 CPUs, decompress
+65–84%), the 9-cell CI-backed quality result, the renormalization
+subtlety, and the name-your-baseline discipline (13–22× / 3–4× / ~1× for
+one kernel against three float baselines).
+
+### 2026-07-22 — #28 prep: native M4 columns without local builds
+
+The M4 must never build indexes (16 GB jetsam rule), so tonight's run
+mmaps CI-built artifacts end to end:
+
+- `maxsim_bench` now honors `INDEX_ROOT`, sharing `stage2_profile`'s cache
+  format — same builder, same seed, same LCG doc stream, so CI's
+  BUILD_ONLY output is bit-identical to what the bench would build.
+  Verified: run1 builds+caches, run2 loads all four.
+- New `build-synth786` CI leg builds the mixedbread-shape indexes (1000
+  docs × 786 tokens, one process per index, always-saved cache) and ships
+  them as an artifact (pushed b3144a4).
+- Overnight script `~/beir-data/quant_grid/m4_overnight_28.sh` scheduled
+  for 23:30 (idle window): downloads the latest green run's artifacts,
+  verifies the binary is arm64, then runs (a) 786×1000 mixedbread protocol
+  vs matrixmultiply baseline (raw-float anchor row included), (b) same vs
+  Accelerate/AMX baseline, (c) shape-replay phase profiles for all cells +
+  the full 4k/15k/52k ladder — all mmap-only. Output:
+  `m4_results/overnight_28.log`. Remaining after that: assemble the final
+  three-altitude table; nano-plaid README M4 row re-measurement still
+  requires its own venv run (manual follow-up in the same window pattern).
+
 ### 2026-07-22 — #30: dim-48 SIMD tail — fixed, with an honest negative
 
 The narrow-dim expand fix landed: sub-16-byte packed tails now pad into a

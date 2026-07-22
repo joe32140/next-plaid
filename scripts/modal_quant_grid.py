@@ -291,6 +291,22 @@ def embed_onnx(tag: str, dataset: str, force: bool = False):
              f"{os.path.getsize(qpath) / 1e6:.1f} MB")
         mpath = qpath
     tok = AutoTokenizer.from_pretrained(model_id)
+    if requantize or onnx_file != "model.onnx":
+        # ORT 1.20.1 CPU bug (bisected via trajectory_probe): a dynamic-quant
+        # int8 session created as the FIRST session in the process emits
+        # collapsed embeddings (tokens ~cos 0.9995 to the mean direction,
+        # retrieval NDCG ~0) while norms stay unit. Any fp32 session run
+        # first flips the same int8 session healthy. Warm one before
+        # creating a quantized session.
+        f = ort.InferenceSession(hf_hub_download(model_id, "model.onnx"),
+                                 providers=["CPUExecutionProvider"])
+        warm = tok(["[D] warmup"], return_tensors="np")
+        f.run(None, {i.name: warm[i.name].astype(np.int64)
+                     for i in f.get_inputs() if i.name in warm})
+        del f
+        _log(f"embed_onnx[{dataset}/{tag}]: fp32 warm session run "
+             f"(ORT int8-first-session workaround)")
+
     opts = ort.SessionOptions()
     sess = ort.InferenceSession(mpath, opts, providers=["CPUExecutionProvider"])
     in_names = [i.name for i in sess.get_inputs()]
@@ -740,6 +756,20 @@ def onnx_pair(dataset: str = "scifact", force: bool = False):
     for r in ceiling.starmap([(t, dataset, force) for t in ONNX_TAGS]):
         _log(f"ceiling: {r['scores']}" + (" (skipped)" if r.get("skipped") else ""))
     for r in eval_cell.starmap([(t, dataset, 0, 0, sha, force) for t in ONNX_TAGS]):
+        _log(f"done: {r['dataset']}/{r['tag']}")
+
+
+@app.local_entrypoint()
+def onnx_fix(dataset: str = "scifact"):
+    """Force-redo only the quantized-encoder cells with the fp32-warm
+    workaround; the onnxf32 cell is unaffected and kept."""
+    sha = _sha()
+    tags = ["edge17m_q8", "edge17m_q8pc"]
+    for r in embed_onnx.starmap([(t, dataset, True) for t in tags]):
+        _log(f"embedded: {r['bundle']}")
+    for r in ceiling.starmap([(t, dataset, True) for t in tags]):
+        _log(f"ceiling: {r['scores']}")
+    for r in eval_cell.starmap([(t, dataset, 0, 0, sha, True) for t in tags]):
         _log(f"done: {r['dataset']}/{r['tag']}")
 
 

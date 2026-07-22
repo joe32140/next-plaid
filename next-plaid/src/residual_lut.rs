@@ -227,6 +227,7 @@ mod neon {
     ///
     /// # Safety
     /// Requires the `dotprod` CPU feature; `dim % 8 == 0 && dim <= MAX_DIM`.
+    #[target_feature(enable = "dotprod")]
     pub(super) unsafe fn maxsim_residual_lut_neon(
         q8: &QueryI8,
         doc_packed: &ArrayView2<u8>,

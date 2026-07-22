@@ -13,8 +13,14 @@ for d in scifact nfcorpus arguana; do
     cell="${d}_${t}"
     [ -f "$OUT/$cell.log" ] && { echo "skip $cell (done)"; continue; }
     echo "=== $cell $(date +%H:%M:%S)"
-    NDCG_DEPLOYED_ONLY=1 NDCG_JSON=1 "$BIN" "$BUNDLES/$cell" >"$OUT/$cell.log" 2>&1
-    grep -E "asym-LUT|retains" "$OUT/$cell.log" | head -5
+    # tmp+rename: a cell killed mid-run (OOM SIGKILL) must not leave a log
+    # that the skip-check above mistakes for a completed cell.
+    if NDCG_DEPLOYED_ONLY=1 NDCG_JSON=1 "$BIN" "$BUNDLES/$cell" >"$OUT/$cell.log.tmp" 2>&1; then
+      mv "$OUT/$cell.log.tmp" "$OUT/$cell.log"
+      grep -E "asym-LUT|retains" "$OUT/$cell.log" | head -5
+    else
+      echo "FAILED $cell (exit $?) — partial output kept in $cell.log.tmp"
+    fi
   done
 done
 echo "M4 sweep complete: $OUT"

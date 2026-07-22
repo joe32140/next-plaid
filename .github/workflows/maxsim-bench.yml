@@ -72,18 +72,37 @@ jobs:
       # Cache key = cell + shapes manifest hash + format version (bump v1
       # manually if the index on-disk format or build config changes). On a
       # hit the profiler sees the completion markers and exits in seconds.
-      - name: cache indexes
-        uses: actions/cache@v4
+      # restore/save are split so partial progress is banked even when a
+      # later build in the leg OOMs (a plain actions/cache skips its save on
+      # job failure — that cost us a 33-minute fiqa52k r4 build once).
+      - name: restore index cache
+        id: idxcache
+        uses: actions/cache/restore@v4
         with:
           path: indexes
           key: stage2-idx-v1-${{ matrix.cell }}-${{ hashFiles(format('next-plaid/examples/shapes/{0}/*', matrix.shapes)) }}
-      # /usr/bin/time -v prints "Maximum resident set size" — the KB/token
-      # scaling datum that decides how far the fiqa cap can rise.
+      # One PROCESS per index: the fiqa52k r4 build fit in 16 GB, but the
+      # binary build that followed it in the same address space OOM'd —
+      # allocator state from build N raises build N+1's floor. A fresh
+      # process per tag resets it (corpus regen costs ~1-4 s). Also gives
+      # per-index peak-RSS from /usr/bin/time -v.
       - name: build (${{ matrix.cell }})
-        run: BUILD_ONLY=1 INDEX_TAGS="${{ matrix.tags }}" INDEX_ROOT=indexes /usr/bin/time -v ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/${{ matrix.shapes }} ${{ matrix.cap }}
+        run: |
+          TAGS="${{ matrix.tags }}"
+          for t in $(echo "${TAGS:-r4,r2,r1,binary}" | tr ',' ' '); do
+            BUILD_ONLY=1 INDEX_TAGS=$t INDEX_ROOT=indexes /usr/bin/time -v \
+              ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/${{ matrix.shapes }} ${{ matrix.cap }}
+          done
+      - name: save index cache
+        if: always() && steps.idxcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: indexes
+          key: stage2-idx-v1-${{ matrix.cell }}-${{ hashFiles(format('next-plaid/examples/shapes/{0}/*', matrix.shapes)) }}
       - name: index sizes
         run: du -sh indexes/*
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: stage2-indexes-${{ matrix.cell }}
           path: indexes

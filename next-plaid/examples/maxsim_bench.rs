@@ -68,7 +68,12 @@ fn main() {
         }
         Err(_) => unpack(&corpus, &lens).into_iter().take(n_docs).collect(),
     };
-    let query = unpack(&queries, &qlens).into_iter().next().unwrap();
+    // The query whose token count is closest to 32 (mixedbread's bench query
+    // is 33x128; a short query would flatter our ms column).
+    let query = unpack(&queries, &qlens)
+        .into_iter()
+        .min_by_key(|q| (q.nrows() as i64 - 32).abs())
+        .unwrap();
     let doc_tokens: usize = docs.iter().map(|d| d.nrows()).sum();
     let dim = docs[0].ncols();
     println!(

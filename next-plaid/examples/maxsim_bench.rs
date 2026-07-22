@@ -37,43 +37,69 @@ fn median(times: &mut [f64]) -> f64 {
 }
 
 fn main() {
-    let bundle = PathBuf::from(
-        std::env::args()
-            .nth(1)
-            .expect("usage: maxsim_bench <bundle_dir> [n_docs]"),
-    );
+    let arg1 = std::env::args()
+        .nth(1)
+        .expect("usage: maxsim_bench <bundle_dir|synth> [n_docs]");
     let n_docs: usize = std::env::args()
         .nth(2)
         .map(|s| s.parse().unwrap())
         .unwrap_or(1000);
 
-    let corpus =
-        Array2::<f32>::read_npy(File::open(bundle.join("corpus.npy")).unwrap()).unwrap();
-    let lens =
-        Array1::<i64>::read_npy(File::open(bundle.join("corpus_lens.npy")).unwrap()).unwrap();
-    let queries =
-        Array2::<f32>::read_npy(File::open(bundle.join("queries.npy")).unwrap()).unwrap();
-    let qlens =
-        Array1::<i64>::read_npy(File::open(bundle.join("query_lens.npy")).unwrap()).unwrap();
-
-    // Candidate docs: real per-doc shapes, or fixed-length synthetic chunks of
-    // the same token stream (SYNTH_TOKENS=786 = mixedbread's doc shape).
-    let docs: Vec<Array2<f32>> = match std::env::var("SYNTH_TOKENS") {
-        Ok(t) => {
-            let t: usize = t.parse().unwrap();
-            assert!(corpus.nrows() >= n_docs * t, "corpus too small for synth shape");
-            (0..n_docs)
-                .map(|i| corpus.slice(s![i * t..(i + 1) * t, ..]).to_owned())
-                .collect()
-        }
-        Err(_) => unpack(&corpus, &lens).into_iter().take(n_docs).collect(),
+    let (docs, query): (Vec<Array2<f32>>, Array2<f32>) = if arg1 == "synth" {
+        // Bundle-free mode for CI: seeded random unit-norm tokens. Kernel
+        // latency depends on shapes, not embedding values; SYNTH_TOKENS is
+        // the per-doc token count (default 180 keeps shared-runner k-means
+        // builds inside the job timeout).
+        let t: usize = std::env::var("SYNTH_TOKENS")
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(180);
+        let dim: usize = std::env::var("SYNTH_DIM")
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(128);
+        let mut s = 0x5eed_u64;
+        let mut unit_rows = |n: usize| -> Array2<f32> {
+            let mut a = Array2::<f32>::zeros((n, dim));
+            for mut row in a.rows_mut() {
+                for v in row.iter_mut() {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    *v = ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0;
+                }
+                let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
+                row.mapv_inplace(|v| v / norm);
+            }
+            a
+        };
+        ((0..n_docs).map(|_| unit_rows(t)).collect(), unit_rows(32))
+    } else {
+        let bundle = PathBuf::from(&arg1);
+        let corpus =
+            Array2::<f32>::read_npy(File::open(bundle.join("corpus.npy")).unwrap()).unwrap();
+        let lens =
+            Array1::<i64>::read_npy(File::open(bundle.join("corpus_lens.npy")).unwrap()).unwrap();
+        let queries =
+            Array2::<f32>::read_npy(File::open(bundle.join("queries.npy")).unwrap()).unwrap();
+        let qlens =
+            Array1::<i64>::read_npy(File::open(bundle.join("query_lens.npy")).unwrap()).unwrap();
+        // Real per-doc shapes, or fixed-length chunks of the same token
+        // stream (SYNTH_TOKENS=786 = mixedbread's doc shape).
+        let docs: Vec<Array2<f32>> = match std::env::var("SYNTH_TOKENS") {
+            Ok(t) => {
+                let t: usize = t.parse().unwrap();
+                assert!(corpus.nrows() >= n_docs * t, "corpus too small for synth shape");
+                (0..n_docs)
+                    .map(|i| corpus.slice(s![i * t..(i + 1) * t, ..]).to_owned())
+                    .collect()
+            }
+            Err(_) => unpack(&corpus, &lens).into_iter().take(n_docs).collect(),
+        };
+        // The query whose token count is closest to 32 (mixedbread's bench
+        // query is 33x128; a short query would flatter our ms column).
+        let query = unpack(&queries, &qlens)
+            .into_iter()
+            .min_by_key(|q| (q.nrows() as i64 - 32).abs())
+            .unwrap();
+        (docs, query)
     };
-    // The query whose token count is closest to 32 (mixedbread's bench query
-    // is 33x128; a short query would flatter our ms column).
-    let query = unpack(&queries, &qlens)
-        .into_iter()
-        .min_by_key(|q| (q.nrows() as i64 - 32).abs())
-        .unwrap();
     let doc_tokens: usize = docs.iter().map(|d| d.nrows()).sum();
     let dim = docs[0].ncols();
     println!(

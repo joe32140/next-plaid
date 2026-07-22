@@ -1,0 +1,31 @@
+name: maxsim-bench
+
+# Cross-platform stage-2 MaxSim latency: GEMM (decompress+matmul) vs
+# asym-LUT (int8xLUT) vs binary (int8x1bit) through the production scoring
+# paths, mixedbread protocol (fixed candidate list, median of 9 after 2
+# warmups). Shared-VM numbers — ratios are the signal, absolutes are not.
+# Known state: on x86 the asym-LUT and binary int8 paths run the scalar
+# fallback (NEON-only kernels so far), so the x86 column quantifies what the
+# planned AVX2/VNNI kernels must recover.
+
+on:
+  push:
+    branches: [feat/asymmetric-lut-residual]
+  workflow_dispatch:
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --release --example maxsim_bench -p next-plaid
+      - name: bench (synthetic 500 docs x 180 tokens, dim 128)
+        run: ./target/release/examples/maxsim_bench synth 500

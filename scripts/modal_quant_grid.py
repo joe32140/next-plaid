@@ -64,6 +64,16 @@ DATASETS = ["scifact", "nfcorpus", "arguana", "fiqa"]
 SCALE_DATASET = "fiqa"  # 57.6K docs; the only corpus big enough for a curve
 SCALE_SIZES = [4000, 7000, 14000, 28000, 0]  # 0 = full corpus
 
+# Encoder-precision strip: mixedbread ships end-to-end ONNX exports of the 17m
+# checkpoint (per onnx_config.json: prefixes, punctuation skiplist, no query
+# expansion, dim=48, projection head in-graph). Both precisions go through the
+# SAME embed_onnx code path, so fp32-vs-int8 encoder is the only variable —
+# deliberately NOT in MODELS so the pylate entrypoints don't pick them up.
+ONNX_TAGS = {
+    "edge17m_onnxf32": ("mixedbread-ai/mxbai-edge-colbert-v0-17m", "model.onnx"),
+    "edge17m_q8": ("mixedbread-ai/mxbai-edge-colbert-v0-17m", "model_int8.onnx"),
+}
+
 embed_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -72,6 +82,24 @@ embed_image = (
         "transformers>=4.48",
         "torch>=2.2",
         "numpy>=1.24",
+        "hf_transfer>=0.1.6",
+    )
+    .env({
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "HF_HOME": CACHE_DIR,
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        "PYTHONUNBUFFERED": "1",
+    })
+)
+
+onnx_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "onnxruntime==1.20.1",
+        "transformers>=4.48",
+        "numpy>=1.24",
+        "huggingface_hub>=0.23",
         "hf_transfer>=0.1.6",
     )
     .env({
@@ -218,6 +246,110 @@ def embed(tag: str, dataset: str, force: bool = False):
     return {"bundle": out, "meta": meta}
 
 
+@app.function(
+    image=onnx_image, cpu=16, memory=32768, timeout=14400,
+    secrets=[HF_SECRET], volumes={CACHE_DIR: hf_cache, BUNDLE_DIR: bundles_vol},
+)
+def embed_onnx(tag: str, dataset: str, force: bool = False):
+    """Encode with mixedbread's end-to-end ONNX export (fp32 or int8 weights).
+
+    Same bundle format as embed(). Preprocessing follows onnx_config.json:
+    string prefixes '[Q] '/'[D] ', doc-side punctuation skiplist, no query
+    expansion. Embeddings are L2-normalized post-hoc; pre-normalization token
+    norm stats go into meta.json (encoder-precision norm-drift evidence — if
+    the graph already normalizes, the stats read ~1.0 and the renorm is a
+    no-op)."""
+    import numpy as np
+    import onnxruntime as ort
+    from huggingface_hub import hf_hub_download
+    from transformers import AutoTokenizer
+
+    out = f"{ROOT}/{dataset}_{tag}"
+    if os.path.exists(f"{out}/meta.json") and not force:
+        _log(f"embed_onnx[{dataset}/{tag}]: bundle exists, skipping")
+        return {"bundle": out, "skipped": True}
+
+    model_id, onnx_file = ONNX_TAGS[tag]
+    corpus_ids, corpus_texts, query_ids, query_texts, qrels = _load_beir(dataset)
+    cfg = json.load(open(hf_hub_download(model_id, "onnx_config.json")))
+    mpath = hf_hub_download(model_id, onnx_file)
+    tok = AutoTokenizer.from_pretrained(model_id)
+    opts = ort.SessionOptions()
+    sess = ort.InferenceSession(mpath, opts, providers=["CPUExecutionProvider"])
+    in_names = [i.name for i in sess.get_inputs()]
+    _log(f"embed_onnx[{dataset}/{tag}]: {onnx_file} inputs={in_names} "
+         f"docs={len(corpus_ids)} queries={len(query_ids)}")
+
+    skip_ids = {
+        i for w in cfg["skiplist_words"]
+        if (i := tok.convert_tokens_to_ids(w)) not in (None, tok.unk_token_id)
+    }
+
+    def encode(texts, prefix, maxlen, filter_skiplist, label):
+        res = [None] * len(texts)
+        norms = []
+        order = np.argsort([-len(t) for t in texts])  # length-bucketed batches
+        B = 32
+        for s in range(0, len(order), B):
+            bidx = order[s:s + B]
+            enc = tok([prefix + texts[i] for i in bidx], padding=True,
+                      truncation=True, max_length=maxlen, return_tensors="np")
+            feed = {n: enc[n].astype(np.int64) for n in in_names if n in enc}
+            emb = sess.run(None, feed)[0]  # [b, seq, dim]
+            for r, i in enumerate(bidx):
+                keep = enc["attention_mask"][r].astype(bool)
+                if filter_skiplist:
+                    keep &= ~np.isin(enc["input_ids"][r], list(skip_ids))
+                e = emb[r][keep].astype(np.float32)
+                n = np.linalg.norm(e, axis=1)
+                norms.append(n)
+                res[i] = e / np.maximum(n, 1e-12)[:, None]
+            if (s // B) % 20 == 0:
+                _log(f"embed_onnx[{dataset}/{tag}]: {label} {s + len(bidx)}/{len(texts)}")
+        alln = np.concatenate(norms)
+        stats = {"mean": float(alln.mean()), "std": float(alln.std()),
+                 "min": float(alln.min()), "max": float(alln.max())}
+        _log(f"embed_onnx[{dataset}/{tag}]: {label} pre-norm token norms {stats}")
+        return res, stats
+
+    doc_emb, doc_norms = encode(corpus_texts, cfg["document_prefix"],
+                                cfg["document_length"], True, "docs")
+    q_emb, q_norms = encode(query_texts, cfg["query_prefix"],
+                            cfg["query_length"], False, "queries")
+    dim = int(doc_emb[0].shape[1])
+
+    def pack(embs):
+        lens = np.array([e.shape[0] for e in embs], dtype=np.int64)
+        return np.concatenate(embs, axis=0).astype(np.float32), lens
+
+    corpus, corpus_lens = pack(doc_emb)
+    queries, query_lens = pack(q_emb)
+    os.makedirs(out, exist_ok=True)
+    np.save(f"{out}/corpus.npy", corpus)
+    np.save(f"{out}/corpus_lens.npy", corpus_lens)
+    np.save(f"{out}/queries.npy", queries)
+    np.save(f"{out}/query_lens.npy", query_lens)
+    for fname, obj in [("corpus_ids.json", corpus_ids), ("query_ids.json", query_ids),
+                       ("qrels.json", qrels)]:
+        with open(f"{out}/{fname}", "w") as f:
+            json.dump(obj, f)
+    meta = {
+        "model_id": model_id, "tag": tag, "dataset": dataset, "dim": dim,
+        "onnx_file": onnx_file, "encoder": "onnxruntime-cpu",
+        "onnxruntime": ort.__version__,
+        "doc_prenorm_token_norms": doc_norms, "query_prenorm_token_norms": q_norms,
+        "docs": len(corpus_ids), "queries": len(query_ids),
+        "doc_tokens": int(corpus_lens.sum()), "query_tokens": int(query_lens.sum()),
+        "date": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with open(f"{out}/meta.json", "w") as f:
+        json.dump(meta, f, indent=1)
+    bundles_vol.commit()
+    _log(f"embed_onnx[{dataset}/{tag}]: wrote {out} dim={dim} "
+         f"tokens={meta['doc_tokens']}")
+    return {"bundle": out, "meta": meta}
+
+
 def _ndcg10(ranked_rels, all_rels):
     """Harness-exact NDCG@10: gain 2^r - 1, discount 1/log2(i+2)."""
     import math
@@ -357,7 +489,8 @@ def eval_cell(tag: str, dataset: str, size: int = 0, seed: int = 0,
     harness = json.loads(line[len("NDCG_JSON "):])
 
     result = {
-        "dataset": dataset, "tag": tag, "model_id": MODELS[tag],
+        "dataset": dataset, "tag": tag,
+        "model_id": MODELS.get(tag) or ONNX_TAGS[tag][0],
         "size": size or n_docs, "n_docs_kept": int(len(keep)), "seed": seed,
         "f32_ndcg": f32_ndcg, "f32_per_query": f32_per_query, "harness": harness,
         "harness_sha": harness_sha, "arch": platform.machine(),
@@ -417,6 +550,21 @@ def scale_strip(force: bool = False):
     cells += [("edge17m", SCALE_DATASET, 14000, s, sha, force) for s in (1, 2)]
     for r in eval_cell.starmap(cells):
         _log(f"done: {r['dataset']}/{r['tag']} n={r['size']} s={r['seed']}")
+
+
+@app.local_entrypoint()
+def onnx_pair(dataset: str = "scifact", force: bool = False):
+    """Encoder-precision strip: fp32-ONNX vs int8-ONNX 17m encoder, same
+    preprocessing, full pipeline (embed -> ceiling -> eval_cell). SciFact
+    default: the 17m checkpoint's largest absolute binary loss with room
+    above the floor to detect further degradation."""
+    sha = _sha()
+    for r in embed_onnx.starmap([(t, dataset, force) for t in ONNX_TAGS]):
+        _log(f"embedded: {r['bundle']}" + (" (skipped)" if r.get("skipped") else ""))
+    for r in ceiling.starmap([(t, dataset, force) for t in ONNX_TAGS]):
+        _log(f"ceiling: {r['scores']}" + (" (skipped)" if r.get("skipped") else ""))
+    for r in eval_cell.starmap([(t, dataset, 0, 0, sha, force) for t in ONNX_TAGS]):
+        _log(f"done: {r['dataset']}/{r['tag']}")
 
 
 @app.local_entrypoint()

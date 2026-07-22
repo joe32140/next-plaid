@@ -72,11 +72,15 @@ SCALE_SIZES = [4000, 7000, 14000, 28000, 0]  # 0 = full corpus
 ONNX_TAGS = {
     # tag: (model_id, onnx_file, requantize_in_container)
     "edge17m_onnxf32": ("mixedbread-ai/mxbai-edge-colbert-v0-17m", "model.onnx", False),
-    # Vendor int8 export: measured anisotropy collapse (tokens vs global mean
-    # dir cos 0.9995 vs fp32's 0.9646; NDCG 0.001). Kept as the artifact row.
+    # Vendor int8 export: HEALTHY (ceiling 0.6994 vs 0.7215 fp32). The initial
+    # collapse (NDCG 0.001) was the ORT 1.20.1 x86 int8-first-session bug —
+    # version matrix: 1.20.1 int8-first collapsed (spread 0.0055), 1.20.1
+    # fp32-first / 1.23.0 / 1.27.0 / arm64 all healthy (0.019-0.023). The
+    # fp32-warm in embed_onnx works around it under this image's 1.20.1 pin.
     "edge17m_q8": ("mixedbread-ai/mxbai-edge-colbert-v0-17m", "model_int8.onnx", False),
-    # Our own per-channel dynamic quant of model.onnx: discriminates broken
-    # export from inherent int8 fragility of this checkpoint.
+    # Our per-channel quantize_dynamic of model.onnx: BROKEN independently of
+    # the session bug (ceiling 0.0 even warmed; Unsqueeze warning during
+    # quantization). Vendor's per-tensor recipe is the working one.
     "edge17m_q8pc": ("mixedbread-ai/mxbai-edge-colbert-v0-17m", "model.onnx", True),
 }
 

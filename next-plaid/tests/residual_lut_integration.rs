@@ -129,3 +129,46 @@ fn lut_scores_track_float_scores() {
         );
     }
 }
+
+/// The batched-centroid path (num_centroids > centroid_batch_size) must
+/// honor `residual_asym` and agree with the dense path. This is the scale
+/// cliff regression test: before the fix, any index with more than
+/// `centroid_batch_size` centroids (~67M tokens at the default 100k)
+/// silently reverted asym scoring to float decompress+GEMM. Forcing a tiny
+/// batch size exercises the batched path on a small index. With every doc
+/// in the exact-scored shortlist, rankings must match and scores may differ
+/// only by the cdot computation route (full GEMM vs per-centroid dots).
+#[test]
+fn batched_path_asym_matches_dense_path() {
+    for &nbits in &[1usize, 2, 4] {
+        let docs = random_docs(80, 8, 64);
+        let dir = TempDir::new().unwrap();
+        let config = IndexConfig {
+            nbits,
+            batch_size: 64,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let index =
+            MmapIndex::create_with_kmeans(&docs, dir.path().to_str().unwrap(), &config).unwrap();
+        let dense = params(true);
+        let batched = SearchParameters {
+            centroid_batch_size: 8,
+            ..params(true)
+        };
+        for (i, doc) in docs.iter().enumerate().step_by(9) {
+            let rd = index.search(doc, &dense, None).unwrap();
+            let rb = index.search(doc, &batched, None).unwrap();
+            assert_eq!(
+                rd.passage_ids, rb.passage_ids,
+                "nbits={nbits} query {i}: batched-asym ranking diverged from dense-asym"
+            );
+            for (a, b) in rd.scores.iter().zip(&rb.scores) {
+                assert!(
+                    (a - b).abs() < 1e-4,
+                    "nbits={nbits} query {i}: batched-asym score {b} vs dense-asym {a}"
+                );
+            }
+        }
+    }
+}

@@ -192,6 +192,49 @@ fn exact_doc_score(
     }
 }
 
+/// Exact asym score of one doc against a *compact* query×centroid matrix.
+///
+/// The batched search path never materializes the dense `[nq, K]` matrix the
+/// [`ScoreQuery::ResidualLut`] arm of [`exact_doc_score`] expects — that is
+/// the point of batching. Instead it packs the distinct centroid scores it
+/// already computed sparsely for approximate scoring into `compact_cd`, with
+/// `remap` translating real centroid ids to compact columns. The doc's codes
+/// are remapped once per doc outside the SIMD kernel, which then runs
+/// unchanged: the kernel only ever indexes `cd[qi * ncent + cid]` and is
+/// agnostic to what the ids mean.
+fn exact_doc_score_asym_compact(
+    index: &crate::index::MmapIndex,
+    q8: &crate::binary::QueryI8,
+    lut: &crate::residual_lut::ResidualLut,
+    planes: Option<&crate::residual_lut::QueryPlanes>,
+    compact_cd: &Array2<f32>,
+    remap: &HashMap<i64, i64>,
+    doc_id: usize,
+) -> Option<f32> {
+    let inv_norms = index.residual_inv_norms()?;
+    let start = index.doc_offsets[doc_id];
+    let end = index.doc_offsets[doc_id + 1];
+    let packed = index.mmap_residuals.slice_rows(start, end);
+    let codes = index.mmap_codes.slice(start, end);
+    let mut remapped = Vec::with_capacity(codes.len());
+    for c in codes.iter() {
+        // Every shortlisted doc is a candidate, and the compact matrix covers
+        // every centroid any candidate references — a miss is a logic bug.
+        debug_assert!(remap.contains_key(c), "shortlist code {c} missing from centroid union");
+        remapped.push(*remap.get(c)?);
+    }
+    Some(crate::residual_lut::maxsim_residual_lut_i8(
+        q8,
+        planes,
+        &packed,
+        &remapped,
+        &compact_cd.view(),
+        lut,
+        &inv_norms[start..end],
+        index.codec.embedding_dim(),
+    ))
+}
+
 /// Bench-only stage-2 entry: exact MaxSim of `query` against `doc_ids`
 /// through the same prepared-query paths `search` uses (float decompression,
 /// asymmetric int8×LUT, or binary int8×1-bit). Includes the per-query
@@ -790,17 +833,53 @@ fn search_one_mmap_batched(
     // Compute exact scores. Binary indexes score against an int8 query; the
     // full-precision query is used for the float (residual) path.
     // Chunked processing limits concurrent memory from parallel decompression.
-    // The batched-centroid path never materializes the dense query×centroid
-    // matrix the asymmetric residual arm needs for its centroid term, so it
-    // always scores residual candidates through the float path.
-    let exact_query = prepare_score_query(index, query, false);
+    //
+    // The asymmetric residual arm needs query×centroid scores for its
+    // centroid term. This path deliberately never builds the dense [nq, K]
+    // matrix — that is the point of batching — but the sparse centroid
+    // scores computed for approximate scoring already cover every centroid
+    // any candidate references, a superset of the shortlist's. Packing them
+    // into a compact [nq, distinct] matrix plus a per-doc code remap feeds
+    // the same fused kernels the dense path uses.
+    let exact_query = prepare_score_query(index, query, params.residual_asym);
+    let asym_compact = if matches!(&exact_query, ScoreQuery::ResidualLut { .. }) {
+        // Build the per-token norm cache once, outside the parallel loop.
+        let _ = index.residual_inv_norms();
+        let mut ids: Vec<usize> = sparse_scores.keys().copied().collect();
+        ids.sort_unstable();
+        let remap: HashMap<i64, i64> = ids
+            .iter()
+            .enumerate()
+            .map(|(col, &c)| (c as i64, col as i64))
+            .collect();
+        let mut compact = Array2::<f32>::zeros((num_query_tokens, ids.len()));
+        for (col, &c) in ids.iter().enumerate() {
+            compact.column_mut(col).assign(&sparse_scores[&c]);
+        }
+        Some((compact, remap))
+    } else {
+        None
+    };
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
         .par_chunks(DECOMPRESS_CHUNK_SIZE)
         .flat_map(|chunk| {
             chunk
                 .iter()
                 .filter_map(|&doc_id| {
-                    let score = exact_doc_score(index, &exact_query, None, doc_id as usize)?;
+                    let score = match (&exact_query, &asym_compact) {
+                        (ScoreQuery::ResidualLut { q8, lut, planes }, Some((cd, remap))) => {
+                            exact_doc_score_asym_compact(
+                                index,
+                                q8,
+                                lut,
+                                planes.as_ref(),
+                                cd,
+                                remap,
+                                doc_id as usize,
+                            )
+                        }
+                        _ => exact_doc_score(index, &exact_query, None, doc_id as usize),
+                    }?;
                     Some((doc_id, score))
                 })
                 .collect::<Vec<_>>()

@@ -48,7 +48,14 @@ jobs:
         env:
           FEAT: ${{ runner.os == 'macOS' && 'accelerate' || 'openblas' }}
         run: cargo build --release --example maxsim_bench -p next-plaid --features "$FEAT"
+      # OPENBLAS_NUM_THREADS=1: one BLAS thread per rayon worker — otherwise
+      # OpenBLAS's own pool oversubscribes against rayon and the float
+      # baseline reads slower than it is (measured: 49 vs 33 ms at 786).
       - name: bench BLAS (500 docs x 180 tokens)
+        env:
+          OPENBLAS_NUM_THREADS: 1
         run: ./target/release/examples/maxsim_bench synth 500
       - name: bench BLAS (500 docs x 786 tokens)
+        env:
+          OPENBLAS_NUM_THREADS: 1
         run: SYNTH_TOKENS=786 ./target/release/examples/maxsim_bench synth 500

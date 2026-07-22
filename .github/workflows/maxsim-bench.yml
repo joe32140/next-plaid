@@ -35,58 +35,65 @@ on:
     branches: [feat/asymmetric-lut-residual]
   workflow_dispatch:
 
-env:
-  FIQA_CAP: 15000
-
+# The fiqa corpus-size ladder (4k / 15k / 52k docs ≈ 0.54M / 2.0M / 7.0M
+# tokens, one length distribution) exists to show the other side of the
+# story: stage-1 grows with corpus while stage-2 stays ~1024 candidate docs,
+# so binary's end-to-end advantage must shrink as the corpus grows — the
+# honest counterweight to kernel-level speedup headlines. Ladder rungs build
+# only r4 + binary (INDEX_TAGS): asym profiles ride the r4 index, and r2/r1
+# don't inform this axis.
+#
+# Builds run as ONE JOB PER CELL: k-means assignment is O(tokens×centroids)
+# and centroid count grows with corpus, so build time scales ~n^1.5 — the
+# tall rungs need their own timeout budget, their own cache save (a
+# cancelled monolithic job saves nothing), and their own right to fail: the
+# bench job runs on `!cancelled()` and profiles whatever artifacts exist
+# (NO_BUILD degrades missing cells to skips).
 jobs:
   build-indexes:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cell: nfcorpus, shapes: nfcorpus, cap: "",      tags: "",          timeout: 45 }
+          - { cell: scifact,  shapes: scifact,  cap: "",      tags: "",          timeout: 45 }
+          - { cell: fiqa15k,  shapes: fiqa,     cap: "15000", tags: "",          timeout: 120 }
+          - { cell: fiqa4k,   shapes: fiqa,     cap: "4000",  tags: "r4,binary", timeout: 45 }
+          - { cell: fiqa52k,  shapes: fiqa,     cap: "52000", tags: "r4,binary", timeout: 300 }
+    name: build-${{ matrix.cell }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.timeout }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: build profiler
         run: cargo build --release --example stage2_profile -p next-plaid
-
-      # Per-cell cache so partial progress persists if a later, larger build
-      # fails. Key = shapes manifest hash + format version (bump v1 manually
-      # if the index on-disk format or build config changes).
-      - name: cache nfcorpus indexes
+      # Cache key = cell + shapes manifest hash + format version (bump v1
+      # manually if the index on-disk format or build config changes). On a
+      # hit the profiler sees the completion markers and exits in seconds.
+      - name: cache indexes
         uses: actions/cache@v4
         with:
-          path: indexes/nfcorpus
-          key: stage2-idx-v1-nfcorpus-${{ hashFiles('next-plaid/examples/shapes/nfcorpus/*') }}
-      - name: cache scifact indexes
-        uses: actions/cache@v4
-        with:
-          path: indexes/scifact
-          key: stage2-idx-v1-scifact-${{ hashFiles('next-plaid/examples/shapes/scifact/*') }}
-      - name: cache fiqa indexes
-        uses: actions/cache@v4
-        with:
-          path: indexes/fiqa
-          key: stage2-idx-v1-fiqa-${{ env.FIQA_CAP }}-${{ hashFiles('next-plaid/examples/shapes/fiqa/*') }}
-
+          path: indexes
+          key: stage2-idx-v1-${{ matrix.cell }}-${{ hashFiles(format('next-plaid/examples/shapes/{0}/*', matrix.shapes)) }}
       # /usr/bin/time -v prints "Maximum resident set size" — the KB/token
-      # scaling datum that decides how far the fiqa cap can rise. On a cache
-      # hit the profiler sees the markers and exits in seconds.
-      - name: build nfcorpus indexes (863k tokens)
-        run: BUILD_ONLY=1 INDEX_ROOT=indexes/nfcorpus /usr/bin/time -v ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/nfcorpus
-      - name: build scifact indexes (1.19M tokens)
-        run: BUILD_ONLY=1 INDEX_ROOT=indexes/scifact /usr/bin/time -v ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/scifact
-      - name: build fiqa indexes (capped, ~2.0M tokens)
-        run: BUILD_ONLY=1 INDEX_ROOT=indexes/fiqa /usr/bin/time -v ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa ${{ env.FIQA_CAP }}
+      # scaling datum that decides how far the fiqa cap can rise.
+      - name: build (${{ matrix.cell }})
+        run: BUILD_ONLY=1 INDEX_TAGS="${{ matrix.tags }}" INDEX_ROOT=indexes /usr/bin/time -v ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/${{ matrix.shapes }} ${{ matrix.cap }}
       - name: index sizes
-        run: du -sh indexes/*/*
+        run: du -sh indexes/*
       - uses: actions/upload-artifact@v4
         with:
-          name: stage2-indexes
+          name: stage2-indexes-${{ matrix.cell }}
           path: indexes
           retention-days: 3
 
   bench:
     needs: build-indexes
+    # Run even when a build leg failed or timed out: profile whatever cells
+    # made it into artifacts, skip the rest (NO_BUILD).
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -104,16 +111,23 @@ jobs:
           cargo test --release -p next-plaid --lib residual_lut
           cargo test --release -p next-plaid --test residual_lut_integration
 
+      # Cell index dirs are uniquely named (shapes-<dataset>-<n>docs_<tag>),
+      # so all per-cell artifacts merge into one flat INDEX_ROOT.
       - uses: actions/download-artifact@v4
         with:
-          name: stage2-indexes
+          pattern: stage2-indexes-*
           path: indexes
+          merge-multiple: true
       - name: stage2 phase profile — nfcorpus shapes (3,633 docs / 863k tokens)
-        run: INDEX_ROOT=indexes/nfcorpus ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/nfcorpus
+        run: NO_BUILD=1 INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/nfcorpus
       - name: stage2 phase profile — scifact shapes (5,183 docs / 1.19M tokens)
-        run: INDEX_ROOT=indexes/scifact ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/scifact
+        run: NO_BUILD=1 INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/scifact
       - name: stage2 phase profile — fiqa shapes (15k docs / ~2.0M tokens)
-        run: INDEX_ROOT=indexes/fiqa ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa ${{ env.FIQA_CAP }}
+        run: NO_BUILD=1 INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 15000
+      - name: corpus ladder — fiqa 4k docs (~0.54M tokens)
+        run: NO_BUILD=1 INDEX_TAGS=r4,binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 4000
+      - name: corpus ladder — fiqa 52k docs (~7.0M tokens)
+        run: NO_BUILD=1 INDEX_TAGS=r4,binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 52000
 
       - name: bench (synthetic 500 docs x 180 tokens, dim 128)
         run: ./target/release/examples/maxsim_bench synth 500

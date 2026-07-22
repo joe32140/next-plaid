@@ -44,6 +44,15 @@
 //!   the reason this exists (a scifact-scale build peaks ~20 GB).
 //! * `BUILD_ONLY=1` — ensure all four indexes exist, then exit without
 //!   profiling (for a dedicated build job).
+//! * `INDEX_TAGS=r4,binary` — restrict which indexes are built/profiled
+//!   (corpus-size ladder cells skip r2/r1: the ladder's axis is the
+//!   float/asym/binary end-to-end ratio vs corpus size, and r2/r1 would
+//!   double the build and artifact cost without informing it).
+//! * `NO_BUILD=1` — never build: profile cached indexes, skip missing ones
+//!   with a note. Profile jobs consuming a build artifact set this so a
+//!   partial artifact (e.g. the tallest ladder rung OOM'd in the build job)
+//!   degrades to a skipped cell instead of a doomed multi-GB build on a
+//!   small runner.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -216,8 +225,18 @@ fn main() {
     let index_root = std::env::var("INDEX_ROOT").ok();
     let build_only = std::env::var("BUILD_ONLY").is_ok();
 
-    // (label, nbits, binary)
-    let builds = [("r4", 4usize, false), ("r2", 2, false), ("r1", 1, false), ("binary", 4, true)];
+    // (label, nbits, binary). INDEX_TAGS=r4,binary restricts the set — used
+    // by corpus-size ladder cells where only the float/asym-vs-binary
+    // end-to-end ratio matters and r2/r1 would double build + artifact cost.
+    // Empty means unset (CI matrix cells pass INDEX_TAGS="" for "all").
+    let tag_filter = std::env::var("INDEX_TAGS").ok().filter(|s| !s.is_empty());
+    let builds: Vec<(&str, usize, bool)> =
+        [("r4", 4usize, false), ("r2", 2, false), ("r1", 1, false), ("binary", 4, true)]
+            .into_iter()
+            .filter(|(tag, _, _)| {
+                tag_filter.as_ref().is_none_or(|f| f.split(',').any(|t| t == *tag))
+            })
+            .collect();
 
     // With INDEX_ROOT, an index is reused iff its completion marker exists
     // (a killed build leaves no marker and is rebuilt). Without it, every
@@ -232,14 +251,15 @@ fn main() {
     let cached = |tag: &str| index_root.is_some() && marker(&dir_for(tag)).exists();
 
     // Materialize the corpus only if something needs building.
-    let need_build = builds.iter().any(|(tag, _, _)| !cached(tag));
+    let no_build = std::env::var("NO_BUILD").is_ok();
+    let need_build = !no_build && builds.iter().any(|(tag, _, _)| !cached(tag));
     let docs: Vec<Array2<f32>> = if need_build {
         let t = Instant::now();
         let d = (corpus.gen_docs)();
         println!("corpus materialized in {:.1}s (needed for index build)", t.elapsed().as_secs_f64());
         d
     } else {
-        println!("all indexes cached under {} — corpus not materialized", index_root.as_deref().unwrap());
+        println!("corpus not materialized (no index build will run)");
         Vec::new()
     };
 
@@ -250,6 +270,9 @@ fn main() {
             let index = MmapIndex::load(dir.to_str().unwrap()).unwrap();
             println!("\n=== index {tag} (nbits={nbits}, binary={binary}) — loaded from cache in {:.2}s ===", t.elapsed().as_secs_f64());
             index
+        } else if no_build {
+            println!("\n=== index {tag}: not cached and NO_BUILD set — skipped ===");
+            continue;
         } else {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(dir.parent().unwrap()).unwrap();

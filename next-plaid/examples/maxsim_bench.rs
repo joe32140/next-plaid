@@ -166,14 +166,44 @@ fn main() {
     for (label, config, asym) in configs {
         let rebuild = !matches!(&built, Some((n, b, _)) if *n == config.nbits && *b == config.binary);
         if rebuild {
-            let dir = std::env::temp_dir().join(format!(
-                "np_maxsim_bench_{}_{}",
-                config.nbits, config.binary
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            eprintln!("building index nbits={} binary={} ...", config.nbits, config.binary);
-            let index =
-                MmapIndex::create_with_kmeans(&docs, dir.to_str().unwrap(), &config).unwrap();
+            // With INDEX_ROOT set, reuse stage2_profile's persistent index
+            // cache: same builder, same seed, and (in synth mode) the same
+            // LCG doc stream, so its BUILD_ONLY output is bit-identical to
+            // what this bench would build. Lets memory-limited machines
+            // time kernels against indexes built elsewhere (e.g. CI).
+            let tag = match (config.nbits, config.binary) {
+                (_, true) => "binary",
+                (4, false) => "r4",
+                (2, false) => "r2",
+                _ => "r1",
+            };
+            let cache_dir = std::env::var("INDEX_ROOT").ok().map(|root| {
+                PathBuf::from(root).join(format!(
+                    "synth-{}x{}_{tag}",
+                    docs.len(),
+                    docs[0].nrows()
+                ))
+            });
+            let index = match &cache_dir {
+                Some(d) if d.join("PROFILE_INDEX_OK").exists() => {
+                    eprintln!("loading cached index {tag} ...");
+                    MmapIndex::load(d.to_str().unwrap()).unwrap()
+                }
+                _ => {
+                    let dir = cache_dir.clone().unwrap_or_else(|| {
+                        std::env::temp_dir()
+                            .join(format!("np_maxsim_bench_{}_{}", config.nbits, config.binary))
+                    });
+                    let _ = std::fs::remove_dir_all(&dir);
+                    eprintln!("building index nbits={} binary={} ...", config.nbits, config.binary);
+                    let index = MmapIndex::create_with_kmeans(&docs, dir.to_str().unwrap(), &config)
+                        .unwrap();
+                    if cache_dir.is_some() {
+                        std::fs::write(dir.join("PROFILE_INDEX_OK"), b"ok").unwrap();
+                    }
+                    index
+                }
+            };
             built = Some((config.nbits, config.binary, index));
         }
         let index = &built.as_ref().unwrap().2;

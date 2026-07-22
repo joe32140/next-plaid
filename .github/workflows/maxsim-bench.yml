@@ -114,6 +114,46 @@ jobs:
           path: indexes
           retention-days: 3
 
+  # Mixedbread-shape indexes (1000 docs x 786 tokens, synth values) as an
+  # artifact: maxsim_bench now honors INDEX_ROOT and shares stage2_profile's
+  # cache format (same builder, same seed, same LCG doc stream), so a
+  # memory-limited machine — e.g. the 16 GB M4 that jetsams any local build
+  # past ~800k tokens — can time the 786-token protocol natively against
+  # indexes built here.
+  build-synth786:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build profiler
+        run: cargo build --release --example stage2_profile -p next-plaid
+      - name: restore index cache
+        id: idxcache
+        uses: actions/cache/restore@v4
+        with:
+          path: indexes
+          key: stage2-idx-v1-synth786
+      - name: build (synth 1000x786)
+        run: |
+          for t in r4 r2 r1 binary; do
+            BUILD_ONLY=1 SYNTH_TOKENS=786 INDEX_TAGS=$t INDEX_ROOT=indexes /usr/bin/time -v \
+              ./target/release/examples/stage2_profile synth 1000
+          done
+      - name: save index cache
+        if: always() && steps.idxcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: indexes
+          key: stage2-idx-v1-synth786
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stage2-indexes-synth786
+          path: indexes
+          retention-days: 3
+
   bench:
     needs: build-indexes
     # Run even when a build leg failed or timed out: profile whatever cells

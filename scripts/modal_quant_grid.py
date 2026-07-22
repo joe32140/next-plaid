@@ -372,7 +372,7 @@ def embed_onnx(tag: str, dataset: str, force: bool = False):
     image=onnx_image, cpu=16, memory=16384, timeout=3600,
     secrets=[HF_SECRET], volumes={CACHE_DIR: hf_cache},
 )
-def batch_probe(n: int = 64, longest: bool = False):
+def batch_probe(n: int = 64, longest: bool = False, use_opts: bool = False):
     """Discriminate weight-recipe vs runtime cause of the int8 collapse.
 
     Both the vendor int8 export and our per-channel requant collapse under
@@ -431,8 +431,10 @@ def batch_probe(n: int = 64, longest: bool = False):
     _log(f"fp32 B=1   : spread(cos to mean dir) mean={m:.4f} std={s:.4f}")
     del fp32
 
+    sess_opts = ort.SessionOptions() if use_opts else None
+    _log(f"int8 session: use_opts={use_opts}")
     int8 = ort.InferenceSession(hf_hub_download(model_id, "model_int8.onnx"),
-                                providers=["CPUExecutionProvider"])
+                                sess_opts, providers=["CPUExecutionProvider"])
     results = {"fp32_spread": [float(m), float(s)]}
     for label, b in [("int8 B=1", 1), ("int8 B=32", 32)]:
         e = run(int8, b)
@@ -446,8 +448,8 @@ def batch_probe(n: int = 64, longest: bool = False):
 
 
 @app.local_entrypoint()
-def probe(n: int = 64, longest: bool = False):
-    _log(f"batch_probe: {json.dumps(batch_probe.remote(n, longest))}")
+def probe(n: int = 64, longest: bool = False, use_opts: bool = False):
+    _log(f"batch_probe: {json.dumps(batch_probe.remote(n, longest, use_opts))}")
 
 
 @app.function(

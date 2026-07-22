@@ -372,7 +372,7 @@ def embed_onnx(tag: str, dataset: str, force: bool = False):
     image=onnx_image, cpu=8, memory=16384, timeout=3600,
     secrets=[HF_SECRET], volumes={CACHE_DIR: hf_cache},
 )
-def batch_probe(n: int = 64):
+def batch_probe(n: int = 64, longest: bool = False):
     """Discriminate weight-recipe vs runtime cause of the int8 collapse.
 
     Both the vendor int8 export and our per-channel requant collapse under
@@ -392,7 +392,13 @@ def batch_probe(n: int = 64):
     cfg = json.load(open(hf_hub_download(model_id, "onnx_config.json")))
     tok = AutoTokenizer.from_pretrained(model_id)
     _, corpus_texts, *_ = _load_beir("scifact")
+    if longest:
+        # The n longest docs by char length — reproduces the first batches of
+        # embed_onnx's global length-sorted order (512-token padded batches).
+        corpus_texts = sorted(corpus_texts, key=len, reverse=True)
     texts = [cfg["document_prefix"] + t for t in corpus_texts[:n]]
+    _log(f"batch_probe: n={n} longest={longest} "
+         f"char lens {min(map(len, texts))}..{max(map(len, texts))}")
 
     def run(sess, batch):
         order = (np.argsort([-len(t) for t in texts]) if batch > 1
@@ -440,8 +446,8 @@ def batch_probe(n: int = 64):
 
 
 @app.local_entrypoint()
-def probe():
-    _log(f"batch_probe: {json.dumps(batch_probe.remote())}")
+def probe(n: int = 64, longest: bool = False):
+    _log(f"batch_probe: {json.dumps(batch_probe.remote(n, longest))}")
 
 
 def _ndcg10(ranked_rels, all_rels):

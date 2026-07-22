@@ -456,7 +456,7 @@ def probe(n: int = 64, longest: bool = False, use_opts: bool = False):
     image=onnx_image, cpu=16, memory=32768, timeout=7200,
     secrets=[HF_SECRET], volumes={CACHE_DIR: hf_cache},
 )
-def trajectory_probe():
+def trajectory_probe(warm_fp32: bool = False, max_batches: int = 0):
     """Full-corpus int8 encode replicating embed_onnx exactly (cpu=16,
     SessionOptions(), global length sort, B=32), logging within-batch token
     spread per batch. Healthy spread ~0.02; collapsed ~0.007. A mid-run drop
@@ -474,6 +474,18 @@ def trajectory_probe():
     _, corpus_texts, *_ = _load_beir("scifact")
     texts = [cfg["document_prefix"] + t for t in corpus_texts]
 
+    if warm_fp32:
+        # The one variable separating collapsed runs from healthy probes:
+        # healthy probes ran an fp32 session in-process before creating the
+        # int8 session. Replicate that with a single tiny fp32 call.
+        f = ort.InferenceSession(hf_hub_download(model_id, "model.onnx"),
+                                 providers=["CPUExecutionProvider"])
+        warm = tok([texts[0][:200]], return_tensors="np")
+        f.run(None, {i.name: warm[i.name].astype(np.int64)
+                     for i in f.get_inputs() if i.name in warm})
+        del f
+        _log("warmed fp32 session before int8 session creation")
+
     opts = ort.SessionOptions()
     sess = ort.InferenceSession(hf_hub_download(model_id, "model_int8.onnx"),
                                 opts, providers=["CPUExecutionProvider"])
@@ -483,6 +495,8 @@ def trajectory_probe():
     B = 32
     spreads = []
     for s in range(0, len(order), B):
+        if max_batches and s // B >= max_batches:
+            break
         bidx = order[s:s + B]
         enc = tok([texts[i] for i in bidx], padding=True, truncation=True,
                   max_length=cfg["document_length"], return_tensors="np")
@@ -506,9 +520,10 @@ def trajectory_probe():
 
 
 @app.local_entrypoint()
-def trajectory():
-    r = trajectory_probe.remote()
-    _log(f"trajectory_probe: first10={r['first10']} last10={r['last10']} min={r['min']}")
+def trajectory(warm_fp32: bool = False, max_batches: int = 0):
+    r = trajectory_probe.remote(warm_fp32, max_batches)
+    _log(f"trajectory_probe(warm_fp32={warm_fp32}): "
+         f"first10={r['first10']} last10={r['last10']} min={r['min']}")
 
 
 def _ndcg10(ranked_rels, all_rels):

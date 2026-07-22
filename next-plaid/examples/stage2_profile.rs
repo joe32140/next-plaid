@@ -17,7 +17,11 @@
 //! across queries. Storage note: raw f32 would be 512 B/token; r4/r2/r1
 //! pack dim·nbits/8 residual bytes (+8 B code) per token; binary dim/8.
 //!
-//! Usage: `stage2_profile <bundle_dir> [max_queries]`
+//! Usage: `stage2_profile <bundle_dir|synth> [max_queries]`
+//!   `synth` generates a bundle-free corpus for CI (seeded LCG unit-norm
+//!   tokens; phase latency depends on shapes, not values): [max_queries]
+//!   becomes n_docs (default 2000), SYNTH_TOKENS per-doc tokens (default
+//!   180), SYNTH_DIM (default 128), 50 queries x 32 tokens.
 
 use std::fs::File;
 use std::path::PathBuf;
@@ -64,35 +68,64 @@ fn time3(mut f: impl FnMut()) -> f64 {
 }
 
 fn main() {
-    let bundle = PathBuf::from(
-        std::env::args()
-            .nth(1)
-            .expect("usage: stage2_profile <bundle_dir> [max_queries]"),
-    );
-    let max_queries: usize = std::env::args()
-        .nth(2)
-        .map(|s| s.parse().unwrap())
-        .unwrap_or(usize::MAX);
+    let arg1 = std::env::args()
+        .nth(1)
+        .expect("usage: stage2_profile <bundle_dir|synth> [max_queries]");
+    let arg2: Option<usize> = std::env::args().nth(2).map(|s| s.parse().unwrap());
 
-    let corpus = Array2::<f32>::read_npy(File::open(bundle.join("corpus.npy")).unwrap()).unwrap();
-    let lens =
-        Array1::<i64>::read_npy(File::open(bundle.join("corpus_lens.npy")).unwrap()).unwrap();
-    let queries_c =
-        Array2::<f32>::read_npy(File::open(bundle.join("queries.npy")).unwrap()).unwrap();
-    let qlens =
-        Array1::<i64>::read_npy(File::open(bundle.join("query_lens.npy")).unwrap()).unwrap();
-    let docs = unpack(&corpus, &lens);
-    let queries: Vec<Array2<f32>> = unpack(&queries_c, &qlens)
-        .into_iter()
-        .take(max_queries)
-        .collect();
+    let (name, docs, queries): (String, Vec<Array2<f32>>, Vec<Array2<f32>>) = if arg1 == "synth" {
+        let n_docs = arg2.unwrap_or(2000);
+        let t: usize = std::env::var("SYNTH_TOKENS")
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(180);
+        let dim: usize = std::env::var("SYNTH_DIM")
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(128);
+        let mut s = 0x5eed_u64;
+        let mut unit_rows = |n: usize| -> Array2<f32> {
+            let mut a = Array2::<f32>::zeros((n, dim));
+            for mut row in a.rows_mut() {
+                for v in row.iter_mut() {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    *v = ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0;
+                }
+                let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
+                row.mapv_inplace(|v| v / norm);
+            }
+            a
+        };
+        let docs: Vec<Array2<f32>> = (0..n_docs).map(|_| unit_rows(t)).collect();
+        let queries: Vec<Array2<f32>> = (0..50).map(|_| unit_rows(32)).collect();
+        (format!("synth-{n_docs}x{t}"), docs, queries)
+    } else {
+        let bundle = PathBuf::from(&arg1);
+        let corpus =
+            Array2::<f32>::read_npy(File::open(bundle.join("corpus.npy")).unwrap()).unwrap();
+        let lens =
+            Array1::<i64>::read_npy(File::open(bundle.join("corpus_lens.npy")).unwrap()).unwrap();
+        let queries_c =
+            Array2::<f32>::read_npy(File::open(bundle.join("queries.npy")).unwrap()).unwrap();
+        let qlens =
+            Array1::<i64>::read_npy(File::open(bundle.join("query_lens.npy")).unwrap()).unwrap();
+        let docs = unpack(&corpus, &lens);
+        let queries: Vec<Array2<f32>> = unpack(&queries_c, &qlens)
+            .into_iter()
+            .take(arg2.unwrap_or(usize::MAX))
+            .collect();
+        (
+            bundle.file_name().unwrap().to_string_lossy().into_owned(),
+            docs,
+            queries,
+        )
+    };
+    let total_tokens: usize = docs.iter().map(|d| d.nrows()).sum();
     println!(
         "stage2_profile: {} ({} docs, {} doc tokens, {} queries, dim {})",
-        bundle.file_name().unwrap().to_string_lossy(),
+        name,
         docs.len(),
-        corpus.nrows(),
+        total_tokens,
         queries.len(),
-        corpus.ncols(),
+        docs[0].ncols(),
     );
     println!("params: SearchParameters::default() (n_ivf_probe=8, n_full_scores=4096)");
     let params = SearchParameters::default();

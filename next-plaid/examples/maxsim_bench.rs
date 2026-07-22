@@ -112,6 +112,42 @@ fn main() {
     );
 
     let ids: Vec<usize> = (0..docs.len()).collect();
+
+    // Anchor row matching mixedbread's Float/Float definition: raw f32 MaxSim
+    // over the original doc arrays — no compression on either side, so no
+    // decompression in the timed path (our "float rX" rows below decompress
+    // from stored codes, the honest cost of a compressed deployment).
+    {
+        use rayon::prelude::*;
+        let raw = |ids: &[usize]| -> f32 {
+            ids.par_iter()
+                .map(|&d| {
+                    let sim = query.dot(&docs[d].t());
+                    sim.rows()
+                        .into_iter()
+                        .map(|r| r.fold(f32::NEG_INFINITY, |m, &v| m.max(v)))
+                        .sum::<f32>()
+                })
+                .sum()
+        };
+        for _ in 0..2 {
+            std::hint::black_box(raw(&ids));
+        }
+        let mut times: Vec<f64> = (0..9)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                std::hint::black_box(raw(&ids));
+                t.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        println!(
+            "{:<30} {:8.2} ms /{} docs   (mixedbread Float/Float anchor)",
+            "float f32 raw (no decompress)",
+            median(&mut times),
+            ids.len(),
+        );
+    }
+
     let configs: Vec<(&str, IndexConfig, bool)> = vec![
         // (label, config, residual_asym)
         ("float r4 (decompress+GEMM)", cfg(4, false), false),

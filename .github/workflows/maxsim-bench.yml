@@ -37,3 +37,18 @@ jobs:
         run: ./target/release/examples/maxsim_bench synth 500
       - name: bench (synthetic 500 docs x 786 tokens — mixedbread's doc shape)
         run: SYNTH_TOKENS=786 ./target/release/examples/maxsim_bench synth 500
+      # Same benches against a vendor-BLAS float baseline (Accelerate/AMX on
+      # macOS, OpenBLAS on Linux) instead of default matrixmultiply — measures
+      # how much of the binary/LUT speedup survives a peak-strength GEMM, the
+      # baseline mixedbread's Float/Float row effectively uses.
+      - name: install OpenBLAS (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+      - name: rebuild with vendor BLAS
+        env:
+          FEAT: ${{ runner.os == 'macOS' && 'accelerate' || 'openblas' }}
+        run: cargo build --release --example maxsim_bench -p next-plaid --features "$FEAT"
+      - name: bench BLAS (500 docs x 180 tokens)
+        run: ./target/release/examples/maxsim_bench synth 500
+      - name: bench BLAS (500 docs x 786 tokens)
+        run: SYNTH_TOKENS=786 ./target/release/examples/maxsim_bench synth 500

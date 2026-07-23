@@ -269,6 +269,38 @@ pub fn exact_score_docs(
         .collect()
 }
 
+/// Transpose stage-1's `[nq, K]` centroid scores into the kernels'
+/// centroid-major `[K, nq]` layout, in cache-blocked passes.
+///
+/// `ndarray`'s `.t().as_standard_layout()` walks the destination in order,
+/// so every element read jumps a full row of the source — at K = 16k that
+/// is a ~64 KB stride, i.e. a cache **and** TLB miss per element, measured
+/// at 2–16 ms per query on x86 (enough to eat half the fused kernels' win
+/// at the end-to-end altitude). Blocking over centroids makes both sides
+/// sequential: for each strip of `BLK` centroids we read `nq` runs of
+/// `BLK` contiguous floats and write `BLK` runs of `nq` contiguous floats,
+/// so each cache line is used fully instead of once.
+fn transpose_cdot(cdot: &Array2<f32>) -> Array2<f32> {
+    const BLK: usize = 64;
+    let (nq, k) = (cdot.nrows(), cdot.ncols());
+    let src = cdot.as_standard_layout();
+    let src = src.as_slice().expect("cdot must be contiguous");
+    let mut out = Array2::<f32>::zeros((k, nq));
+    let dst = out.as_slice_mut().expect("fresh array is contiguous");
+    let mut c0 = 0usize;
+    while c0 < k {
+        let c1 = (c0 + BLK).min(k);
+        for qi in 0..nq {
+            let row = &src[qi * k + c0..qi * k + c1];
+            for (j, &v) in row.iter().enumerate() {
+                dst[(c0 + j) * nq + qi] = v;
+            }
+        }
+        c0 = c1;
+    }
+    out
+}
+
 /// Like [`exact_score_docs`], but with the dense query×centroid matrix
 /// supplied by the caller in stage-1's `[nq, K]` layout — the production
 /// situation, where Stage-1 already computed it for IVF probing. Used by the
@@ -289,7 +321,7 @@ pub fn exact_score_docs_prepared(
     let sq = prepare_score_query(index, query, residual_asym);
     let cdot_t = if matches!(&sq, ScoreQuery::ResidualLut { .. }) {
         let _ = index.residual_inv_norms();
-        Some(cdot.t().as_standard_layout().into_owned())
+        Some(transpose_cdot(cdot))
     } else {
         None
     };
@@ -596,7 +628,7 @@ pub fn search_one_mmap(
         // per-token probing, the exact kernels want centroid-major [K, nq]
         // so a token's scores across query rows are one contiguous strip
         // (vectorized fold + no K-strided gather per row).
-        Some(query_centroid_scores.t().as_standard_layout().into_owned())
+        Some(transpose_cdot(&query_centroid_scores))
     } else {
         None
     };
@@ -1049,5 +1081,30 @@ mod tests {
         assert_eq!(max_score(1.0, f32::NAN), 1.0);
         assert_eq!(max_score(f32::INFINITY, 1.0), 1.0);
         assert_eq!(max_score(1.0, f32::INFINITY), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod transpose_tests {
+    use super::*;
+
+    /// The blocked transpose must equal the naive one for every shape — in
+    /// particular for K spanning many blocks (the production case; the
+    /// search integration tests all use toy indexes whose K never exceeds
+    /// one block) and for K not a multiple of the block size.
+    #[test]
+    fn blocked_transpose_matches_naive() {
+        for &nq in &[1usize, 3, 32] {
+            for &k in &[1usize, 7, 64, 65, 200, 4096] {
+                let a = Array2::<f32>::from_shape_fn((nq, k), |(q, c)| (q * 7919 + c) as f32);
+                let got = transpose_cdot(&a);
+                assert_eq!(got.dim(), (k, nq), "nq={nq} k={k}");
+                for q in 0..nq {
+                    for c in 0..k {
+                        assert_eq!(got[[c, q]], a[[q, c]], "nq={nq} k={k} at ({q},{c})");
+                    }
+                }
+            }
+        }
     }
 }

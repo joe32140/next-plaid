@@ -61,11 +61,20 @@ Measurement program complete, CI-verified on x86 AVX2 / Neoverse / Apple M1:
   the dataset-scale measurements confirm the port.
 - ~~**tr rung (transpose-reduce)**~~ — taken same evening (NEON only),
   prediction falsified (~3–5%, not 1.15–1.35×), kept for the consistent
-  small win; see log entry. Successor candidates, evidence-driven:
-  **dim-128-specialized straight-line inner loop** (kill the per-iteration
-  `k < dim` branch — where nano's rung gains actually lived) and
-  **doc-token blocking** (binary's structure: 4 tokens per query-row
-  pass, quartering query-row re-streaming). AVX2 tr remains gated on a
+  small win; see log entry. Successor candidate, stated precisely (the
+  bench IS dim 128 — the issue is code shape, not data shape): with
+  `dim` a runtime value the compiler can neither unroll `while k < dim`
+  nor pin the expanded weights in registers, so `w` sits in a stack
+  buffer re-loaded 8×32 = 256 times per token; nano's fixed-128 kernel
+  loads it into 8 registers once (8 loads) and straight-lines the SDOTs.
+  A runtime `dim == 128` fast path (same dispatch pattern as the SIMD
+  gate) removes both. Mechanism-based prediction: weight-load traffic
+  drops ~32×; combined with **doc-token blocking** (binary's 4 tokens
+  per query-row pass, quartering query-row re-streaming) this is the
+  load-traffic story that explains binary's residual ~3.5× edge better
+  than any epilogue accounting did — both epilogue rungs (vfold, tr)
+  shaved instructions while the load stream stayed untouched, which is
+  exactly why they underdelivered. AVX2 tr remains gated on a
   reference/measurement.
 - **#33 stage-1 optimization** — the sequel. Instrument stage-1 phases
   first; then cdot int8 GEMM, cdot transpose + vectorized approx scorer,

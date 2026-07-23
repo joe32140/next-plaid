@@ -56,9 +56,9 @@ Measurement program complete, CI-verified on x86 AVX2 / Neoverse / Apple M1:
 
 ## On hold (deliberately, so we don't forget)
 
-- **#32 vfold port** — vectorize the asym epilogue fold (nano-plaid
-  measured ~2.1×/rung; closes binary-vs-r1 from ~3× to ~1.2×). Final table
-  ships with "asym columns are conservative; known ~2× headroom".
+- ~~**#32 vfold port**~~ — un-held 2026-07-22 on user go; see the #32 log
+  entry below. The "asym conservative, ~2× headroom" footnote retires if
+  the dataset-scale measurements confirm the port.
 - **#33 stage-1 optimization** — the sequel. Instrument stage-1 phases
   first; then cdot int8 GEMM, cdot transpose + vectorized approx scorer,
   centroid-scan pruning, cell-level approx scoring. Reprioritized by the
@@ -162,6 +162,58 @@ mmaps CI-built artifacts end to end:
   `m4_results/overnight_28.log`. Remaining after that: assemble the final
   three-altitude table; nano-plaid README M4 row re-measurement still
   requires its own venv run (manual follow-up in the same window pattern).
+
+### 2026-07-22 — #32: vfold port (user go: "let's give it a try as long as we are noted")
+
+Prediction registered before measuring (structure matters as much as the
+numbers): kernel-level 1.6–2.1× ordered r1 > r2 > r4 and dim 48 > dim 128;
+binary-vs-r1 gap ~3× → ~1.2–1.5×; e2e ~1.3–1.4× at nfcorpus scale,
+~1.05× at 52k (Amdahl). Falsifier: flat-across-rungs gains would mean the
+fold-share model of the kernel is wrong.
+
+Port shape (two changes, deliberately landed together):
+
+1. **cdot transposed to centroid-major** `[K, nq]` end to end — the layout
+   nano-plaid had from the start (`cdot_t`). One centroid's scores across
+   query rows are now one contiguous strip, so the fold loads them as one
+   vector; previously each (row, token) gathered `cd[qi*K + cid]` — at
+   dataset K (16–65k) that is 32 loads scattered 64–256 KB apart per token.
+   Stage-1 keeps its row-major `[nq, K]` (per-token probing wants row
+   scans); the dense path transposes once per query
+   (`.t().as_standard_layout()`), the batched path's compact matrix simply
+   became row-per-centroid (its sparse scores were already `Array1<f32>`
+   per cid — the transposed build is *less* code), and `exact_score_docs`
+   builds C×Qᵀ directly at no extra cost.
+2. **fold_block** (NEON 4-wide, AVX2 8-wide): per doc token the SDOT/maddubs
+   accumulators land in an `accs[nq]` scratch, then one vectorized pass does
+   convert→scale-mul→cdot-add→inv-mul→max. Bit-identical to the scalar
+   epilogue by construction: cvt is the same round-to-nearest as `as f32`,
+   mul/add kept separate (never fused), `inv` multiplied last, and
+   vector max equals the scalar `if s > best` select for finite scores —
+   `simd_kernel_matches_scalar_bitwise` still asserts `to_bits` equality,
+   no tolerance change needed. 196/196 tests pass, incl. the #34
+   batched-vs-dense parity test.
+
+First A/B (M4 native arm64, synth 500×180 K=4096, NON-idle machine, bench
+includes per-query prep + cdot GEMM): asym r4 2.26→1.79 ms (1.26×),
+r2 2.24→1.88 (1.19×), r1 2.14→1.74 (1.23×); binary 0.50→0.44 (no code
+change — that pair is the ±12% noise gauge). Real but below the predicted
+1.6–2.1× on this cell, and NOT ordered r1 > r4 — partial hit on the
+falsifier: on M4 at small K the scalar fold was evidently cheaper than the
+nano-derived model assumed (out-of-order hides it behind SDOT latency).
+The layout half of the change barely bites at K=4096 (512 KB matrix,
+cache-resident); the dataset-scale CI cells (K 16–65k) and tonight's idle
+M4 run are the decisive measurements. nano's remaining rung (`tr`,
+transpose-reduce of the per-row horizontal `vaddvq`) stays unported.
+
+### 2026-07-22 — session interruption note
+
+The 23:30 overnight scheduler task and a running test command were both
+SIGKILLed at ~20:30 by a session restart (not jetsam: 74% memory free, no
+JetsamEvent reports, the scheduler died mid-sleep, well before firing).
+Overnight #28 re-armed afterwards; it now measures the post-vfold tree,
+which is what the final table should carry anyway (CI run 29960245502
+remains the pre-vfold reference point for the asym columns).
 
 ### 2026-07-22 — #30: dim-48 SIMD tail — fixed, with an honest negative
 

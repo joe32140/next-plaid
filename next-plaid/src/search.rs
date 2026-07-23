@@ -151,7 +151,7 @@ fn prepare_score_query<'a>(
 fn exact_doc_score(
     index: &crate::index::MmapIndex,
     query: &ScoreQuery,
-    cdot: Option<&Array2<f32>>,
+    cdot_t: Option<&Array2<f32>>,
     doc_id: usize,
 ) -> Option<f32> {
     match query {
@@ -170,9 +170,10 @@ fn exact_doc_score(
             Some(colbert_score(&q.view(), &doc.view()))
         }
         ScoreQuery::ResidualLut { q8, lut, planes } => {
-            // Needs the dense query×centroid matrix for the centroid term;
-            // prepare_score_query never builds this arm on paths without it.
-            let cdot = cdot?;
+            // Needs the query×centroid matrix for the centroid term, in the
+            // kernels' centroid-major [K, nq] layout; prepare_score_query
+            // never builds this arm on paths without it.
+            let cdot_t = cdot_t?;
             let inv_norms = index.residual_inv_norms()?;
             let start = index.doc_offsets[doc_id];
             let end = index.doc_offsets[doc_id + 1];
@@ -183,7 +184,7 @@ fn exact_doc_score(
                 planes.as_ref(),
                 &packed,
                 &codes,
-                &cdot.view(),
+                &cdot_t.view(),
                 lut,
                 &inv_norms[start..end],
                 index.codec.embedding_dim(),
@@ -194,20 +195,21 @@ fn exact_doc_score(
 
 /// Exact asym score of one doc against a *compact* query×centroid matrix.
 ///
-/// The batched search path never materializes the dense `[nq, K]` matrix the
+/// The batched search path never materializes the dense `[K, nq]` matrix the
 /// [`ScoreQuery::ResidualLut`] arm of [`exact_doc_score`] expects — that is
 /// the point of batching. Instead it packs the distinct centroid scores it
-/// already computed sparsely for approximate scoring into `compact_cd`, with
-/// `remap` translating real centroid ids to compact columns. The doc's codes
+/// already computed sparsely for approximate scoring into `compact_cd_t`
+/// (centroid-major: one row of `nq` scores per distinct centroid), with
+/// `remap` translating real centroid ids to compact rows. The doc's codes
 /// are remapped once per doc outside the SIMD kernel, which then runs
-/// unchanged: the kernel only ever indexes `cd[qi * ncent + cid]` and is
+/// unchanged: the kernel only ever indexes `cd[cid * nq + qi]` and is
 /// agnostic to what the ids mean.
 fn exact_doc_score_asym_compact(
     index: &crate::index::MmapIndex,
     q8: &crate::binary::QueryI8,
     lut: &crate::residual_lut::ResidualLut,
     planes: Option<&crate::residual_lut::QueryPlanes>,
-    compact_cd: &Array2<f32>,
+    compact_cd_t: &Array2<f32>,
     remap: &HashMap<i64, i64>,
     doc_id: usize,
 ) -> Option<f32> {
@@ -228,7 +230,7 @@ fn exact_doc_score_asym_compact(
         planes,
         &packed,
         &remapped,
-        &compact_cd.view(),
+        &compact_cd_t.view(),
         lut,
         &inv_norms[start..end],
         index.codec.embedding_dim(),
@@ -250,25 +252,30 @@ pub fn exact_score_docs(
     residual_asym: bool,
 ) -> Vec<f32> {
     let sq = prepare_score_query(index, query, residual_asym);
-    let cdot = if matches!(&sq, ScoreQuery::ResidualLut { .. }) {
+    let cdot_t = if matches!(&sq, ScoreQuery::ResidualLut { .. }) {
         let _ = index.residual_inv_norms();
-        Some(query.dot(&index.codec.centroids_view().t()))
+        // Built directly centroid-major (C × Qᵀ): same GEMM cost as the
+        // [nq, K] orientation, already in the kernels' fold-friendly layout.
+        Some(index.codec.centroids_view().dot(&query.t()))
     } else {
         None
     };
     // Parallel over docs like the production stage-2 candidate loop above.
     doc_ids
         .par_iter()
-        .map(|&d| exact_doc_score(index, &sq, cdot.as_ref(), d).unwrap_or(f32::NEG_INFINITY))
+        .map(|&d| exact_doc_score(index, &sq, cdot_t.as_ref(), d).unwrap_or(f32::NEG_INFINITY))
         .collect()
 }
 
 /// Like [`exact_score_docs`], but with the dense query×centroid matrix
-/// supplied by the caller — the production situation, where Stage-1 already
-/// computed it for IVF probing. Used by the stage-2 profiler so the LUT path
-/// is not charged twice for the centroid term. An empty `doc_ids` makes this
-/// a pure measurement of per-query preparation (int8 quantization, fused-LUT
-/// + planes build, and on first call the index's inv-norms cache).
+/// supplied by the caller in stage-1's `[nq, K]` layout — the production
+/// situation, where Stage-1 already computed it for IVF probing. Used by the
+/// stage-2 profiler so the LUT path is not charged twice for the centroid
+/// term; the one-pass transpose to the kernels' centroid-major layout
+/// happens here, the same per-query cost `search_one_mmap` pays. An empty
+/// `doc_ids` makes this a pure measurement of per-query preparation (int8
+/// quantization, fused-LUT + planes build, and on first call the index's
+/// inv-norms cache).
 #[doc(hidden)]
 pub fn exact_score_docs_prepared(
     index: &crate::index::MmapIndex,
@@ -278,12 +285,15 @@ pub fn exact_score_docs_prepared(
     residual_asym: bool,
 ) -> Vec<f32> {
     let sq = prepare_score_query(index, query, residual_asym);
-    if matches!(&sq, ScoreQuery::ResidualLut { .. }) {
+    let cdot_t = if matches!(&sq, ScoreQuery::ResidualLut { .. }) {
         let _ = index.residual_inv_norms();
-    }
+        Some(cdot.t().as_standard_layout().into_owned())
+    } else {
+        None
+    };
     doc_ids
         .par_iter()
-        .map(|&d| exact_doc_score(index, &sq, Some(cdot), d).unwrap_or(f32::NEG_INFINITY))
+        .map(|&d| exact_doc_score(index, &sq, cdot_t.as_ref(), d).unwrap_or(f32::NEG_INFINITY))
         .collect()
 }
 
@@ -529,7 +539,6 @@ pub fn search_one_mmap(
     subset: Option<&[i64]>,
 ) -> Result<QueryResult> {
     let num_centroids = index.codec.num_centroids();
-    let num_query_tokens = query.nrows();
 
     // Decide whether to use batched mode for memory efficiency
     let use_batched = params.centroid_batch_size > 0 && num_centroids > params.centroid_batch_size;
@@ -553,22 +562,25 @@ pub fn search_one_mmap(
     // full-precision query is used for the float (residual) path.
     // Chunked processing limits concurrent memory from parallel decompression.
     let exact_query = prepare_score_query(index, query, params.residual_asym);
-    if matches!(&exact_query, ScoreQuery::ResidualLut { .. }) {
+    let cdot_t = if matches!(&exact_query, ScoreQuery::ResidualLut { .. }) {
         // Build the per-token norm cache once, outside the parallel loop.
         let _ = index.residual_inv_norms();
-    }
+        // One transpose pass per query: stage-1 needs [nq, K] row-major for
+        // per-token probing, the exact kernels want centroid-major [K, nq]
+        // so a token's scores across query rows are one contiguous strip
+        // (vectorized fold + no K-strided gather per row).
+        Some(query_centroid_scores.t().as_standard_layout().into_owned())
+    } else {
+        None
+    };
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
         .par_chunks(DECOMPRESS_CHUNK_SIZE)
         .flat_map(|chunk| {
             chunk
                 .iter()
                 .filter_map(|&doc_id| {
-                    let score = exact_doc_score(
-                        index,
-                        &exact_query,
-                        Some(&query_centroid_scores),
-                        doc_id as usize,
-                    )?;
+                    let score =
+                        exact_doc_score(index, &exact_query, cdot_t.as_ref(), doc_id as usize)?;
                     Some((doc_id, score))
                 })
                 .collect::<Vec<_>>()
@@ -835,12 +847,13 @@ fn search_one_mmap_batched(
     // Chunked processing limits concurrent memory from parallel decompression.
     //
     // The asymmetric residual arm needs query×centroid scores for its
-    // centroid term. This path deliberately never builds the dense [nq, K]
-    // matrix — that is the point of batching — but the sparse centroid
-    // scores computed for approximate scoring already cover every centroid
-    // any candidate references, a superset of the shortlist's. Packing them
-    // into a compact [nq, distinct] matrix plus a per-doc code remap feeds
-    // the same fused kernels the dense path uses.
+    // centroid term. This path deliberately never builds the dense matrix —
+    // that is the point of batching — but the sparse centroid scores
+    // computed for approximate scoring already cover every centroid any
+    // candidate references, a superset of the shortlist's. Packing them
+    // into a compact centroid-major [distinct, nq] matrix (one contiguous
+    // row per centroid, the kernels' fold layout) plus a per-doc code remap
+    // feeds the same fused kernels the dense path uses.
     let exact_query = prepare_score_query(index, query, params.residual_asym);
     let asym_compact = if matches!(&exact_query, ScoreQuery::ResidualLut { .. }) {
         // Build the per-token norm cache once, outside the parallel loop.
@@ -850,11 +863,11 @@ fn search_one_mmap_batched(
         let remap: HashMap<i64, i64> = ids
             .iter()
             .enumerate()
-            .map(|(col, &c)| (c as i64, col as i64))
+            .map(|(row, &c)| (c as i64, row as i64))
             .collect();
-        let mut compact = Array2::<f32>::zeros((num_query_tokens, ids.len()));
-        for (col, &c) in ids.iter().enumerate() {
-            compact.column_mut(col).assign(&sparse_scores[&c]);
+        let mut compact = Array2::<f32>::zeros((ids.len(), num_query_tokens));
+        for (row, &c) in ids.iter().enumerate() {
+            compact.row_mut(row).assign(&sparse_scores[&c]);
         }
         Some((compact, remap))
     } else {

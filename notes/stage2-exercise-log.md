@@ -232,6 +232,56 @@ Overnight #28 re-armed afterwards; it now measures the post-vfold tree,
 which is what the final table should carry anyway (CI run 29960245502
 remains the pre-vfold reference point for the asym columns).
 
+### 2026-07-23 — CI verdict on vfold+tr: the original prediction WAS right, at dataset scale
+
+Compared run 29960353782 (pre-vfold, clean profiler) against 29980662977
+(vfold + tr + centroid-major cdot, clean profiler). **Binary is the
+control**: its code is untouched and it measures 0.97–1.03× across every
+cell — so the asym deltas below are signal, not runner drift.
+
+Exact-kernel speedup, asym (pre → post):
+
+| cell            | x86 AVX2            | Neoverse            |
+|-----------------|---------------------|---------------------|
+| nfcorpus (0.86M)| 10.0 → 6.5 (1.53×)  | 5.6 → 3.7 (1.52×)   |
+| scifact (1.19M) | 17.2 → 9.4 (1.83×)  | 14.4 → 7.4 (1.96×)  |
+| fiqa-15k (2.0M) | 23.3 → 8.2 (2.84×)  | 14.0 → 6.3 (2.22×)  |
+| fiqa-4k (0.53M) | 12.0 → 7.4 (1.62×)  | 8.3 → 4.6 (1.82×)   |
+| fiqa-52k (7.0M) | 13.6 → 8.4 (1.61×)  | 14.0 → 7.2 (1.93×)  |
+
+1.5–2.8×, i.e. **the 1.6–2.1× vfold prediction landed** — the M4's 1.2×
+was the outlier, exactly as flagged at the time: at K=4096 the cdot is
+cache-resident so the layout half of the change is worth nothing, while
+at dataset K (8k–32k) the old per-(row,token) strided gather was the
+dominant cost. Asym vs float at the kernel is now **6.1–9.5× on x86**
+(was 2.2–6.3×). Lesson for the class: a microbenchmark at the wrong
+working-set size can hide the entire effect being measured.
+
+### 2026-07-23 — the transpose bill: cache-blocked, after CI showed it eating half the win
+
+The same comparison exposed the cost the layout change introduced.
+Per-query `prep` (which now legitimately carries the [nq,K]→[K,nq]
+transpose) went from ~15 µs to **2–16 ms on x86** (0.07–0.44 ms on
+Neoverse), and it shows up in production e2e: fiqa-15k r4 saved 15.1 ms
+of exact time but only 7.4 ms of e2e; scifact r4 saved 7.8 ms of exact
+and 1.2 ms of e2e. Roughly half the kernel win was being handed back.
+
+Cause: `ndarray`'s `.t().as_standard_layout()` walks the destination in
+order, so each element read jumps a full source row — at K=16k that is a
+~64 KB stride, a cache *and* TLB miss per element, ~500k of them.
+
+Fix: `transpose_cdot`, blocked 64 centroids at a time, so both sides are
+sequential (read nq runs of 64 contiguous floats, write 64 runs of nq).
+Unit-tested against the naive transpose across multi-block and ragged K
+— the search integration tests all use toy indexes whose K fits in one
+block, so they could never have caught a blocking bug. Verdict pending
+on the next CI run + the M4 overnight.
+
+Note the shape of this: the transpose was invisible while it sat inside
+the timed exact region (it just inflated one column); moving it to prep
+for *fairness* is what made it measurable. Harness honesty found a real
+performance bug.
+
 ### 2026-07-22 — opportunity #1 (tr rung, NEON): done — prediction falsified, kept anyway
 
 Ported nano's transpose-reduce to the NEON kernel (AVX2 untouched — no

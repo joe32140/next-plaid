@@ -56,13 +56,50 @@ BLAS — we skip the step before it.
 
 ## 3. Name your baseline
 
-The same binary kernel, three honest headlines:
+The single most misleading thing you can do with these kernels is quote a
+speedup without saying what it is against. Native M4, mixedbread's protocol
+(1000 docs × 786 tokens, one 32-token query, median of 9):
 
-| float baseline | speedup | note |
-|---|---:|---|
-| decompress + matrixmultiply (our deployed path) | 13–28× | the cost actually being removed |
-| raw f32 + vendor BLAS (never compressed) | ~3–4.4× | reproduces mixedbread's published 3.82× |
-| raw f32 + Apple AMX | ~1.1–1.8× | Apple's matrix unit ≈ our kernels on raw floats |
+| | vs float r4 (decompress+GEMM) | vs raw f32, same GEMM |
+|---|---:|---:|
+| **matrixmultiply build** | | |
+| float r4 (decompress + GEMM) | 57.75 ms — 1.00× | — |
+| raw f32, never compressed | 15.29 ms | 1.00× |
+| asym r4 (int8×LUT) | 21.62 ms — **2.67×** | **0.71×** |
+| binary (int8×1-bit) | 7.06 ms — **8.17×** | **2.17×** |
+| **Accelerate/AMX build** | | |
+| float r4 (decompress + GEMM) | 29.21 ms — 1.00× | — |
+| raw f32, never compressed | 8.11 ms | 1.00× |
+| asym r4 | 13.75 ms — **2.12×** | **0.59×** |
+| binary | 6.15 ms — **4.75×** | **1.32×** |
+
+Read the two columns together. Against the path a compressed deployment
+actually runs, asym is 2.1–2.7× and binary 4.8–8.2×. Against a system that
+never compressed at all and has Apple's matrix unit, **asym is slower than
+float** (0.59–0.71×) and binary's edge shrinks to 1.3×.
+
+Both are true. The fused kernels buy their speed by not decompressing, so
+they win exactly to the extent that decompression is in your baseline —
+which is why the phase decomposition in §2 is the load-bearing measurement,
+not the speedup number.
+
+---
+
+### Native M4, real-shape corpora (production tree, idle machine)
+
+Exact stage-2 kernel, and the whole query through the public API:
+
+| cell (tokens) | float exact | asym exact | binary exact | float e2e | asym e2e | binary e2e |
+|---|---:|---:|---:|---:|---:|---:|
+| nfcorpus (0.86M) | 9.98 | **1.77** (5.6×) | **0.67** (14.9×) | 15.1 | 4.5 | 3.0 |
+| scifact (1.19M) | 12.83 | **2.72** (4.7×) | **0.96** (13.4×) | 21.1 | 8.7 | 6.2 |
+| fiqa-15k (2.0M) | 14.31 | **2.78** (5.1×) | **1.22** (11.7×) | 24.0 | 10.2 | 10.2 |
+| fiqa-4k (0.53M) | 19.68 | **3.98** (4.9×) | **1.16** (17.0×) | 25.8 | 8.6 | 5.5 |
+| fiqa-52k (7.0M) | 25.63 | **4.42** (5.8×) | **1.26** (20.3×) | 47.6 | 25.9 | 21.0 |
+
+All times ms/query. The e2e columns are where Amdahl shows up: at fiqa-52k
+the kernel is 5.8×/20× faster but the query is only 1.8×/2.3× faster,
+because stage-1 is most of it.
 
 ---
 

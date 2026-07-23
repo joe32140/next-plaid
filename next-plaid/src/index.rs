@@ -1062,6 +1062,10 @@ pub struct MmapIndex {
     pub mmap_codes: crate::mmap::MmapNpyArray1I64,
     /// Memory-mapped residuals array (public for search access)
     pub mmap_residuals: crate::mmap::MmapNpyArray2U8,
+    /// Lazily-computed per-token `1/||reconstruction||` for the asymmetric
+    /// residual scoring path — the same normalization `decompress` applies.
+    /// Derived data (function of codes + codec), built once on first use.
+    residual_inv_norms: std::sync::OnceLock<Option<Vec<f32>>>,
 }
 
 impl MmapIndex {
@@ -1183,6 +1187,7 @@ impl MmapIndex {
             doc_lengths,
             doc_offsets,
             mmap_codes,
+            residual_inv_norms: std::sync::OnceLock::new(),
             mmap_residuals,
         })
     }
@@ -1367,6 +1372,41 @@ impl MmapIndex {
     /// Get the embedding dimension.
     pub fn embedding_dim(&self) -> usize {
         self.codec.embedding_dim()
+    }
+
+    /// Per-token `1 / ||centroid + dequantized residual||`, cached on first
+    /// use. This is what makes asymmetric LUT scoring match the float path's
+    /// normalized reconstructions. `None` for binary indexes. The first call
+    /// streams the whole payload once (parallel, ~seconds per million
+    /// tokens); subsequent calls are free.
+    pub fn residual_inv_norms(&self) -> Option<&[f32]> {
+        self.residual_inv_norms
+            .get_or_init(|| {
+                if self.metadata.binary {
+                    return None;
+                }
+                let n = *self.doc_offsets.last()?;
+                let codes = self.mmap_codes.slice(0, n);
+                let packed = self.mmap_residuals.slice_rows(0, n);
+                // Run the parallel compute on its own one-shot pool, never
+                // the global one: this initializer is reached from inside
+                // rayon workers (search_many_mmap par_iter -> search ->
+                // here), and a global-pool par_iter inside get_or_init can
+                // deadlock — the initializing worker's join steals a
+                // sibling query, which re-enters get_or_init on the same
+                // thread; meanwhile every other worker may already be
+                // parked on this OnceLock, leaving no one to run the
+                // stolen work. A dedicated pool's threads depend on
+                // neither. Pool spin-up is noise against the
+                // seconds-per-million-tokens compute.
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .build()
+                    .expect("inv-norms init pool");
+                pool.install(|| {
+                    crate::residual_lut::compute_inv_norms(&self.codec, &codes, &packed)
+                })
+            })
+            .as_deref()
     }
 
     /// Release all memory-mapped file handles.

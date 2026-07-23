@@ -45,6 +45,16 @@ pub struct SearchParameters {
     /// Default: Some(0.4)
     #[serde(default = "default_centroid_score_threshold")]
     pub centroid_score_threshold: Option<f32>,
+    /// Score residual candidates asymmetrically — int8 query × int8 LUT over
+    /// the stored codes plus the centroid term from the IVF probe matrix —
+    /// instead of decompress→f32 MaxSim. Compute-only: same index, same
+    /// storage, so the two modes can be A/B'd per search. Honored on both
+    /// the dense and batched-centroid search paths (the batched path packs
+    /// its sparse centroid scores into a compact matrix); ignored for
+    /// binary indexes and for dims the fused kernels don't support
+    /// (> 256), which fall back to the float path. Default off.
+    #[serde(default)]
+    pub residual_asym: bool,
 }
 
 fn default_centroid_batch_size() -> usize {
@@ -64,6 +74,7 @@ impl Default for SearchParameters {
             n_ivf_probe: 8,
             centroid_batch_size: default_centroid_batch_size(),
             centroid_score_threshold: default_centroid_score_threshold(),
+            residual_asym: false,
         }
     }
 }
@@ -99,18 +110,44 @@ enum ScoreQuery<'a> {
     /// Float / residual index: the caller's full-precision query, borrowed —
     /// standard ColBERT MaxSim needs no per-query preparation.
     Float(&'a Array2<f32>),
+    /// Residual index scored asymmetrically: int8 query codes plus the fused
+    /// byte→int8-weights LUT, scoring the stored codes directly (centroid
+    /// term from the dense query×centroid matrix; no decompression). The
+    /// plane-ordered query copy feeds the SIMD kernels' expand layout.
+    ResidualLut {
+        q8: crate::binary::QueryI8,
+        /// Boxed: the fused table dominates the enum's size, and it is only
+        /// ever read through a reference in the per-doc scoring loop.
+        lut: Box<crate::residual_lut::ResidualLut>,
+        /// `None` for non-byte-aligned dims, which score on the scalar path.
+        planes: Option<crate::residual_lut::QueryPlanes>,
+    },
 }
 
 /// Prepare the query for the index's Stage-2 scoring path, once per search.
 fn prepare_score_query<'a>(
     index: &crate::index::MmapIndex,
     query: &'a Array2<f32>,
+    residual_asym: bool,
 ) -> ScoreQuery<'a> {
     if index.metadata.binary {
-        ScoreQuery::Binary(crate::binary::quantize_query_i8(&query.view()))
-    } else {
-        ScoreQuery::Float(query)
+        return ScoreQuery::Binary(crate::binary::quantize_query_i8(&query.view()));
     }
+    if residual_asym && index.codec.embedding_dim() <= crate::residual_lut::MAX_DIM {
+        if let Some(lut) = crate::residual_lut::quantize_lut(&index.codec) {
+            let dim = index.codec.embedding_dim();
+            let q8 = crate::binary::quantize_query_i8(&query.view());
+            let planes = dim
+                .is_multiple_of(8)
+                .then(|| crate::residual_lut::build_query_planes(&q8, &lut, dim));
+            return ScoreQuery::ResidualLut {
+                q8,
+                lut: Box::new(lut),
+                planes,
+            };
+        }
+    }
+    ScoreQuery::Float(query)
 }
 
 /// Exact MaxSim of the prepared query against document `doc_id`.
@@ -122,6 +159,7 @@ fn prepare_score_query<'a>(
 fn exact_doc_score(
     index: &crate::index::MmapIndex,
     query: &ScoreQuery,
+    cdot_t: Option<&Array2<f32>>,
     doc_id: usize,
 ) -> Option<f32> {
     match query {
@@ -139,7 +177,107 @@ fn exact_doc_score(
             let doc = index.get_document_embeddings(doc_id).ok()?;
             Some(colbert_score(&q.view(), &doc.view()))
         }
+        ScoreQuery::ResidualLut { q8, lut, planes } => {
+            // Needs the query×centroid matrix for the centroid term, in the
+            // kernels' centroid-major [K, nq] layout; prepare_score_query
+            // never builds this arm on paths without it.
+            let cdot_t = cdot_t?;
+            let inv_norms = index.residual_inv_norms()?;
+            let start = index.doc_offsets[doc_id];
+            let end = index.doc_offsets[doc_id + 1];
+            let packed = index.mmap_residuals.slice_rows(start, end);
+            let codes = index.mmap_codes.slice(start, end);
+            Some(crate::residual_lut::maxsim_residual_lut_i8(
+                q8,
+                planes.as_ref(),
+                &packed,
+                &codes,
+                &cdot_t.view(),
+                lut,
+                &inv_norms[start..end],
+                index.codec.embedding_dim(),
+            ))
+        }
     }
+}
+
+/// Exact asym score of one doc against a *compact* query×centroid matrix.
+///
+/// The batched search path never materializes the dense `[K, nq]` matrix the
+/// [`ScoreQuery::ResidualLut`] arm of [`exact_doc_score`] expects — that is
+/// the point of batching. Instead it packs the distinct centroid scores it
+/// already computed sparsely for approximate scoring into `compact_cd_t`
+/// (centroid-major: one row of `nq` scores per distinct centroid), with
+/// `remap` translating real centroid ids to compact rows. The doc's codes
+/// are remapped once per doc outside the SIMD kernel, which then runs
+/// unchanged: the kernel only ever indexes `cd[cid * nq + qi]` and is
+/// agnostic to what the ids mean.
+fn exact_doc_score_asym_compact(
+    index: &crate::index::MmapIndex,
+    q8: &crate::binary::QueryI8,
+    lut: &crate::residual_lut::ResidualLut,
+    planes: Option<&crate::residual_lut::QueryPlanes>,
+    compact_cd_t: &Array2<f32>,
+    remap: &HashMap<i64, i64>,
+    doc_id: usize,
+) -> Option<f32> {
+    let inv_norms = index.residual_inv_norms()?;
+    let start = index.doc_offsets[doc_id];
+    let end = index.doc_offsets[doc_id + 1];
+    let packed = index.mmap_residuals.slice_rows(start, end);
+    let codes = index.mmap_codes.slice(start, end);
+    let mut remapped = Vec::with_capacity(codes.len());
+    for c in codes.iter() {
+        // Every shortlisted doc is a candidate, and the compact matrix covers
+        // every centroid any candidate references — a miss is a logic bug.
+        debug_assert!(
+            remap.contains_key(c),
+            "shortlist code {c} missing from centroid union"
+        );
+        remapped.push(*remap.get(c)?);
+    }
+    Some(crate::residual_lut::maxsim_residual_lut_i8(
+        q8,
+        planes,
+        &packed,
+        &remapped,
+        &compact_cd_t.view(),
+        lut,
+        &inv_norms[start..end],
+        index.codec.embedding_dim(),
+    ))
+}
+
+/// Transpose stage-1's `[nq, K]` centroid scores into the kernels'
+/// centroid-major `[K, nq]` layout, in cache-blocked passes.
+///
+/// `ndarray`'s `.t().as_standard_layout()` walks the destination in order,
+/// so every element read jumps a full row of the source — at K = 16k that
+/// is a ~64 KB stride, i.e. a cache **and** TLB miss per element (a
+/// controlled A/B measured the naive transpose at ~0.3–0.4 ms per query at
+/// K = 16k–32k on x86, ~40 µs on Apple M4). Blocking over centroids makes
+/// both sides sequential: for each strip of `BLK` centroids we read `nq`
+/// runs of `BLK` contiguous floats and write `BLK` runs of `nq` contiguous
+/// floats, so each cache line is used fully instead of once.
+fn transpose_cdot(cdot: &Array2<f32>) -> Array2<f32> {
+    const BLK: usize = 64;
+    let (nq, k) = (cdot.nrows(), cdot.ncols());
+    let src = cdot.as_standard_layout();
+    let src = src.as_slice().expect("cdot must be contiguous");
+    let mut out = Array2::<f32>::zeros((k, nq));
+    let dst = out.as_slice_mut().expect("fresh array is contiguous");
+    let mut c0 = 0usize;
+    while c0 < k {
+        let c1 = (c0 + BLK).min(k);
+        for qi in 0..nq {
+            let row = &src[qi * k + c0..qi * k + c1];
+            for (j, &v) in row.iter().enumerate() {
+                dst[(c0 + j) * nq + qi] = v;
+            }
+        }
+        c0 = c1;
+    }
+    out
 }
 
 /// Wrapper for f32 to use with BinaryHeap (implements Ord)
@@ -384,7 +522,6 @@ pub fn search_one_mmap(
     subset: Option<&[i64]>,
 ) -> Result<QueryResult> {
     let num_centroids = index.codec.num_centroids();
-    let num_query_tokens = query.nrows();
 
     // Decide whether to use batched mode for memory efficiency
     let use_batched = params.centroid_batch_size > 0 && num_centroids > params.centroid_batch_size;
@@ -393,6 +530,85 @@ pub fn search_one_mmap(
         // Batched path: memory-efficient IVF probing for large centroid counts
         return search_one_mmap_batched(index, query, params, subset);
     }
+
+    let (query_centroid_scores, to_decompress) = stage1_shortlist(index, query, params, subset)?;
+
+    if to_decompress.is_empty() {
+        return Ok(QueryResult {
+            query_id: 0,
+            passage_ids: vec![],
+            scores: vec![],
+        });
+    }
+
+    // Compute exact scores. Binary indexes score against an int8 query; the
+    // full-precision query is used for the float (residual) path.
+    // Chunked processing limits concurrent memory from parallel decompression.
+    let exact_query = prepare_score_query(index, query, params.residual_asym);
+    let cdot_t = if matches!(&exact_query, ScoreQuery::ResidualLut { .. }) {
+        // Build the per-token norm cache once, outside the parallel loop.
+        let _ = index.residual_inv_norms();
+        // One transpose pass per query: stage-1 needs [nq, K] row-major for
+        // per-token probing, the exact kernels want centroid-major [K, nq]
+        // so a token's scores across query rows are one contiguous strip
+        // (vectorized fold + no K-strided gather per row).
+        Some(transpose_cdot(&query_centroid_scores))
+    } else {
+        None
+    };
+    let mut exact_scores: Vec<(i64, f32)> = to_decompress
+        .par_chunks(DECOMPRESS_CHUNK_SIZE)
+        .flat_map(|chunk| {
+            chunk
+                .iter()
+                .filter_map(|&doc_id| {
+                    let score =
+                        exact_doc_score(index, &exact_query, cdot_t.as_ref(), doc_id as usize)?;
+                    Some((doc_id, score))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Sort by exact score
+    exact_scores.sort_by(|a, b| cmp_score_descending(a.1, b.1));
+
+    // Return top-k results
+    let result_count = params.top_k.min(exact_scores.len());
+    let passage_ids: Vec<i64> = exact_scores
+        .iter()
+        .take(result_count)
+        .map(|(id, _)| *id)
+        .collect();
+    let scores: Vec<f32> = exact_scores
+        .iter()
+        .take(result_count)
+        .map(|(_, s)| *s)
+        .collect();
+
+    Ok(QueryResult {
+        query_id: 0,
+        passage_ids,
+        scores,
+    })
+}
+
+/// Stage 1 of the standard (non-batched) search: dense query×centroid scores,
+/// per-token IVF cell selection, candidate gathering, approximate codes-only
+/// scoring, and pruning down to the exact-scoring shortlist. Everything a
+/// query pays *before* the Stage-2 kernels take over.
+///
+/// Returns the dense query×centroid matrix (reused by Stage-2 for the LUT
+/// path's centroid term) and the pruned candidate list, which is empty when
+/// nothing survives probing/filtering.
+fn stage1_shortlist(
+    index: &crate::index::MmapIndex,
+    query: &Array2<f32>,
+    params: &SearchParameters,
+    subset: Option<&[i64]>,
+) -> Result<(Array2<f32>, Vec<i64>)> {
+    let num_centroids = index.codec.num_centroids();
+    let num_query_tokens = query.nrows();
 
     // Standard path: compute full query-centroid scores upfront
     let query_centroid_scores = query.dot(&index.codec.centroids_view().t());
@@ -490,11 +706,7 @@ pub fn search_one_mmap(
     }
 
     if candidates.is_empty() {
-        return Ok(QueryResult {
-            query_id: 0,
-            passage_ids: vec![],
-            scores: vec![],
-        });
+        return Ok((query_centroid_scores, vec![]));
     }
 
     // Compute approximate scores
@@ -521,52 +733,7 @@ pub fn search_one_mmap(
     let n_decompress = (params.n_full_scores / 4).max(params.top_k);
     let to_decompress: Vec<i64> = top_candidates.into_iter().take(n_decompress).collect();
 
-    if to_decompress.is_empty() {
-        return Ok(QueryResult {
-            query_id: 0,
-            passage_ids: vec![],
-            scores: vec![],
-        });
-    }
-
-    // Compute exact scores. Binary indexes score against an int8 query; the
-    // full-precision query is used for the float (residual) path.
-    // Chunked processing limits concurrent memory from parallel decompression.
-    let exact_query = prepare_score_query(index, query);
-    let mut exact_scores: Vec<(i64, f32)> = to_decompress
-        .par_chunks(DECOMPRESS_CHUNK_SIZE)
-        .flat_map(|chunk| {
-            chunk
-                .iter()
-                .filter_map(|&doc_id| {
-                    let score = exact_doc_score(index, &exact_query, doc_id as usize)?;
-                    Some((doc_id, score))
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    // Sort by exact score
-    exact_scores.sort_by(|a, b| cmp_score_descending(a.1, b.1));
-
-    // Return top-k results
-    let result_count = params.top_k.min(exact_scores.len());
-    let passage_ids: Vec<i64> = exact_scores
-        .iter()
-        .take(result_count)
-        .map(|(id, _)| *id)
-        .collect();
-    let scores: Vec<f32> = exact_scores
-        .iter()
-        .take(result_count)
-        .map(|(_, s)| *s)
-        .collect();
-
-    Ok(QueryResult {
-        query_id: 0,
-        passage_ids,
-        scores,
-    })
+    Ok((query_centroid_scores, to_decompress))
 }
 
 /// Memory-efficient batched search for MmapIndex with large centroid counts.
@@ -657,14 +824,55 @@ fn search_one_mmap_batched(
     // Compute exact scores. Binary indexes score against an int8 query; the
     // full-precision query is used for the float (residual) path.
     // Chunked processing limits concurrent memory from parallel decompression.
-    let exact_query = prepare_score_query(index, query);
+    //
+    // The asymmetric residual arm needs query×centroid scores for its
+    // centroid term. This path deliberately never builds the dense matrix —
+    // that is the point of batching — but the sparse centroid scores
+    // computed for approximate scoring already cover every centroid any
+    // candidate references, a superset of the shortlist's. Packing them
+    // into a compact centroid-major [distinct, nq] matrix (one contiguous
+    // row per centroid, the kernels' fold layout) plus a per-doc code remap
+    // feeds the same fused kernels the dense path uses.
+    let exact_query = prepare_score_query(index, query, params.residual_asym);
+    let asym_compact = if matches!(&exact_query, ScoreQuery::ResidualLut { .. }) {
+        // Build the per-token norm cache once, outside the parallel loop.
+        let _ = index.residual_inv_norms();
+        let mut ids: Vec<usize> = sparse_scores.keys().copied().collect();
+        ids.sort_unstable();
+        let remap: HashMap<i64, i64> = ids
+            .iter()
+            .enumerate()
+            .map(|(row, &c)| (c as i64, row as i64))
+            .collect();
+        // Centroid-major, matching the dense path.
+        let mut compact = Array2::<f32>::zeros((ids.len(), num_query_tokens));
+        for (row, &cid) in ids.iter().enumerate() {
+            compact.row_mut(row).assign(&sparse_scores[&cid]);
+        }
+        Some((compact, remap))
+    } else {
+        None
+    };
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
         .par_chunks(DECOMPRESS_CHUNK_SIZE)
         .flat_map(|chunk| {
             chunk
                 .iter()
                 .filter_map(|&doc_id| {
-                    let score = exact_doc_score(index, &exact_query, doc_id as usize)?;
+                    let score = match (&exact_query, &asym_compact) {
+                        (ScoreQuery::ResidualLut { q8, lut, planes }, Some((cd, remap))) => {
+                            exact_doc_score_asym_compact(
+                                index,
+                                q8,
+                                lut,
+                                planes.as_ref(),
+                                cd,
+                                remap,
+                                doc_id as usize,
+                            )
+                        }
+                        _ => exact_doc_score(index, &exact_query, None, doc_id as usize),
+                    }?;
                     Some((doc_id, score))
                 })
                 .collect::<Vec<_>>()
@@ -794,5 +1002,29 @@ mod tests {
         assert_eq!(max_score(1.0, f32::NAN), 1.0);
         assert_eq!(max_score(f32::INFINITY, 1.0), 1.0);
         assert_eq!(max_score(1.0, f32::INFINITY), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod transpose_tests {
+    use super::*;
+
+    /// The blocked transpose must equal the naive one for every shape — in
+    /// particular for K spanning many blocks (the production case) and for
+    /// K not a multiple of the block size.
+    #[test]
+    fn blocked_transpose_matches_naive() {
+        for &nq in &[1usize, 3, 32] {
+            for &k in &[1usize, 7, 64, 65, 200, 4096] {
+                let a = Array2::<f32>::from_shape_fn((nq, k), |(q, c)| (q * 7919 + c) as f32);
+                let got = transpose_cdot(&a);
+                assert_eq!(got.dim(), (k, nq), "nq={nq} k={k}");
+                for q in 0..nq {
+                    for c in 0..k {
+                        assert_eq!(got[[c, q]], a[[q, c]], "nq={nq} k={k} at ({q},{c})");
+                    }
+                }
+            }
+        }
     }
 }

@@ -203,3 +203,54 @@ fn binary_index_rejects_incremental_update() {
     let reloaded = MmapIndex::load(path).unwrap();
     assert!(reloaded.metadata.binary);
 }
+
+#[test]
+fn encode_index_chunk_binary_packs_signs_with_ivf_codes() {
+    // encode_index_chunk with `binary: true` must produce the same artifact as
+    // create_index_files' binary path: rows of packed sign bits (not residual
+    // codes) plus one centroid code per token for IVF. Guards the fast path
+    // that skips residual computation entirely in binary mode.
+    let dim = 64usize;
+    let docs = random_docs(10, 8, dim);
+    let centroids = next_plaid::compute_kmeans(
+        &docs,
+        &next_plaid::kmeans::ComputeKmeansConfig {
+            seed: 42,
+            num_partitions: Some(16),
+            force_cpu: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let artifacts = next_plaid::prepare_codec_artifacts(&docs, centroids, &config(true)).unwrap();
+
+    let chunk = next_plaid::encode_index_chunk(&docs, &artifacts.codec, true, true).unwrap();
+
+    let total_tokens: usize = docs.iter().map(|d| d.nrows()).sum();
+    assert_eq!(chunk.codes.len(), total_tokens);
+    assert_eq!(chunk.residuals.ncols(), binary::packed_dim(dim));
+    assert_eq!(chunk.residuals.nrows(), total_tokens);
+    assert_eq!(
+        chunk.doclens,
+        docs.iter().map(|d| d.nrows() as i64).collect::<Vec<_>>()
+    );
+
+    // The packed rows must be the embeddings' sign bits...
+    let mut flat = Array2::<f32>::zeros((total_tokens, dim));
+    let mut offset = 0;
+    for doc in &docs {
+        flat.slice_mut(ndarray::s![offset..offset + doc.nrows(), ..])
+            .assign(doc);
+        offset += doc.nrows();
+    }
+    assert_eq!(chunk.residuals, binary::binarize(&flat.view()));
+
+    // ...and the codes the nearest-centroid assignment the IVF is built from.
+    let want_codes: Vec<i64> = artifacts
+        .codec
+        .compress_into_codes_cpu(&flat)
+        .iter()
+        .map(|&c| c as i64)
+        .collect();
+    assert_eq!(chunk.codes.to_vec(), want_codes);
+}

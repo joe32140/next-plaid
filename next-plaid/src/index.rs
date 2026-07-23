@@ -312,9 +312,6 @@ pub fn encode_index_chunk(
     let doclens: Vec<i64> = embeddings.iter().map(|d| d.nrows() as i64).collect();
     let total_tokens: usize = doclens.iter().sum::<i64>() as usize;
 
-    #[cfg(not(feature = "_cuda"))]
-    let _ = force_cpu;
-
     let mut batch_embeddings = Array2::<f32>::zeros((total_tokens, embedding_dim));
     let mut offset = 0;
     for doc in embeddings {
@@ -325,7 +322,17 @@ pub fn encode_index_chunk(
         offset += n;
     }
 
-    let (batch_codes, batch_residuals) = {
+    let (batch_codes, batch_residuals) = if binary {
+        // Binary storage needs only centroid codes (for IVF); the packed store
+        // is the embeddings' sign bits, so computing residuals here would be
+        // O(tokens × dim) work thrown away (mirrors create_index_files).
+        let codes = if force_cpu {
+            codec.compress_into_codes_cpu(&batch_embeddings)
+        } else {
+            codec.compress_into_codes(&batch_embeddings)
+        };
+        (codes, Array2::<f32>::zeros((0, embedding_dim)))
+    } else {
         #[cfg(feature = "_cuda")]
         {
             let force_gpu = crate::is_force_gpu();

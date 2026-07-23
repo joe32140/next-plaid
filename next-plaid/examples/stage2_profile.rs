@@ -62,7 +62,8 @@ use ndarray::{s, Array1, Array2};
 use ndarray_npy::ReadNpyExt;
 use next_plaid::index::MmapIndex;
 use next_plaid::search::{
-    cdot_to_kernel_layout, exact_score_docs_prepared, exact_score_docs_prepared_t, search_one_mmap,
+    cdot_to_kernel_layout, exact_score_docs_prepared, exact_score_docs_prepared_fsplit,
+    exact_score_docs_prepared_t, exact_score_docs_prepared_t_fsplit, search_one_mmap,
     stage1_shortlist, SearchParameters,
 };
 use next_plaid::IndexConfig;
@@ -265,6 +266,12 @@ fn main() {
         next_plaid::residual_lut::active_kernel_name(corpus.dim, true),
         next_plaid::residual_lut::ablation(),
     );
+    if std::env::var("NP_FSPLIT").is_ok() {
+        println!(
+            "fsplit kernel: {}   (EXPERIMENT: f32 query x f32 weights split)",
+            next_plaid::residual_lut::fsplit_kernel_name(corpus.dim),
+        );
+    }
     let params = SearchParameters::default();
     let index_root = std::env::var("INDEX_ROOT").ok();
     let build_only = std::env::var("BUILD_ONLY").is_ok();
@@ -404,6 +411,8 @@ fn main() {
         // indexes get the float A/B plus its decompress/GEMM decomposition.
         let schemes: &[(&str, bool)] = if binary {
             &[("binary", false)]
+        } else if std::env::var("NP_FSPLIT").is_ok() {
+            &[("float", false), ("asym", true), ("fsplit", false)]
         } else {
             &[("float", false), ("asym", true)]
         };
@@ -418,13 +427,28 @@ fn main() {
                 // never sees), so the exact timing gets the pre-transposed
                 // matrix and times scoring only.
                 prep_ms.push(time3(|| {
-                    std::hint::black_box(exact_score_docs_prepared(&index, q, cdot, &[], asym));
+                    if scheme == "fsplit" {
+                        std::hint::black_box(exact_score_docs_prepared_fsplit(
+                            &index,
+                            q,
+                            cdot,
+                            &[],
+                        ));
+                    } else {
+                        std::hint::black_box(exact_score_docs_prepared(&index, q, cdot, &[], asym));
+                    }
                 }));
                 let cdot_t = cdot_to_kernel_layout(cdot);
                 exact_ms.push(time3(|| {
-                    std::hint::black_box(exact_score_docs_prepared_t(
-                        &index, q, &cdot_t, ids, asym,
-                    ));
+                    if scheme == "fsplit" {
+                        std::hint::black_box(exact_score_docs_prepared_t_fsplit(
+                            &index, q, &cdot_t, ids,
+                        ));
+                    } else {
+                        std::hint::black_box(exact_score_docs_prepared_t(
+                            &index, q, &cdot_t, ids, asym,
+                        ));
+                    }
                 }));
             }
             // The whole pipeline through the public API (stage-1 + prep +
@@ -435,17 +459,29 @@ fn main() {
                 ..SearchParameters::default()
             };
             let mut e2e_ms = Vec::new();
-            for q in &queries {
-                e2e_ms.push(time3(|| {
-                    std::hint::black_box(search_one_mmap(&index, q, &sp, None).unwrap());
-                }));
+            if scheme != "fsplit" {
+                for q in &queries {
+                    e2e_ms.push(time3(|| {
+                        std::hint::black_box(search_one_mmap(&index, q, &sp, None).unwrap());
+                    }));
+                }
             }
             let (p_mean, _) = agg(prep_ms);
             let (e_mean, e_p50) = agg(exact_ms);
-            let (t_mean, t_p50) = agg(e2e_ms);
             if scheme == "float" {
                 float_mean = e_mean;
             }
+            if scheme == "fsplit" {
+                println!(
+                    "{scheme:<8} prep {:7.0} µs   exact mean {e_mean:7.3} ms  p50 {e_p50:7.3} ms   \
+                     {:6.1} ns/token   {:.2}x vs float   | e2e — (experiment, not wired into search)",
+                    p_mean * 1e3,
+                    e_mean * 1e6 / tok_per_q,
+                    float_mean / e_mean,
+                );
+                continue;
+            }
+            let (t_mean, t_p50) = agg(e2e_ms);
             println!(
                 "{scheme:<8} prep {:7.0} µs   exact mean {e_mean:7.3} ms  p50 {e_p50:7.3} ms   \
                  {:6.1} ns/token   {:.2}x vs float   | e2e mean {t_mean:7.3} ms  p50 {t_p50:7.3} ms",

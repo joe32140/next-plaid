@@ -377,6 +377,65 @@ pub fn exact_score_docs_prepared_t(
         .collect()
 }
 
+/// EXPERIMENT (profiler-only): the f32-query split scorer — per-query prep
+/// variant, mirroring [`exact_score_docs_prepared`]'s asym arm: builds the
+/// f32 table, triggers the inv-norms cache, transposes to centroid-major.
+#[doc(hidden)]
+pub fn exact_score_docs_prepared_fsplit(
+    index: &crate::index::MmapIndex,
+    query: &Array2<f32>,
+    cdot: &Array2<f32>,
+    doc_ids: &[usize],
+) -> Vec<f32> {
+    let flut = crate::residual_lut::quantize_lut_f32(&index.codec).expect("residual codec");
+    let _ = index.residual_inv_norms();
+    let cdot_t = transpose_cdot(cdot);
+    fsplit_score_ids(index, query, &flut, &cdot_t, doc_ids)
+}
+
+/// EXPERIMENT (profiler-only): scoring-only twin of
+/// [`exact_score_docs_prepared_t`] for the f32 split.
+#[doc(hidden)]
+pub fn exact_score_docs_prepared_t_fsplit(
+    index: &crate::index::MmapIndex,
+    query: &Array2<f32>,
+    cdot_t: &Array2<f32>,
+    doc_ids: &[usize],
+) -> Vec<f32> {
+    let flut = crate::residual_lut::quantize_lut_f32(&index.codec).expect("residual codec");
+    let _ = index.residual_inv_norms();
+    fsplit_score_ids(index, query, &flut, cdot_t, doc_ids)
+}
+
+fn fsplit_score_ids(
+    index: &crate::index::MmapIndex,
+    query: &Array2<f32>,
+    flut: &crate::residual_lut::FloatLut,
+    cdot_t: &Array2<f32>,
+    doc_ids: &[usize],
+) -> Vec<f32> {
+    let inv_norms = index.residual_inv_norms().expect("residual index");
+    let dim = index.codec.embedding_dim();
+    doc_ids
+        .par_iter()
+        .map(|&d| {
+            let start = index.doc_offsets[d];
+            let end = index.doc_offsets[d + 1];
+            let packed = index.mmap_residuals.slice_rows(start, end);
+            let codes = index.mmap_codes.slice(start, end);
+            crate::residual_lut::maxsim_residual_fsplit(
+                &query.view(),
+                &packed,
+                &codes,
+                &cdot_t.view(),
+                flut,
+                &inv_norms[start..end],
+                dim,
+            )
+        })
+        .collect()
+}
+
 /// Wrapper for f32 to use with BinaryHeap (implements Ord)
 #[derive(Clone, Copy, PartialEq)]
 struct OrdF32(f32);

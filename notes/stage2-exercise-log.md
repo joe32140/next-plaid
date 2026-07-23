@@ -6,6 +6,53 @@ order, with the evidence for each step. Companion docs:
 [scaling-1b-docs.md](scaling-1b-docs.md) (1B-doc analysis),
 nano-plaid `docs/class4.html` (the kernel story + port epilogue).
 
+### 2026-07-23 (early AM) — f32-split experiment: the split without int8, falsified
+
+Question (Joe): if we keep the query f32 and do the same split MaxSim as
+the LUT path — centroid term from the cdot matrix + residual term against
+the *unquantized* f32 bucket weights, fused in registers — do we get good
+performance? My prediction beforehand: ~2–3× vs decompress+GEMM (delete
+the decompress share, keep the same-FLOP dot). **Measured: 0.80–0.93× —
+slower than the float baseline.** The falsifier fired again.
+
+Implementation (research branch only, `NP_FSPLIT=1` in the profiler):
+`FloatLut` (byte→f32 weights through the same codec maps), NEON kernel
+(scalar expand per token, per-row 4-accumulator FMA dot, 4-wide fold, no
+sqw), semantics test vs the decompress reference (5e-3, nothing
+quantized) and NEON-vs-scalar tolerance test; both ablation-guarded.
+Idle M4 (load ~1.2), arm64-verified, cached CI indexes, QUERIES=20, r4:
+
+| cell | float (dec+GEMM) | asym int8 | **fsplit f32** |
+|---|---:|---:|---:|
+| scifact | 10.47 ms | 2.38 ms (4.40×) | **13.06 ms (0.80×)** |
+| fiqa-15k | 10.01 ms | 1.92 ms (5.20×) | **10.80 ms (0.93×)** |
+
+Why the estimate was wrong, and what the result actually establishes:
+the float baseline's dot is a *packed, register-tiled BLAS GEMM*
+(gemm+max alone: 3.5–3.9 ms); the fused loop is an unpacked per-row dot
+(2 loads per 4-lane FMA, no cross-row register reuse), which costs ~3×
+the BLAS GEMM at f32 (~11 ms) — more than the entire decompress share
+(6.9–7.1 ms) it deletes. My estimate compared fsplit to "float minus
+decompress" while silently assuming the fused loop's dot costs the same
+as BLAS's. It doesn't at f32. The int8 kernel survives the *identical
+loop structure* only because SDOT does 16 MACs/op (vs 4 for f32 FMA) and
+int8 weights are ¼ the load bytes — which relieves exactly the two
+resources the unpacked loop is bound on.
+
+The route "decode residual, then BLAS-GEMM it, add centroid term" can't
+rescue f32 either: BLAS needs the residual materialized as a 512 B/token
+f32 buffer, and that materialization walk *is* most of the decompress
+cost — it converges back to the float path by construction.
+
+So the design space is now closed by measurement, not argument: the
+split pays only if the residual term never materializes (registers);
+a register-resident f32 dot loses ~3× to packed BLAS; int8 is what makes
+the register path profitable (16-MAC SDOT + ¼ bytes), and it costs
+~0.001 NDCG. **int8 isn't an optimization of the split — it's the
+enabling condition.** Chapter-01-of-class-4 lesson, fourth appearance:
+the identity/split alone is slower than the thing it replaces; all the
+speed lives in fusion + the hardware instruction.
+
 ### 2026-07-23 (night) — the clean CR, and what its CI gates caught
 
 Overnight goal: fold the ablation results into class 4, and shape the LUT

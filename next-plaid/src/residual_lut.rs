@@ -1092,6 +1092,218 @@ mod avx512 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// EXPERIMENT (research branch only): f32-query split scoring.
+//
+// Same split as the asym path — centroid term read from the centroid-major
+// cdot matrix plus a residual term — but the residual dot is the *raw f32
+// query* against the *unquantized f32 bucket weights*, fused in registers
+// (no reconstruction buffer, no norm pass, cached inv-norms). Answers "how
+// much of the asym win needs int8, and how much is just the split?": the
+// core pays 4x the weight bytes and 1/4 the MACs per 128-bit op vs SDOT.
+// Not wired into search; reachable only from the profiler harness.
+// ---------------------------------------------------------------------------
+
+/// Byte → f32 bucket weights: the unquantized twin of [`ResidualLut`],
+/// built through the same codec decode maps.
+pub struct FloatLut {
+    /// `[256 * keys_per_byte]` f32 weights, row `b` = expansion of byte `b`.
+    pub fused: Vec<f32>,
+    pub keys_per_byte: usize,
+}
+
+/// Build the f32 byte→weights table. `None` for binary codecs.
+pub fn quantize_lut_f32(codec: &ResidualCodec) -> Option<FloatLut> {
+    let weights = codec.bucket_weights.as_ref()?;
+    let lookup = codec.bucket_weight_indices_lookup.as_ref()?;
+    let keys_per_byte = 8 / codec.nbits;
+    let mut fused = vec![0f32; 256 * keys_per_byte];
+    for byte in 0..256usize {
+        let reversed = codec.byte_reversed_bits_map[byte] as usize;
+        for k in 0..keys_per_byte {
+            fused[byte * keys_per_byte + k] = weights[lookup[[reversed, k]]];
+        }
+    }
+    Some(FloatLut {
+        fused,
+        keys_per_byte,
+    })
+}
+
+/// Which fsplit kernel this process dispatches to (print next to numbers).
+pub fn fsplit_kernel_name(dim: usize) -> &'static str {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if dim.is_multiple_of(4) {
+            return "f32-split-neon(fma)";
+        }
+    }
+    let _ = dim;
+    "f32-split-scalar"
+}
+
+/// MaxSim via the f32 split: `Σ_qi max_t (q_qi·w_t + cdot_t[cid_t, qi])·inv_t`.
+/// Doc-token-outer like the asym kernel; expand writes f32 weights once per
+/// token, amortized over all query rows.
+#[allow(clippy::too_many_arguments)]
+pub fn maxsim_residual_fsplit(
+    query: &ArrayView2<f32>,
+    doc_packed: &ArrayView2<u8>,
+    doc_codes: &[i64],
+    cdot_t: &ArrayView2<f32>,
+    flut: &FloatLut,
+    inv_norms: &[f32],
+    dim: usize,
+) -> f32 {
+    let nq = query.nrows();
+    assert!(dim <= MAX_DIM, "dim {dim} exceeds MAX_DIM {MAX_DIM}");
+    assert_eq!(cdot_t.ncols(), nq, "cdot_t must be centroid-major [K, nq]");
+    assert_eq!(doc_packed.nrows(), doc_codes.len(), "packed rows != codes");
+    assert_eq!(inv_norms.len(), doc_codes.len(), "inv_norms != codes");
+    let ncent = cdot_t.nrows() as u64;
+    for &c in doc_codes {
+        assert!((c as u64) < ncent, "centroid id {c} out of range {ncent}");
+    }
+    if nq == 0 || doc_packed.nrows() == 0 {
+        return 0.0;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if dim.is_multiple_of(4) {
+        // NEON f32 is baseline on aarch64; unsafe only for the raw loads.
+        return unsafe { fsplit_neon(query, doc_packed, doc_codes, cdot_t, flut, inv_norms, dim) };
+    }
+    fsplit_scalar(query, doc_packed, doc_codes, cdot_t, flut, inv_norms, dim)
+}
+
+fn fsplit_scalar(
+    query: &ArrayView2<f32>,
+    doc_packed: &ArrayView2<u8>,
+    doc_codes: &[i64],
+    cdot_t: &ArrayView2<f32>,
+    flut: &FloatLut,
+    inv_norms: &[f32],
+    dim: usize,
+) -> f32 {
+    let nq = query.nrows();
+    let qv = query.as_slice().expect("query must be contiguous");
+    let cd = cdot_t.as_slice().expect("cdot_t must be standard layout");
+    let mut best = vec![f32::NEG_INFINITY; nq];
+    let mut w = [0f32; MAX_DIM];
+    for (t, row) in doc_packed.axis_iter(Axis(0)).enumerate() {
+        let mut d = 0usize;
+        'expand: for &byte in row.iter() {
+            let base = byte as usize * flut.keys_per_byte;
+            for k in 0..flut.keys_per_byte {
+                if d == dim {
+                    break 'expand;
+                }
+                w[d] = flut.fused[base + k];
+                d += 1;
+            }
+        }
+        let cid = doc_codes[t] as usize;
+        let crow = &cd[cid * nq..cid * nq + nq];
+        let inv = inv_norms[t];
+        for (qi, best_qi) in best.iter_mut().enumerate() {
+            let qrow = &qv[qi * dim..(qi + 1) * dim];
+            let mut acc = 0f32;
+            for (a, b) in qrow.iter().zip(&w[..dim]) {
+                acc += a * b;
+            }
+            let s = (acc + crow[qi]) * inv;
+            if s > *best_qi {
+                *best_qi = s;
+            }
+        }
+    }
+    best.iter().sum()
+}
+
+/// # Safety
+/// `dim % 4 == 0 && dim <= MAX_DIM`; query/cdot contiguous (asserted by the
+/// dispatcher via `as_slice`).
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fsplit_neon(
+    query: &ArrayView2<f32>,
+    doc_packed: &ArrayView2<u8>,
+    doc_codes: &[i64],
+    cdot_t: &ArrayView2<f32>,
+    flut: &FloatLut,
+    inv_norms: &[f32],
+    dim: usize,
+) -> f32 {
+    use std::arch::aarch64::*;
+    let nq = query.nrows();
+    let qv = query.as_slice().expect("query must be contiguous");
+    let cd = cdot_t.as_slice().expect("cdot_t must be standard layout");
+    let d_all = doc_packed.as_slice().expect("doc bytes must be contiguous");
+    let pb = doc_packed.ncols();
+    let mut best = vec![f32::NEG_INFINITY; nq];
+    let mut accs = vec![0f32; nq];
+    let mut w = [0f32; MAX_DIM];
+    for (t, &code) in doc_codes.iter().enumerate() {
+        let row = &d_all[t * pb..t * pb + pb];
+        // Scalar expand to f32 weights — once per token, amortized.
+        let mut d = 0usize;
+        'expand: for &byte in row {
+            let base = byte as usize * flut.keys_per_byte;
+            for k in 0..flut.keys_per_byte {
+                if d == dim {
+                    break 'expand;
+                }
+                *w.get_unchecked_mut(d) = *flut.fused.get_unchecked(base + k);
+                d += 1;
+            }
+        }
+        let cid = code as usize;
+        let crow = cd.as_ptr().add(cid * nq);
+        let inv = inv_norms[t];
+        let wp = w.as_ptr();
+        // Per-row FMA dot, 16 lanes per iteration on 4 accumulators.
+        for (qi, acc_qi) in accs.iter_mut().enumerate() {
+            let qp = qv.as_ptr().add(qi * dim);
+            let mut a0 = vdupq_n_f32(0.0);
+            let mut a1 = vdupq_n_f32(0.0);
+            let mut a2 = vdupq_n_f32(0.0);
+            let mut a3 = vdupq_n_f32(0.0);
+            let mut k = 0usize;
+            while k + 16 <= dim {
+                a0 = vfmaq_f32(a0, vld1q_f32(qp.add(k)), vld1q_f32(wp.add(k)));
+                a1 = vfmaq_f32(a1, vld1q_f32(qp.add(k + 4)), vld1q_f32(wp.add(k + 4)));
+                a2 = vfmaq_f32(a2, vld1q_f32(qp.add(k + 8)), vld1q_f32(wp.add(k + 8)));
+                a3 = vfmaq_f32(a3, vld1q_f32(qp.add(k + 12)), vld1q_f32(wp.add(k + 12)));
+                k += 16;
+            }
+            while k + 4 <= dim {
+                a0 = vfmaq_f32(a0, vld1q_f32(qp.add(k)), vld1q_f32(wp.add(k)));
+                k += 4;
+            }
+            *acc_qi = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+        }
+        // Vectorized fold, 4 rows at a time (no sqw — nothing was quantized).
+        let invv = vdupq_n_f32(inv);
+        let mut qi = 0usize;
+        while qi + 4 <= nq {
+            let s = vmulq_f32(
+                vaddq_f32(vld1q_f32(accs.as_ptr().add(qi)), vld1q_f32(crow.add(qi))),
+                invv,
+            );
+            let b = vld1q_f32(best.as_ptr().add(qi));
+            vst1q_f32(best.as_mut_ptr().add(qi), vmaxq_f32(b, s));
+            qi += 4;
+        }
+        while qi < nq {
+            let s = (accs[qi] + *crow.add(qi)) * inv;
+            if s > best[qi] {
+                best[qi] = s;
+            }
+            qi += 1;
+        }
+    }
+    best.iter().sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1142,6 +1354,121 @@ mod tests {
             Some(weights),
         )
         .unwrap()
+    }
+
+    /// EXPERIMENT: the f32-split kernel must approximate the decompress
+    /// reference like the asym path does — but tighter, since nothing is
+    /// quantized (only split-vs-reconstruct float associativity remains).
+    #[test]
+    fn fsplit_matches_decompress_reference() {
+        if ablation() != Ablation::Off {
+            return; // fsplit has no ablation modes
+        }
+        let mut rng = StdRng::seed_from_u64(97);
+        for &nbits in &[1usize, 2, 4] {
+            for &dim in &[48usize, 128] {
+                let k = 8;
+                let codec = toy_codec(dim, nbits, k, &mut rng);
+                let flut = quantize_lut_f32(&codec).unwrap();
+                let weights = codec.bucket_weights.as_ref().unwrap();
+                let lookup = codec.bucket_weight_indices_lookup.as_ref().unwrap();
+                let query = Array2::from_shape_fn((6, dim), |_| rng.gen_range(-1.0f32..1.0));
+                let res = Array2::from_shape_fn((9, dim), |_| rng.gen_range(-0.3f32..0.3));
+                let packed = codec.quantize_residuals(&res).unwrap();
+                let codes: Vec<i64> = (0..9).map(|_| rng.gen_range(0..k as i64)).collect();
+                let cents = Array2::from_shape_fn((k, dim), |(i, d)| codec.centroids.row(i)[d]);
+                let cdot_t = cents.dot(&query.t());
+                let inv = compute_inv_norms(&codec, &codes, &packed.view()).unwrap();
+
+                let got = maxsim_residual_fsplit(
+                    &query.view(),
+                    &packed.view(),
+                    &codes,
+                    &cdot_t.view(),
+                    &flut,
+                    &inv,
+                    dim,
+                );
+
+                let mut expect = 0.0f64;
+                for qi in 0..6 {
+                    let mut best = f64::NEG_INFINITY;
+                    for (t, &code) in codes.iter().enumerate() {
+                        let centroid = codec.centroids.row(code as usize);
+                        let mut recon = vec![0.0f64; dim];
+                        let mut d = 0usize;
+                        'r: for &byte in packed.row(t).iter() {
+                            let rev = codec.byte_reversed_bits_map[byte as usize] as usize;
+                            for &bi in lookup.row(rev).iter() {
+                                if d == dim {
+                                    break 'r;
+                                }
+                                recon[d] = centroid[d] as f64 + weights[bi] as f64;
+                                d += 1;
+                            }
+                        }
+                        let norm = recon.iter().map(|v| v * v).sum::<f64>().sqrt();
+                        let dot: f64 = (0..dim)
+                            .map(|d| query[[qi, d]] as f64 * recon[d] / norm)
+                            .sum();
+                        best = best.max(dot);
+                    }
+                    expect += best;
+                }
+                assert!(
+                    (got as f64 - expect).abs() < 5e-3,
+                    "nbits={nbits} dim={dim}: got {got} expect {expect}"
+                );
+            }
+        }
+    }
+
+    /// EXPERIMENT: NEON fsplit vs scalar fsplit (FMA + 4 accumulators
+    /// reorder the sum, so tolerance-based, not bit-exact).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn fsplit_neon_close_to_scalar() {
+        if ablation() != Ablation::Off {
+            return;
+        }
+        let mut rng = StdRng::seed_from_u64(101);
+        for &nq in &[3usize, 32] {
+            for &nbits in &[1usize, 2, 4] {
+                for &dim in &[48usize, 128, 256] {
+                    let k = 12;
+                    let codec = toy_codec(dim, nbits, k, &mut rng);
+                    let flut = quantize_lut_f32(&codec).unwrap();
+                    let query = Array2::from_shape_fn((nq, dim), |_| rng.gen_range(-1.0f32..1.0));
+                    let res = Array2::from_shape_fn((13, dim), |_| rng.gen_range(-0.4f32..0.4));
+                    let packed = codec.quantize_residuals(&res).unwrap();
+                    let codes: Vec<i64> = (0..13).map(|_| rng.gen_range(0..k as i64)).collect();
+                    let cdot_t = Array2::from_shape_fn((k, nq), |_| rng.gen_range(-1.0f32..1.0));
+                    let inv: Vec<f32> = (0..13).map(|_| rng.gen_range(0.5f32..1.5)).collect();
+                    let s = fsplit_scalar(
+                        &query.view(),
+                        &packed.view(),
+                        &codes,
+                        &cdot_t.view(),
+                        &flut,
+                        &inv,
+                        dim,
+                    );
+                    let v = maxsim_residual_fsplit(
+                        &query.view(),
+                        &packed.view(),
+                        &codes,
+                        &cdot_t.view(),
+                        &flut,
+                        &inv,
+                        dim,
+                    );
+                    assert!(
+                        (s - v).abs() < 1e-3 * (1.0 + s.abs()),
+                        "nq={nq} nbits={nbits} dim={dim}: scalar {s} vs neon {v}"
+                    );
+                }
+            }
+        }
     }
 
     /// The fused table must expand a packed byte to exactly the bucket

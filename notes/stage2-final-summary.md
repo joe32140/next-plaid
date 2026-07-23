@@ -109,6 +109,24 @@ because stage-1 is most of it.
 
 ---
 
+### The three altitudes, one table (native M4)
+
+The same two kernels look very different depending on how much of the query
+you include. Every row is the *same code* on the *same machine*:
+
+| altitude | what is timed | float | asym | binary |
+|---|---|---:|---:|---:|
+| **kernel** (mixedbread protocol, 1000×786) | fixed candidate list, no IVF | 57.8 ms | 21.6 ms (**2.7×**) | 7.1 ms (**8.2×**) |
+| **phase** (stage-2, real shortlist) | exact scoring of ~1024 real candidates | 9.98–25.6 ms | 1.77–4.42 ms (**4.7–5.8×**) | 0.67–1.26 ms (**11.7–20.3×**) |
+| **end-to-end** (public API) | stage-1 + stage-2 + top-k | 15.1–47.6 ms | 4.5–25.9 ms (**1.8–3.4×**) | 3.0–21.0 ms (**2.3–5.0×**) |
+
+Quoting only the top row would overstate what a user experiences by 2–4×.
+Quoting only the bottom row would hide that the kernel work succeeded. Both
+belong in any honest write-up, which is the whole reason this profiler
+reports all three.
+
+---
+
 ## 4. Amdahl: the ratio decays, the saving does not
 
 Stage-2 is bounded by stage-1's share of the query. Binary's end-to-end

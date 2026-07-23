@@ -8,9 +8,12 @@ including the predictions that were wrong.
 **Scope of the claim.** Quality: 3 checkpoints × 3 datasets × 4 schemes,
 real embeddings, bootstrap CIs. Latency: shape-replay corpora (real token
 length distributions, synthetic values — latency depends on shapes, not
-values) on 4 CPUs: x86 AVX2, x86 AVX-512 VNNI, Neoverse (Graviton-class),
-Apple M-series. Shared CI runners drift 8–20% run to run, so **ratios are
-the signal and absolutes are context**.
+values) on **3 CPUs actually executed**: x86 AVX2, Neoverse
+(Graviton-class), and Apple M4. An AVX-512 VNNI kernel exists but has not
+run on any machine we have (§6.1) — it carries no performance claim.
+Shared CI runners drift, so **ratios are the signal and absolutes are
+context**; §6.2 measures each platform's noise floor rather than assuming
+it.
 
 ---
 
@@ -152,33 +155,41 @@ same cached indexes, same queries — and the bit-exactness suite runs under
 every mode, so an ablation cannot quietly change the computation it is
 timing. Each row below adds one component to the row above it.
 
-### Apple M4 (native arm64, idle machine, r4, exact-kernel ms)
+### Contribution of each component, per CPU
 
-| ablation | scifact | fiqa-15k | this row adds | gain |
-|---|---:|---:|---|---|
-| `row_major` | 3.499 | 3.283 | *(the kernel before this work)* | baseline |
-| `no_vfold` | 2.863 | 2.605 | centroid-major cdot layout | **1.22× / 1.26×** |
-| `no_tr` | 3.583 | 3.150 | vectorized fold | **0.80× / 0.83×** ⚠ |
-| *(production)* | 2.730 | 2.679 | transpose-reduce | 1.31× / 1.18× |
-| | | | **total** | **1.28× / 1.23×** |
+Gain that each component adds on top of the row above it (scifact / fiqa-15k,
+r4, exact-kernel time):
+
+| component added | Apple M4 (native) | Neoverse (CI) | x86 AVX2 (CI) |
+|---|---|---|---|
+| centroid-major cdot layout | **1.22× / 1.26×** | **1.80× / 1.61×** | **1.26× / 1.22×** |
+| vectorised fold (`vfold`) | **0.80× / 0.83×** ⚠ | 1.14× / 1.18× | 1.10× / 1.12× |
+| transpose-reduce (`tr`) | 1.31× / 1.18× | 1.01× / 1.02× | n/a (NEON-only) |
+| **total vs pre-work kernel** | **1.28× / 1.23×** | **2.08× / 1.93×** | **1.34× / 1.37×** |
+
+Absolute exact-kernel times, pre-work → production: M4 3.50→2.73 ms,
+Neoverse 12.62→6.07 ms, x86 17.05→12.73 ms (scifact).
 
 Three findings, none of which I predicted correctly:
 
-1. **The memory layout did the work.** Making a token's centroid scores
-   contiguous across query rows — not any epilogue vectorisation — is where
-   the gain lives.
-2. **The vectorised fold alone is a *regression* on M4** (0.80×, reproduced
-   in 2 further repeats: 2.69/2.99 scalar vs 3.43/3.69 vfold). Writing each
-   row's accumulator to a scratch and reading it back costs more than
-   folding four rows at once saves.
-3. **`vfold` + `tr` together ≈ scalar fold + good layout** (2.73 vs 2.86,
-   and 2.68 vs 2.61 — a wash). The two epilogue rungs are worth roughly
-   nothing on Apple silicon once the layout is right.
+1. **The memory layout did the work, everywhere.** Making a token's centroid
+   scores contiguous across query rows is the dominant component on all
+   three CPUs — and on Neoverse it alone is worth 1.6–1.8×. The epilogue
+   vectorisation I set out to port is the *smaller* half on every platform.
+2. **The vectorised fold is microarchitecture-dependent, including in
+   sign.** It pays on Neoverse (+14–18%) and x86 (+10–12%), and is a
+   *regression* on Apple M4 (−17 to −20%, reproduced in two further
+   repeats: 2.69/2.99 ms scalar vs 3.43/3.69 ms vfold). Writing each row's
+   accumulator to a scratch and reading it back costs the M4 more than
+   folding four rows at once saves it.
+3. **`tr` matters only where `vfold` hurt.** On M4 it recovers the
+   regression (1.18–1.31×); on Neoverse it is 1–2%, i.e. noise. Its value
+   was repairing a problem the previous rung introduced on one CPU.
 
 The honest reading: I imported two optimisations from a sibling project
-where they were measured to pay, and on this kernel shape they did not —
-while the unglamorous change I made *in passing* to enable them (the
-layout) was the entire win.
+where they had been measured to pay. One transferred partially and one
+inverted sign on Apple silicon — while the unglamorous change I made *in
+passing* to enable them was the largest contributor on every machine.
 
 ### Transpose implementation
 
@@ -186,18 +197,28 @@ Making the centroid term contiguous requires transposing stage-1's matrix
 once per query. How that transpose is written matters enormously, and
 differently per platform:
 
-| per-query prep | M4, K=16k | M4, K=32k | x86, K=16k |
-|---|---:|---:|---|
-| blocked (production) | 146–157 µs | 191 µs | (see CI) |
-| naive `as_standard_layout` | 184–195 µs | 238 µs | **0.7–15.8 ms** |
-| penalty | ~40 µs | ~47 µs | **milliseconds** |
+Per-query prep time, K = 16,384 (controlled ablation, same run):
 
-Same code, wildly different penalty. Apple's memory system absorbs the
-strided access almost entirely (~50 µs to transpose 4 MB); on x86 the same
-access pattern costs milliseconds, because every element read is both a
-cache and a TLB miss. Had this been benchmarked only on the Mac, the
-transpose would have looked free and shipped as-is — and x86 users would
-have paid half the kernel win back without anyone seeing it.
+| | Apple M4 | Neoverse | x86 AVX2 |
+|---|---:|---:|---:|
+| blocked (production) | 146–157 µs | 167–196 µs | 144–185 µs |
+| naive `as_standard_layout` | 184–195 µs | 215–302 µs | 428–580 µs |
+| **penalty** | **~40 µs** | **~50–105 µs** | **~285–395 µs** |
+
+The penalty is real and scales with how badly the platform handles a
+strided read: Apple's memory system absorbs it almost entirely, x86 pays
+~8× more, because there every element read is both a cache and a TLB miss.
+
+> **Correction.** Earlier in this exercise I wrote that the naive transpose
+> was "eating about half the kernel win" on x86, from a run where `prep`
+> read 2–16 ms. The controlled ablation does not support that: the true
+> cost is ~0.3–0.4 ms, roughly 3% of the exact-kernel time, and those early
+> readings were internally inconsistent (2.2 ms vs 15.8 ms at identical K)
+> and taken across runs where stage-1 variance was confounded with the
+> change. The blocked transpose is still worth keeping — it is strictly
+> less work and the ablation measures it cleanly — but the magnitude was
+> overstated, and the mechanism I inferred from cross-run e2e deltas was
+> not something those deltas could actually show.
 
 ---
 
@@ -206,9 +227,29 @@ have paid half the kernel win back without anyone seeing it.
 | CPU | binary kernel | asym kernel | status |
 |---|---|---|---|
 | x86 AVX2 | AVX2 SAD | `pshufb` + `maddubs` | shipped, CI-verified |
-| x86 AVX-512 VNNI | `vpdpbusd` | **`vpdpbusd` + 16-wide fold (new)** | see §6.1 |
+| x86 AVX-512 VNNI | `vpdpbusd` | **`vpdpbusd` + 16-wide fold (new)** | **written, not yet executed** — §6.1 |
 | aarch64 (Neoverse) | SDOT | `tbl` + SDOT + tr | shipped, CI-verified |
 | Apple M-series | SDOT | `tbl` + SDOT + tr | shipped, verified natively |
+
+## 6.2 Measurement noise per platform, for free
+
+`force_avx2` is a no-op on every machine in this matrix (aarch64 ignores
+it; the x86 runner has no AVX-512 to disable). It should therefore measure
+*identical* to production — so the deviation it shows **is** that
+platform's noise floor:
+
+| platform | inert-ablation deviation | verdict |
+|---|---|---|
+| Neoverse (CI) | 1.00× | trustworthy to ~1% |
+| x86 AVX2 (CI) | 0.97–1.00× | trustworthy to ~3% |
+| Apple M4 (native, idle) | ~6% (binary control) | trustworthy to ~6% |
+| **macOS CI runner** | **1.43×** | **unusable — discard** |
+
+That last row is why the Apple numbers in this document come from the local
+M4 and not from `macos-latest`: a control that should read 1.00× read
+1.43×, so nothing measured on that runner can support a claim smaller than
+a factor of ~1.5. Building the noise gauge into the ablation set cost one
+extra row per platform and caught a whole runner's worth of bad data.
 
 ### 6.1 AVX-512 bridge
 
@@ -225,7 +266,24 @@ where `w == 0` need no handling because `|w| = 0` zeroes the product
 regardless, and `-128` never occurs on either side (both clamp to ±127 at
 quantisation), so the negation cannot overflow.
 
-<!--AVX512-STATUS-->
+**Status: written, compiles, bit-exactness-gated — but NOT yet executed.**
+The profiler prints the kernel it dispatched to, and every x86 CI job
+reports `asym kernel: avx2`: GitHub's `ubuntu-latest` runners do not expose
+AVX-512 VNNI. The `force_avx2` ablation confirms it independently — forcing
+AVX2 off the production path changes nothing (0.97–1.00×), which it could
+only do if AVX-512 were never selected in the first place.
+
+So this kernel is: type-checked, compiled for x86-64, guarded by runtime
+feature detection (`avx512f` + `avx512bw` + `avx512vnni`, so it cannot
+SIGILL on a machine without them), and covered by the parity suite *on any
+machine that has the instructions* — but it has not run anywhere yet, and
+no performance claim is attached to it. To validate: run
+`cargo test --release -p next-plaid --lib residual_lut` plus
+`stage2_profile` on an Ice Lake / Sapphire Rapids / Zen 4+ host and check
+the printed kernel name says `avx512-vnni`.
+
+Calling it "AVX-512 support" today would be exactly the error the
+kernel-name line was added to prevent.
 
 ---
 
@@ -273,7 +331,7 @@ Five lessons, each paid for with a wrong prediction:
    while it sat inside the timed exact region — it just inflated one
    column. Moving it out *for fairness* is what exposed it as a genuine
    per-query cost eating half the win.
-5. **Ablations must be proven inert.** Every `NP_ASYM_ABLATE` mode runs the
+5. **Ablations must be proven inert — and an inert one is a free noise gauge.** Every `NP_ASYM_ABLATE` mode runs the
    full bit-exactness suite in CI. An ablation that quietly changed the
    computation would produce a confident, meaningless number.
 

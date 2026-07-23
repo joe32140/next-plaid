@@ -97,10 +97,10 @@ Exact stage-2 kernel, and the whole query through the public API:
 
 | cell (tokens) | float exact | asym exact | binary exact | float e2e | asym e2e | binary e2e |
 |---|---:|---:|---:|---:|---:|---:|
+| fiqa-4k (0.53M) | 19.68 | **3.98** (4.9×) | **1.16** (17.0×) | 25.8 | 8.6 | 5.5 |
 | nfcorpus (0.86M) | 9.98 | **1.77** (5.6×) | **0.67** (14.9×) | 15.1 | 4.5 | 3.0 |
 | scifact (1.19M) | 12.83 | **2.72** (4.7×) | **0.96** (13.4×) | 21.1 | 8.7 | 6.2 |
 | fiqa-15k (2.0M) | 14.31 | **2.78** (5.1×) | **1.22** (11.7×) | 24.0 | 10.2 | 10.2 |
-| fiqa-4k (0.53M) | 19.68 | **3.98** (4.9×) | **1.16** (17.0×) | 25.8 | 8.6 | 5.5 |
 | fiqa-52k (7.0M) | 25.63 | **4.42** (5.8×) | **1.26** (20.3×) | 47.6 | 25.9 | 21.0 |
 
 All times ms/query. The e2e columns are where Amdahl shows up: at fiqa-52k

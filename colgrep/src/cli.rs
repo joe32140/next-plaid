@@ -211,6 +211,12 @@ EXAMPLES:
     # Disable embedding pooling (larger index, more precise)
     colgrep settings --pool-factor 1
 
+    # Store embeddings as 1-bit signs (~4x smaller index, faster search)
+    colgrep settings --binary
+
+    # Back to residual storage (this is the default)
+    colgrep settings --no-binary
+
     # Set parallel encoding sessions (default: auto-detected CPU count)
     colgrep settings --parallel 8
 
@@ -257,6 +263,7 @@ NOTES:
     • Default output is compact (filepath:lines). Use -v or --verbose for full content
     • Precision defaults to FP32 on CUDA builds and INT8 otherwise; --fp32/--int8 force a choice
     • Pool factor 2 (default) reduces index size by ~50%. Use 1 to disable pooling
+    • --binary stores 1-bit embeddings: ~4x smaller index and faster search, small quality cost; toggling re-embeds indexes on their next update
     • Parallel sessions default to CPU count. Batch-size 1 (default) maximizes throughput
     • Parser recursion depth defaults to 1024. Increase only if needed for deep ASTs
     • Extra ignore patterns add to the built-in defaults (node_modules, .git, target, etc.)
@@ -720,6 +727,16 @@ pub enum Commands {
         /// Default: 0.75. Use 0 to reset to default.
         #[arg(long, value_name = "FLOAT")]
         alpha: Option<f32>,
+
+        /// Store document embeddings as 1-bit signs (binary quantization):
+        /// ~4x smaller indexes and faster search, small ranking-quality cost.
+        /// Existing indexes are re-embedded on their next update.
+        #[arg(long = "binary", conflicts_with = "no_binary")]
+        binary: bool,
+
+        /// Store document embeddings as residual codes (this is the default)
+        #[arg(long = "no-binary", conflicts_with = "binary")]
+        no_binary: bool,
 
         /// Add patterns to ignore during indexing (on top of defaults)
         /// Can be repeated. Examples: --ignore generated --ignore "*.pb.go"

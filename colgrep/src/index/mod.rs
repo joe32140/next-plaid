@@ -693,6 +693,7 @@ fn run_index_stage(
                         &chunk.embeddings,
                         &codec_artifacts.codec,
                         coding_force_cpu,
+                        coding_config.binary,
                     )?;
                     encoded_chunks.push(encoded);
                 }
@@ -1108,6 +1109,10 @@ pub struct IndexBuilder {
     /// Model id (e.g., "lightonai/LateOn-Code-edge"). Used both to scope the index
     /// directory (per-model indexes) and for "🤖 Model:" display.
     model_id: String,
+    /// Store document embeddings as packed 1-bit signs instead of residual
+    /// codes (persisted `colgrep settings --binary`). Binary indexes cannot
+    /// take incremental appends, so file changes trigger a full re-embed.
+    binary: bool,
 }
 
 impl IndexBuilder {
@@ -1159,6 +1164,9 @@ impl IndexBuilder {
             dynamic_batch: true,
             auto_confirm: false, // Prompt by default for large indexes
             model_id: model_id.to_string(),
+            binary: crate::config::Config::load()
+                .unwrap_or_default()
+                .use_binary(),
         })
     }
 
@@ -1404,6 +1412,7 @@ impl IndexBuilder {
         let force_cpu = next_plaid::is_force_cpu();
         let config = IndexConfig {
             force_cpu,
+            binary: self.binary,
             ..Default::default()
         };
         let update_config = UpdateConfig {
@@ -1450,6 +1459,7 @@ impl IndexBuilder {
                 let force_cpu = next_plaid::is_force_cpu();
                 let config = IndexConfig {
                     force_cpu,
+                    binary: self.binary,
                     ..Default::default()
                 };
                 let update_config = UpdateConfig {
@@ -1707,6 +1717,28 @@ impl IndexBuilder {
             return self.full_rebuild(languages);
         }
 
+        // The persisted `binary` setting changed since this index was built
+        // (1-bit sign store vs residual codes are incompatible on-disk formats):
+        // discard and re-embed. Checked before the resumable-build branch so an
+        // interrupted build under the old setting is also discarded.
+        if index_exists {
+            if let Ok(index_metadata) = Metadata::load_from_path(&index_dir) {
+                if index_metadata.binary != self.binary {
+                    eprintln!(
+                        "🔁 Embedding storage setting changed ({} → {}), re-embedding index...",
+                        if index_metadata.binary {
+                            "binary"
+                        } else {
+                            "residual"
+                        },
+                        if self.binary { "binary" } else { "residual" },
+                    );
+                    let _ = std::fs::remove_file(self.index_dir.join(BUILDING_MARKER));
+                    return self.full_rebuild(languages);
+                }
+            }
+        }
+
         // Fresh first build, or resume of an interrupted resumable build: build directly
         // into the real index dir and checkpoint state per batch, so an interrupted run
         // (e.g. an agent command timeout) keeps its progress instead of restarting.
@@ -1886,6 +1918,15 @@ impl IndexBuilder {
                 unchanged,
                 skipped: 0,
             });
+        }
+
+        // An existing binary index cannot take incremental appends; route the
+        // scoped update through the standard indexing path, which re-embeds
+        // atomically. The index lock is already held, as run_indexing expects.
+        // A missing index stays on the scoped path — the initial create writes
+        // atomically, so it is binary-safe.
+        if self.binary && index_dir.join("metadata.json").exists() {
+            return self.run_indexing(None, false);
         }
 
         // Load or create state
@@ -2106,6 +2147,14 @@ impl IndexBuilder {
         std::fs::create_dir_all(&index_dir)?;
         let index_path = index_dir.to_str().unwrap().to_string();
 
+        // A binary index already on disk cannot take the appends a resumed
+        // build would need (files that appeared since the committed write);
+        // rebuild atomically instead. A fresh binary build (no metadata.json)
+        // stays here — it runs as a single batch on the initial-create path.
+        if self.binary && index_dir.join("metadata.json").exists() {
+            return self.full_rebuild(languages);
+        }
+
         // Mark the build in progress so the next run resumes here even after some chunks
         // (and thus metadata.json) have been written.
         let marker = self.index_dir.join(BUILDING_MARKER);
@@ -2237,6 +2286,18 @@ impl IndexBuilder {
 
         // Encode in file-coherent batches of ~BUILD_CHECKPOINT_UNITS units, committing state
         // after each batch so interruptions keep finished work.
+        //
+        // Binary builds use a single batch instead: the first committed batch
+        // creates the index and every later batch appends via update_append,
+        // which binary indexes reject. One batch keeps the whole build on the
+        // atomic initial-create path (encoded sign bits are ~4x smaller than
+        // residual codes, so holding them in memory is cheap); the cost is
+        // that an interrupted binary build restarts from zero.
+        let checkpoint_units = if self.binary {
+            usize::MAX
+        } else {
+            BUILD_CHECKPOINT_UNITS
+        };
         let encode_pb = ProgressBar::new(total_units as u64);
         encode_pb.set_style(
             ProgressStyle::default_bar()
@@ -2260,7 +2321,7 @@ impl IndexBuilder {
             batch_units.extend(units);
             batch_files.push(file);
 
-            if batch_units.len() >= BUILD_CHECKPOINT_UNITS {
+            if batch_units.len() >= checkpoint_units {
                 if self.flush_build_batch(
                     &index_path,
                     &batch_files,
@@ -2495,6 +2556,20 @@ impl IndexBuilder {
         let plan = self.compute_update_plan(old_state, languages)?;
         let index_dir = get_vector_index_path(&self.index_dir);
         let index_path = index_dir.to_str().unwrap();
+
+        // Binary indexes cannot take incremental appends (next-plaid re-encodes
+        // appends through the residual codec, which would corrupt a 1-bit sign
+        // store), so added/changed files force an atomic full re-embed. Pure
+        // deletions stay incremental — deletion is storage-format agnostic.
+        if self.binary && (!plan.added.is_empty() || !plan.changed.is_empty()) {
+            eprintln!(
+                "🔁 Binary index: re-embedding all files ({} added, {} changed; \
+                 binary indexes do not support incremental updates)",
+                plan.added.len(),
+                plan.changed.len()
+            );
+            return self.full_rebuild(languages);
+        }
 
         // Repair desync only if the previous run was interrupted mid-write.
         if old_state.dirty {
@@ -5364,6 +5439,7 @@ mod tests {
             dynamic_batch: true,
             auto_confirm: true,
             model_id: "test-model".to_string(),
+            binary: false,
         }
     }
 

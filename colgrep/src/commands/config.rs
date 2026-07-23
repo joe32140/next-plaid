@@ -113,6 +113,8 @@ pub fn cmd_config(
     hybrid_search: bool,
     no_hybrid_search: bool,
     alpha: Option<f32>,
+    binary: bool,
+    no_binary: bool,
     add_ignore: Vec<String>,
     remove_ignore: Vec<String>,
     add_force_include: Vec<String>,
@@ -148,6 +150,8 @@ pub fn cmd_config(
         && !hybrid_search
         && !no_hybrid_search
         && alpha.is_none()
+        && !binary
+        && !no_binary
         && !has_ignore_changes
     {
         println!("Current configuration:");
@@ -232,6 +236,13 @@ pub fn cmd_config(
             println!("  alpha:       {:.2}", ha);
         } else {
             println!("  alpha:       {:.2} (default)", ha);
+        }
+
+        // binary embedding storage
+        if config.use_binary() {
+            println!("  binary:      true (1-bit embeddings)");
+        } else {
+            println!("  binary:      false (default)");
         }
 
         // max recursion depth
@@ -432,6 +443,21 @@ pub fn cmd_config(
             config.set_hybrid_alpha(a);
             println!("✅ Set hybrid alpha to {:.2}", config.get_hybrid_alpha());
         }
+        changed = true;
+    }
+
+    // Set binary embedding storage or no_binary
+    if binary {
+        config.set_binary(true);
+        println!("✅ Enabled binary embedding storage (~4x smaller indexes, faster search)");
+        println!("   Existing indexes will be re-embedded on their next update.");
+        println!("   ⚠️  Binary storage suits ≥96-dim embedding models; low-dim models");
+        println!("   (like the default 48-dim LateOn-Code-edge) may lose ranking quality.");
+        changed = true;
+    } else if no_binary {
+        config.clear_binary();
+        println!("✅ Disabled binary embedding storage (residual codes are now default)");
+        println!("   Existing binary indexes will be re-embedded on their next update.");
         changed = true;
     }
 

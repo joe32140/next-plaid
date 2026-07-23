@@ -256,6 +256,12 @@ colgrep settings --coreml-cache-dir ~/Library/Caches/colgrep/coreml
 # Set embedding pool factor (2 = 50% smaller index, 1 = full precision)
 colgrep settings --pool-factor 2
 
+# Store embeddings as 1-bit signs (~4x smaller index, faster search)
+colgrep settings --binary
+
+# Back to residual embedding storage (this is the default)
+colgrep settings --no-binary
+
 # Set parallel encoding sessions (persists across sessions and all indexes)
 # Default: CPU count (max 16) on CPU; 1 on GPU/CoreML. Use 0 to reset to auto.
 colgrep settings --parallel 8
@@ -304,6 +310,35 @@ Default when unset (`--parallel 0`):
 On a CPU build, raising sessions speeds up cold indexing roughly linearly with cores at only
 a modest, bounded memory increase. On accelerator builds the trade-off is steeper, so the
 default stays at 1 — raise it explicitly with `--parallel` if you have the device memory.
+
+### Binary Embedding Storage
+
+`colgrep settings --binary` switches index storage from residual codes to packed
+1-bit signs, scored with asymmetric binary MaxSim (int8 query × 1-bit documents).
+Indexes shrink ~4x and Stage-2 scoring gets faster, at a small ranking-quality
+cost. Like all `settings` values it is **persistent**: it applies to every
+future index and, when toggled, existing indexes are automatically re-embedded
+the next time they are updated or searched.
+
+```bash
+# Opt in (persisted in ~/.config/colgrep/config.json)
+colgrep settings --binary
+
+# Revert to the default residual storage
+colgrep settings --no-binary
+```
+
+Trade-offs to know about:
+
+- **Incremental updates are disabled.** Binary indexes cannot take appends, so
+  any added or changed file triggers a full re-embed of the project. Best
+  suited to small/medium repos or workflows where the index is built once.
+- **Quality depends on embedding dimension.** Binarization retains ranking
+  quality on ≥ 96-dim models but degrades sharply on low-dim checkpoints
+  (dim ≤ 64). colgrep's default model (`LateOn-Code-edge`) produces **48-dim**
+  embeddings, so with the default model expect a real quality drop — verify
+  search quality on your repo before adopting it, or pair `--binary` with a
+  higher-dimension model.
 
 ### Hybrid Search
 

@@ -1344,10 +1344,13 @@ async fn test_update_max_documents_config() {
 
     assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
 
-    // Wait for eviction
+    // Wait for eviction. Generous timeout: the queued update re-runs k-means
+    // before evicting, and on small shared runners (notably ubuntu-24.04-arm)
+    // concurrent tests' OpenBLAS thread pools contend hard enough that 15s
+    // flaked (2026-07-10 and 2026-07-16, same timeout each time).
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     fixture
-        .wait_for_exact_doc_count("config_update_test", 5, 15000)
+        .wait_for_exact_doc_count("config_update_test", 5, 60000)
         .await;
 
     // Verify only 5 documents remain

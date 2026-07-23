@@ -25,7 +25,6 @@
 //! }
 //! ```
 
-use ndarray::Array1;
 use ndarray::Array2;
 use rayon::prelude::*;
 
@@ -85,18 +84,8 @@ pub fn reconstruct_embeddings(
                 return Ok(Array2::zeros((0, index.embedding_dim())));
             }
 
-            // Get codes and residuals from mmap
-            let codes_slice = index.mmap_codes.slice(start, end);
-            let residuals_view = index.mmap_residuals.slice_rows(start, end);
-
-            // Convert codes to Array1<usize>
-            let codes: Array1<usize> = Array1::from_iter(codes_slice.iter().map(|&c| c as usize));
-
-            // Convert residuals to owned Array2
-            let residuals = residuals_view.to_owned();
-
-            // Decompress using the codec
-            index.codec.decompress(&residuals, &codes.view())
+            // Decode the stored representation (residual codes or 1-bit signs).
+            index.decode_rows(start, end)
         })
         .collect()
 }

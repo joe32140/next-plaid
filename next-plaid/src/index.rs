@@ -8,6 +8,7 @@ use std::path::Path;
 use ndarray::{s, Array1, Array2, Axis};
 use serde::{Deserialize, Serialize};
 
+use crate::binary;
 use crate::codec::ResidualCodec;
 use crate::error::{Error, Result};
 use crate::kmeans::{compute_kmeans, ComputeKmeansConfig};
@@ -71,6 +72,11 @@ pub struct IndexConfig {
     /// Default: `Unicode61` (word-level). Use `Trigram` for code / substring search.
     #[serde(default)]
     pub fts_tokenizer: crate::text_search::FtsTokenizer,
+    /// Store documents as 1-bit signs and score with asymmetric binary MaxSim
+    /// (see [`crate::binary`]) instead of residual (`nbits`) quantization.
+    /// Documents shrink ~32x versus `f32`; queries stay full precision.
+    #[serde(default)]
+    pub binary: bool,
 }
 
 fn default_start_from_scratch() -> usize {
@@ -97,6 +103,7 @@ impl Default for IndexConfig {
             start_from_scratch: crate::default_start_from_scratch(),
             force_cpu: false,
             fts_tokenizer: crate::text_search::FtsTokenizer::default(),
+            binary: false,
         }
     }
 }
@@ -124,6 +131,10 @@ pub struct Metadata {
     /// If false or missing, the index may need fast-plaid to next-plaid conversion.
     #[serde(default)]
     pub next_plaid_compatible: bool,
+    /// Whether documents are stored as 1-bit signs and scored with asymmetric
+    /// binary MaxSim (see [`crate::binary`]) rather than residual quantization.
+    #[serde(default)]
+    pub binary: bool,
 }
 
 impl Metadata {
@@ -290,9 +301,14 @@ pub fn encode_index_chunk(
     embeddings: &[Array2<f32>],
     codec: &ResidualCodec,
     force_cpu: bool,
+    binary: bool,
 ) -> Result<EncodedIndexChunk> {
     let embedding_dim = codec.embedding_dim();
-    let packed_dim = embedding_dim * codec.nbits / 8;
+    let packed_dim = if binary {
+        binary::packed_dim(embedding_dim)
+    } else {
+        embedding_dim * codec.nbits / 8
+    };
     let doclens: Vec<i64> = embeddings.iter().map(|d| d.nrows() as i64).collect();
     let total_tokens: usize = doclens.iter().sum::<i64>() as usize;
 
@@ -351,7 +367,11 @@ pub fn encode_index_chunk(
         }
     };
 
-    let batch_packed = codec.quantize_residuals(&batch_residuals)?;
+    let batch_packed = if binary {
+        binary::binarize(&batch_embeddings.view())
+    } else {
+        codec.quantize_residuals(&batch_residuals)?
+    };
     let (raw_residuals, residuals_offset) = batch_packed.into_raw_vec_and_offset();
     if residuals_offset != Some(0) {
         return Err(Error::Shape(format!(
@@ -400,20 +420,25 @@ pub fn write_index_from_encoded_chunks(
             .write_npy(file)?;
         Ok(())
     })?;
-    atomic_write_file(&index_dir.join("bucket_cutoffs.npy"), |file| {
-        codec_artifacts.bucket_cutoffs.write_npy(file)?;
-        Ok(())
-    })?;
-    atomic_write_file(&index_dir.join("bucket_weights.npy"), |file| {
-        codec_artifacts.bucket_weights.write_npy(file)?;
-        Ok(())
-    })?;
+    // Residual-quantization buckets are unused by binary scoring; skip them so
+    // both build paths (this and create_index_files) produce the same on-disk
+    // artifact set for a binary index.
+    if !config.binary {
+        atomic_write_file(&index_dir.join("bucket_cutoffs.npy"), |file| {
+            codec_artifacts.bucket_cutoffs.write_npy(file)?;
+            Ok(())
+        })?;
+        atomic_write_file(&index_dir.join("bucket_weights.npy"), |file| {
+            codec_artifacts.bucket_weights.write_npy(file)?;
+            Ok(())
+        })?;
+        atomic_write_file(&index_dir.join("cluster_threshold.npy"), |file| {
+            Array1::from_vec(vec![codec_artifacts.cluster_threshold]).write_npy(file)?;
+            Ok(())
+        })?;
+    }
     atomic_write_file(&index_dir.join("avg_residual.npy"), |file| {
         codec_artifacts.avg_res_per_dim.write_npy(file)?;
-        Ok(())
-    })?;
-    atomic_write_file(&index_dir.join("cluster_threshold.npy"), |file| {
-        Array1::from_vec(vec![codec_artifacts.cluster_threshold]).write_npy(file)?;
         Ok(())
     })?;
 
@@ -516,6 +541,7 @@ pub fn write_index_from_encoded_chunks(
         num_documents,
         embedding_dim,
         next_plaid_compatible: true,
+        binary: config.binary,
     };
     atomic_write_file(&index_dir.join("metadata.json"), |file| {
         let mut writer = BufWriter::new(file);
@@ -674,27 +700,30 @@ pub fn create_index_files(
         Ok(())
     })?;
 
-    let cutoffs_path = index_dir.join("bucket_cutoffs.npy");
-    atomic_write_file(&cutoffs_path, |file| {
-        bucket_cutoffs.write_npy(file)?;
-        Ok(())
-    })?;
+    // Residual-quantization buckets are unused by binary scoring; skip them.
+    if !config.binary {
+        let cutoffs_path = index_dir.join("bucket_cutoffs.npy");
+        atomic_write_file(&cutoffs_path, |file| {
+            bucket_cutoffs.write_npy(file)?;
+            Ok(())
+        })?;
 
-    let weights_path = index_dir.join("bucket_weights.npy");
-    atomic_write_file(&weights_path, |file| {
-        bucket_weights.write_npy(file)?;
-        Ok(())
-    })?;
+        let weights_path = index_dir.join("bucket_weights.npy");
+        atomic_write_file(&weights_path, |file| {
+            bucket_weights.write_npy(file)?;
+            Ok(())
+        })?;
+
+        let threshold_path = index_dir.join("cluster_threshold.npy");
+        atomic_write_file(&threshold_path, |file| {
+            Array1::from_vec(vec![cluster_threshold]).write_npy(file)?;
+            Ok(())
+        })?;
+    }
 
     let avg_res_path = index_dir.join("avg_residual.npy");
     atomic_write_file(&avg_res_path, |file| {
         avg_res_per_dim.write_npy(file)?;
-        Ok(())
-    })?;
-
-    let threshold_path = index_dir.join("cluster_threshold.npy");
-    atomic_write_file(&threshold_path, |file| {
-        Array1::from_vec(vec![cluster_threshold]).write_npy(file)?;
         Ok(())
     })?;
 
@@ -737,7 +766,15 @@ pub fn create_index_files(
 
         // BATCH: Compress embeddings and compute residuals
         // Try CUDA fused operation first, fall back to CPU (skip CUDA if force_cpu is set)
-        let (batch_codes, batch_residuals) = {
+        let (batch_codes, batch_residuals) = if config.binary {
+            // Binary storage needs only centroid codes (for IVF); residuals unused.
+            let codes = if config.force_cpu {
+                codec.compress_into_codes_cpu(&batch_embeddings)
+            } else {
+                codec.compress_into_codes(&batch_embeddings)
+            };
+            (codes, Array2::<f32>::zeros((0, embedding_dim)))
+        } else {
             #[cfg(feature = "_cuda")]
             {
                 let force_gpu = crate::is_force_gpu();
@@ -776,8 +813,12 @@ pub fn create_index_files(
             }
         };
 
-        // BATCH: Quantize all residuals at once
-        let batch_packed = codec.quantize_residuals(&batch_residuals)?;
+        // BATCH: encode all tokens — 1-bit signs (binary) or residual codes.
+        let batch_packed = if config.binary {
+            binary::binarize(&batch_embeddings.view())
+        } else {
+            codec.quantize_residuals(&batch_residuals)?
+        };
 
         // Track codes for IVF building
         for &len in &chunk_doclens {
@@ -897,6 +938,7 @@ pub fn create_index_files(
         num_documents,
         embedding_dim,
         next_plaid_compatible: true, // Created by next-plaid, always compatible
+        binary: config.binary,
     };
 
     let metadata_path = index_dir.join("metadata.json");
@@ -1155,27 +1197,32 @@ impl MmapIndex {
         candidates
     }
 
-    /// Get document embeddings by decompressing codes and residuals.
+    /// Decode the stored representation of token rows `[start, end)` into
+    /// `[tokens, dim]` embeddings, honoring the storage mode: binary indexes hold
+    /// 1-bit signs (decoded to ±1), residual indexes hold codes + residuals.
+    pub(crate) fn decode_rows(&self, start: usize, end: usize) -> Result<Array2<f32>> {
+        let residuals = self.mmap_residuals.slice_rows(start, end);
+        if self.metadata.binary {
+            return Ok(binary::signs_pm1(&residuals, self.codec.embedding_dim()));
+        }
+        let codes: Array1<usize> = Array1::from_iter(
+            self.mmap_codes
+                .slice(start, end)
+                .iter()
+                .map(|&c| c as usize),
+        );
+        self.codec.decompress(&residuals.to_owned(), &codes.view())
+    }
+
+    /// Get document embeddings, decoding the stored representation (residual codes
+    /// or 1-bit signs). For a binary index the result is the stored ±1 signs.
     pub fn get_document_embeddings(&self, doc_id: usize) -> Result<Array2<f32>> {
         if doc_id >= self.doc_lengths.len() {
             return Err(Error::Search(format!("Invalid document ID: {}", doc_id)));
         }
-
         let start = self.doc_offsets[doc_id];
         let end = self.doc_offsets[doc_id + 1];
-
-        // Get codes and residuals from mmap
-        let codes_slice = self.mmap_codes.slice(start, end);
-        let residuals_view = self.mmap_residuals.slice_rows(start, end);
-
-        // Convert codes to Array1<usize>
-        let codes: Array1<usize> = Array1::from_iter(codes_slice.iter().map(|&c| c as usize));
-
-        // Convert residuals to owned Array2
-        let residuals = residuals_view.to_owned();
-
-        // Decompress
-        self.codec.decompress(&residuals, &codes.view())
+        self.decode_rows(start, end)
     }
 
     /// Get codes for a batch of document IDs (for approximate scoring).
@@ -1238,8 +1285,12 @@ impl MmapIndex {
             offset += len;
         }
 
-        let codes_arr = Array1::from_vec(all_codes);
-        let embeddings = self.codec.decompress(&all_residuals, &codes_arr.view())?;
+        let embeddings = if self.metadata.binary {
+            binary::signs_pm1(&all_residuals.view(), self.codec.embedding_dim())
+        } else {
+            let codes_arr = Array1::from_vec(all_codes);
+            self.codec.decompress(&all_residuals, &codes_arr.view())?
+        };
 
         Ok((embeddings, lengths))
     }
@@ -1481,6 +1532,10 @@ impl MmapIndex {
                     n_samples_kmeans: config.n_samples_kmeans,
                     start_from_scratch: config.start_from_scratch,
                     force_cpu: config.force_cpu,
+                    // A rebuild from raw embeddings must keep the index's
+                    // storage scheme, or an update would silently convert a
+                    // binary index back to residual.
+                    binary: self.metadata.binary,
                     ..Default::default()
                 };
 
@@ -1498,6 +1553,20 @@ impl MmapIndex {
                 return Ok((start_doc_id..start_doc_id + num_new_docs as i64).collect());
             }
             // else: embeddings.npy is out of sync, fall through to buffer mode
+        }
+
+        // Binary indexes can only be updated through the start-from-scratch
+        // rebuild above (re-encoding from raw f32 embeddings). The buffer and
+        // centroid-expansion paths below append through the residual codec,
+        // which would corrupt a 1-bit sign store — and the expansion path
+        // deletes buffered documents before re-indexing, so the rejection must
+        // happen here, before any destructive step.
+        if self.metadata.binary {
+            return Err(Error::Update(
+                "binary indexes only support incremental updates while raw embeddings are \
+                 retained (num_documents <= start_from_scratch); rebuild the index instead"
+                    .into(),
+            ));
         }
 
         // Load buffer

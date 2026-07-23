@@ -202,6 +202,14 @@ POST /indices
 | `start_from_scratch` | `999`   | Below this doc count, full rebuild on update  |
 | `max_documents`      | `null`  | Evict oldest when exceeded (null = unlimited) |
 | `fts_tokenizer`      | `"unicode61"` | FTS5 tokenizer: `"unicode61"` (words) or `"trigram"` (substrings) |
+| `binary`             | `false` | Store documents as 1-bit signs (asymmetric binary MaxSim): ~4x smaller than `nbits: 4` and faster to search, at a small ranking-quality cost |
+
+> **`binary: true` caveats** — the storage scheme is fixed at creation time.
+> Binary indexes rebuild from raw embeddings on every update, so documents can
+> only be added while the index holds at most `start_from_scratch` documents;
+> beyond that, adds are rejected and the index must be recreated. Intended for
+> embedding dims ≥ 96 (e.g. 128); low-dimension checkpoints (dim ≤ 64) lose
+> substantial ranking quality when binarized.
 
 ### Add Documents (text)
 

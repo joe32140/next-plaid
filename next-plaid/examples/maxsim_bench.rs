@@ -61,7 +61,9 @@ fn main() {
             let mut a = Array2::<f32>::zeros((n, dim));
             for mut row in a.rows_mut() {
                 for v in row.iter_mut() {
-                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     *v = ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0;
                 }
                 let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
@@ -85,7 +87,10 @@ fn main() {
         let docs: Vec<Array2<f32>> = match std::env::var("SYNTH_TOKENS") {
             Ok(t) => {
                 let t: usize = t.parse().unwrap();
-                assert!(corpus.nrows() >= n_docs * t, "corpus too small for synth shape");
+                assert!(
+                    corpus.nrows() >= n_docs * t,
+                    "corpus too small for synth shape"
+                );
                 (0..n_docs)
                     .map(|i| corpus.slice(s![i * t..(i + 1) * t, ..]).to_owned())
                     .collect()
@@ -164,7 +169,8 @@ fn main() {
     // A/B is scoring-path-only).
     let mut built: Option<(usize, bool, MmapIndex)> = None;
     for (label, config, asym) in configs {
-        let rebuild = !matches!(&built, Some((n, b, _)) if *n == config.nbits && *b == config.binary);
+        let rebuild =
+            !matches!(&built, Some((n, b, _)) if *n == config.nbits && *b == config.binary);
         if rebuild {
             // With INDEX_ROOT set, reuse stage2_profile's persistent index
             // cache: same builder, same seed, and (in synth mode) the same
@@ -192,11 +198,7 @@ fn main() {
                         .unwrap_or_else(|| "bundle".into());
                     format!("bundle-{stem}")
                 };
-                PathBuf::from(root).join(format!(
-                    "{src}-{}x{}_{tag}",
-                    docs.len(),
-                    docs[0].nrows()
-                ))
+                PathBuf::from(root).join(format!("{src}-{}x{}_{tag}", docs.len(), docs[0].nrows()))
             });
             let index = match &cache_dir {
                 Some(d) if d.join("PROFILE_INDEX_OK").exists() => {
@@ -205,13 +207,19 @@ fn main() {
                 }
                 _ => {
                     let dir = cache_dir.clone().unwrap_or_else(|| {
-                        std::env::temp_dir()
-                            .join(format!("np_maxsim_bench_{}_{}", config.nbits, config.binary))
+                        std::env::temp_dir().join(format!(
+                            "np_maxsim_bench_{}_{}",
+                            config.nbits, config.binary
+                        ))
                     });
                     let _ = std::fs::remove_dir_all(&dir);
-                    eprintln!("building index nbits={} binary={} ...", config.nbits, config.binary);
-                    let index = MmapIndex::create_with_kmeans(&docs, dir.to_str().unwrap(), &config)
-                        .unwrap();
+                    eprintln!(
+                        "building index nbits={} binary={} ...",
+                        config.nbits, config.binary
+                    );
+                    let index =
+                        MmapIndex::create_with_kmeans(&docs, dir.to_str().unwrap(), &config)
+                            .unwrap();
                     if cache_dir.is_some() {
                         std::fs::write(dir.join("PROFILE_INDEX_OK"), b"ok").unwrap();
                     }

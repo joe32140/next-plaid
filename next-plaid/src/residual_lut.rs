@@ -326,7 +326,11 @@ pub fn maxsim_residual_lut_i8(
         "packed row too short for dim {dim} at {} keys/byte",
         lut.keys_per_byte
     );
-    let ncent = if row_major { cdot_t.ncols() } else { cdot_t.nrows() } as u64;
+    let ncent = if row_major {
+        cdot_t.ncols()
+    } else {
+        cdot_t.nrows()
+    } as u64;
     for &c in doc_codes {
         // A negative i64 wraps to a huge u64 and fails the same check.
         assert!((c as u64) < ncent, "centroid id {c} out of range {ncent}");
@@ -349,8 +353,8 @@ pub fn maxsim_residual_lut_i8(
                     let (best, accs) = &mut *s.borrow_mut();
                     unsafe {
                         neon::maxsim_residual_lut_neon(
-                            q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms,
-                            dim, best, accs,
+                            q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim,
+                            best, accs,
                         )
                     }
                 });
@@ -361,8 +365,8 @@ pub fn maxsim_residual_lut_i8(
                     let (best, accs) = &mut *s.borrow_mut();
                     unsafe {
                         avx512::maxsim_residual_lut_avx512(
-                            q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms,
-                            dim, best, accs,
+                            q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim,
+                            best, accs,
                         )
                     }
                 });
@@ -373,8 +377,8 @@ pub fn maxsim_residual_lut_i8(
                     let (best, accs) = &mut *s.borrow_mut();
                     unsafe {
                         avx2::maxsim_residual_lut_avx2(
-                            q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms,
-                            dim, best, accs,
+                            q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim,
+                            best, accs,
                         )
                     }
                 });
@@ -743,8 +747,7 @@ mod avx2 {
         let invv = _mm256_set1_ps(inv);
         let mut i = 0usize;
         while i + 8 <= nq {
-            let a =
-                _mm256_cvtepi32_ps(_mm256_loadu_si256(accs.as_ptr().add(i) as *const __m256i));
+            let a = _mm256_cvtepi32_ps(_mm256_loadu_si256(accs.as_ptr().add(i) as *const __m256i));
             let s = _mm256_mul_ps(
                 _mm256_add_ps(
                     _mm256_mul_ps(_mm256_loadu_ps(sqw.as_ptr().add(i)), a),
@@ -872,8 +875,7 @@ mod avx2 {
                 while k < dim {
                     let qv = _mm256_loadu_si256(qp.add(k) as *const __m256i);
                     let wv = _mm256_loadu_si256(wp.add(k) as *const __m256i);
-                    let prod =
-                        _mm256_maddubs_epi16(_mm256_abs_epi8(wv), _mm256_sign_epi8(qv, wv));
+                    let prod = _mm256_maddubs_epi16(_mm256_abs_epi8(wv), _mm256_sign_epi8(qv, wv));
                     acc = _mm256_add_epi32(acc, _mm256_madd_epi16(prod, ones));
                     k += 32;
                 }
@@ -888,9 +890,8 @@ mod avx2 {
             let inv = inv_norms[t];
             if row_major {
                 for (qi, best_qi) in best.iter_mut().enumerate() {
-                    let s = (sqw[qi] * accs[qi] as f32
-                        + *cd.as_ptr().add(qi * k_stride + cid))
-                        * inv;
+                    let s =
+                        (sqw[qi] * accs[qi] as f32 + *cd.as_ptr().add(qi * k_stride + cid)) * inv;
                     if s > *best_qi {
                         *best_qi = s;
                     }
@@ -1069,9 +1070,8 @@ mod avx512 {
             let inv = inv_norms[t];
             if row_major {
                 for (qi, best_qi) in best.iter_mut().enumerate() {
-                    let s = (sqw[qi] * accs[qi] as f32
-                        + *cd.as_ptr().add(qi * k_stride + cid))
-                        * inv;
+                    let s =
+                        (sqw[qi] * accs[qi] as f32 + *cd.as_ptr().add(qi * k_stride + cid)) * inv;
                     if s > *best_qi {
                         *best_qi = s;
                     }
@@ -1091,7 +1091,6 @@ mod avx512 {
         best.iter().sum()
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1258,50 +1257,50 @@ mod tests {
                     let cdot_t = Array2::from_shape_fn(shape, |_| rng.gen_range(-1.0f32..1.0));
                     let inv: Vec<f32> = (0..13).map(|_| rng.gen_range(0.5f32..1.5)).collect();
 
-                let scalar = maxsim_residual_lut_scalar(
-                    &q8,
-                    &packed.view(),
-                    &codes,
-                    &cdot_t.view(),
-                    &lut,
-                    &inv,
-                    dim,
-                );
-                // Fresh scratch per call — also proves the kernels fully
-                // initialize it (no state carried between calls).
-                let (mut best, mut accs) = (Vec::new(), Vec::new());
-                #[cfg(target_arch = "aarch64")]
-                let simd = unsafe {
-                    super::neon::maxsim_residual_lut_neon(
+                    let scalar = maxsim_residual_lut_scalar(
                         &q8,
-                        &planes,
                         &packed.view(),
                         &codes,
                         &cdot_t.view(),
                         &lut,
-                        nib,
                         &inv,
                         dim,
-                        &mut best,
-                        &mut accs,
-                    )
-                };
-                #[cfg(target_arch = "x86_64")]
-                let simd = unsafe {
-                    super::avx2::maxsim_residual_lut_avx2(
-                        &q8,
-                        &planes,
-                        &packed.view(),
-                        &codes,
-                        &cdot_t.view(),
-                        &lut,
-                        nib,
-                        &inv,
-                        dim,
-                        &mut best,
-                        &mut accs,
-                    )
-                };
+                    );
+                    // Fresh scratch per call — also proves the kernels fully
+                    // initialize it (no state carried between calls).
+                    let (mut best, mut accs) = (Vec::new(), Vec::new());
+                    #[cfg(target_arch = "aarch64")]
+                    let simd = unsafe {
+                        super::neon::maxsim_residual_lut_neon(
+                            &q8,
+                            &planes,
+                            &packed.view(),
+                            &codes,
+                            &cdot_t.view(),
+                            &lut,
+                            nib,
+                            &inv,
+                            dim,
+                            &mut best,
+                            &mut accs,
+                        )
+                    };
+                    #[cfg(target_arch = "x86_64")]
+                    let simd = unsafe {
+                        super::avx2::maxsim_residual_lut_avx2(
+                            &q8,
+                            &planes,
+                            &packed.view(),
+                            &codes,
+                            &cdot_t.view(),
+                            &lut,
+                            nib,
+                            &inv,
+                            dim,
+                            &mut best,
+                            &mut accs,
+                        )
+                    };
                     assert_eq!(
                         scalar.to_bits(),
                         simd.to_bits(),
@@ -1399,7 +1398,9 @@ mod tests {
                 let res = Array2::from_shape_fn((9, dim), |_| rng.gen_range(-0.4f32..0.4));
                 let packed = codec.quantize_residuals(&res).unwrap();
                 let codes: Vec<i64> = (0..9).map(|_| rng.gen_range(0..k as i64)).collect();
-                let cdot_t = orient(Array2::from_shape_fn((k, 6), |_| rng.gen_range(-1.0f32..1.0)));
+                let cdot_t = orient(Array2::from_shape_fn((k, 6), |_| {
+                    rng.gen_range(-1.0f32..1.0)
+                }));
                 let inv: Vec<f32> = (0..9).map(|_| rng.gen_range(0.5f32..1.5)).collect();
                 let planes = build_query_planes(&q8, &lut, dim);
 

@@ -224,7 +224,10 @@ fn exact_doc_score_asym_compact(
     for c in codes.iter() {
         // Every shortlisted doc is a candidate, and the compact matrix covers
         // every centroid any candidate references — a miss is a logic bug.
-        debug_assert!(remap.contains_key(c), "shortlist code {c} missing from centroid union");
+        debug_assert!(
+            remap.contains_key(c),
+            "shortlist code {c} missing from centroid union"
+        );
         remapped.push(*remap.get(c)?);
     }
     Some(crate::residual_lut::maxsim_residual_lut_i8(
@@ -280,7 +283,7 @@ pub fn exact_score_docs(
 /// sequential: for each strip of `BLK` centroids we read `nq` runs of
 /// `BLK` contiguous floats and write `BLK` runs of `nq` contiguous floats,
 /// so each cache line is used fully instead of once.
-fn transpose_cdot(cdot: &Array2<f32>) -> Array2<f32> {
+pub(crate) fn transpose_cdot(cdot: &Array2<f32>) -> Array2<f32> {
     use crate::residual_lut::{ablation, Ablation};
     match ablation() {
         // Hand the kernels stage-1's matrix as-is; they gather from it.
@@ -346,6 +349,16 @@ pub fn exact_score_docs_prepared(
 /// production search pays it once per query, and the profiler's prep phase
 /// accounts for it); leaving it inside the exact timing would add a
 /// K-dependent cost to the asym column that the float column never pays.
+/// Put stage-1's `[nq, K]` matrix into the layout the kernels expect,
+/// honouring any active ablation. Benchmarks call this *outside* their
+/// timed region and pass the result to [`exact_score_docs_prepared_t`], so
+/// the per-query transpose is charged to prep (where production pays it)
+/// instead of to the exact-scoring column.
+#[doc(hidden)]
+pub fn cdot_to_kernel_layout(cdot: &Array2<f32>) -> Array2<f32> {
+    transpose_cdot(cdot)
+}
+
 #[doc(hidden)]
 pub fn exact_score_docs_prepared_t(
     index: &crate::index::MmapIndex,
@@ -935,8 +948,7 @@ fn search_one_mmap_batched(
         // Centroid-major, matching the dense path — except under the
         // row-major ablation, which reproduces the pre-work layout on both
         // paths so the two stay comparable.
-        let compact = if crate::residual_lut::ablation()
-            == crate::residual_lut::Ablation::RowMajor
+        let compact = if crate::residual_lut::ablation() == crate::residual_lut::Ablation::RowMajor
         {
             let mut c = Array2::<f32>::zeros((num_query_tokens, ids.len()));
             for (col, &cid) in ids.iter().enumerate() {

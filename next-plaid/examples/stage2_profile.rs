@@ -62,8 +62,8 @@ use ndarray::{s, Array1, Array2};
 use ndarray_npy::ReadNpyExt;
 use next_plaid::index::MmapIndex;
 use next_plaid::search::{
-    exact_score_docs_prepared, exact_score_docs_prepared_t, search_one_mmap, stage1_shortlist,
-    SearchParameters,
+    cdot_to_kernel_layout, exact_score_docs_prepared, exact_score_docs_prepared_t, search_one_mmap,
+    stage1_shortlist, SearchParameters,
 };
 use next_plaid::IndexConfig;
 
@@ -83,7 +83,9 @@ fn lcg_unit_rows(s: &mut u64, n: usize, dim: usize) -> Array2<f32> {
     let mut a = Array2::<f32>::zeros((n, dim));
     for mut row in a.rows_mut() {
         for v in row.iter_mut() {
-            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *v = ((*s >> 33) as f32 / (1u64 << 31) as f32) - 1.0;
         }
         let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
@@ -116,7 +118,9 @@ fn time3(mut f: impl FnMut()) -> f64 {
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).map(|v| v.parse().unwrap()).unwrap_or(default)
+    std::env::var(key)
+        .map(|v| v.parse().unwrap())
+        .unwrap_or(default)
 }
 
 /// What the profiler knows about the corpus without materializing it.
@@ -135,10 +139,14 @@ fn main() {
 
     let (corpus, queries): (Corpus, Vec<Array2<f32>>) = if arg1 == "shapes" {
         let dir = PathBuf::from(
-            std::env::args().nth(2).expect("usage: stage2_profile shapes <lens_dir> [n_docs_cap]"),
+            std::env::args()
+                .nth(2)
+                .expect("usage: stage2_profile shapes <lens_dir> [n_docs_cap]"),
         );
-        let cap: usize =
-            std::env::args().nth(3).map(|s| s.parse().unwrap()).unwrap_or(usize::MAX);
+        let cap: usize = std::env::args()
+            .nth(3)
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(usize::MAX);
         let dim = env_usize("SHAPE_DIM", 128);
         let n_queries = env_usize("QUERIES", 50);
         let clens =
@@ -160,17 +168,31 @@ fn main() {
         let lens_for_gen = doc_lens.clone();
         let gen_docs = Box::new(move || {
             let mut s = 0x5eed_u64;
-            lens_for_gen.iter().map(|&l| lcg_unit_rows(&mut s, l, dim)).collect()
+            lens_for_gen
+                .iter()
+                .map(|&l| lcg_unit_rows(&mut s, l, dim))
+                .collect()
         });
-        (Corpus { name, dim, doc_lens, gen_docs }, queries)
+        (
+            Corpus {
+                name,
+                dim,
+                doc_lens,
+                gen_docs,
+            },
+            queries,
+        )
     } else if arg1 == "synth" {
-        let n_docs: usize =
-            std::env::args().nth(2).map(|s| s.parse().unwrap()).unwrap_or(2000);
+        let n_docs: usize = std::env::args()
+            .nth(2)
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(2000);
         let t = env_usize("SYNTH_TOKENS", 180);
         let dim = env_usize("SYNTH_DIM", 128);
         let mut qseed = 0x0DD5EED5_u64;
-        let queries: Vec<Array2<f32>> =
-            (0..50).map(|_| lcg_unit_rows(&mut qseed, 32, dim)).collect();
+        let queries: Vec<Array2<f32>> = (0..50)
+            .map(|_| lcg_unit_rows(&mut qseed, 32, dim))
+            .collect();
         let gen_docs = Box::new(move || {
             let mut s = 0x5eed_u64;
             (0..n_docs).map(|_| lcg_unit_rows(&mut s, t, dim)).collect()
@@ -186,16 +208,20 @@ fn main() {
         )
     } else {
         let bundle = PathBuf::from(&arg1);
-        let max_queries: usize =
-            std::env::args().nth(2).map(|s| s.parse().unwrap()).unwrap_or(usize::MAX);
+        let max_queries: usize = std::env::args()
+            .nth(2)
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(usize::MAX);
         let lens =
             Array1::<i64>::read_npy(File::open(bundle.join("corpus_lens.npy")).unwrap()).unwrap();
         let queries_c =
             Array2::<f32>::read_npy(File::open(bundle.join("queries.npy")).unwrap()).unwrap();
         let qlens =
             Array1::<i64>::read_npy(File::open(bundle.join("query_lens.npy")).unwrap()).unwrap();
-        let queries: Vec<Array2<f32>> =
-            unpack(&queries_c, &qlens).into_iter().take(max_queries).collect();
+        let queries: Vec<Array2<f32>> = unpack(&queries_c, &qlens)
+            .into_iter()
+            .take(max_queries)
+            .collect();
         let dim = queries_c.ncols();
         let doc_lens: Vec<usize> = lens.iter().map(|&l| l as usize).collect();
         let name = bundle.file_name().unwrap().to_string_lossy().into_owned();
@@ -204,12 +230,21 @@ fn main() {
             let corpus =
                 Array2::<f32>::read_npy(File::open(bundle_for_gen.join("corpus.npy")).unwrap())
                     .unwrap();
-            let lens =
-                Array1::<i64>::read_npy(File::open(bundle_for_gen.join("corpus_lens.npy")).unwrap())
-                    .unwrap();
+            let lens = Array1::<i64>::read_npy(
+                File::open(bundle_for_gen.join("corpus_lens.npy")).unwrap(),
+            )
+            .unwrap();
             unpack(&corpus, &lens)
         });
-        (Corpus { name, dim, doc_lens, gen_docs }, queries)
+        (
+            Corpus {
+                name,
+                dim,
+                doc_lens,
+                gen_docs,
+            },
+            queries,
+        )
     };
 
     let total_tokens: usize = corpus.doc_lens.iter().sum();
@@ -239,13 +274,19 @@ fn main() {
     // end-to-end ratio matters and r2/r1 would double build + artifact cost.
     // Empty means unset (CI matrix cells pass INDEX_TAGS="" for "all").
     let tag_filter = std::env::var("INDEX_TAGS").ok().filter(|s| !s.is_empty());
-    let builds: Vec<(&str, usize, bool)> =
-        [("r4", 4usize, false), ("r2", 2, false), ("r1", 1, false), ("binary", 4, true)]
-            .into_iter()
-            .filter(|(tag, _, _)| {
-                tag_filter.as_ref().is_none_or(|f| f.split(',').any(|t| t == *tag))
-            })
-            .collect();
+    let builds: Vec<(&str, usize, bool)> = [
+        ("r4", 4usize, false),
+        ("r2", 2, false),
+        ("r1", 1, false),
+        ("binary", 4, true),
+    ]
+    .into_iter()
+    .filter(|(tag, _, _)| {
+        tag_filter
+            .as_ref()
+            .is_none_or(|f| f.split(',').any(|t| t == *tag))
+    })
+    .collect();
 
     // With INDEX_ROOT, an index is reused iff its completion marker exists
     // (a killed build leaves no marker and is rebuilt). Without it, every
@@ -265,7 +306,10 @@ fn main() {
     let docs: Vec<Array2<f32>> = if need_build {
         let t = Instant::now();
         let d = (corpus.gen_docs)();
-        println!("corpus materialized in {:.1}s (needed for index build)", t.elapsed().as_secs_f64());
+        println!(
+            "corpus materialized in {:.1}s (needed for index build)",
+            t.elapsed().as_secs_f64()
+        );
         d
     } else {
         println!("corpus not materialized (no index build will run)");
@@ -300,7 +344,10 @@ fn main() {
             if index_root.is_some() {
                 std::fs::write(marker(&dir), b"ok").unwrap();
             }
-            println!("\n=== index {tag} (nbits={nbits}, binary={binary}) — build {:.1}s ===", t.elapsed().as_secs_f64());
+            println!(
+                "\n=== index {tag} (nbits={nbits}, binary={binary}) — build {:.1}s ===",
+                t.elapsed().as_secs_f64()
+            );
             index
         };
         if build_only {
@@ -355,8 +402,11 @@ fn main() {
 
         // Schemes on this index. Binary indexes have one path; residual
         // indexes get the float A/B plus its decompress/GEMM decomposition.
-        let schemes: &[(&str, bool)] =
-            if binary { &[("binary", false)] } else { &[("float", false), ("asym", true)] };
+        let schemes: &[(&str, bool)] = if binary {
+            &[("binary", false)]
+        } else {
+            &[("float", false), ("asym", true)]
+        };
         let mut float_mean = f64::NAN;
         for &(scheme, asym) in schemes {
             let mut prep_ms = Vec::new();
@@ -370,7 +420,7 @@ fn main() {
                 prep_ms.push(time3(|| {
                     std::hint::black_box(exact_score_docs_prepared(&index, q, cdot, &[], asym));
                 }));
-                let cdot_t = cdot.t().as_standard_layout().into_owned();
+                let cdot_t = cdot_to_kernel_layout(cdot);
                 exact_ms.push(time3(|| {
                     std::hint::black_box(exact_score_docs_prepared_t(
                         &index, q, &cdot_t, ids, asym,
@@ -420,8 +470,10 @@ fn main() {
                         .sum();
                     std::hint::black_box(s);
                 }));
-                let dense: Vec<Array2<f32>> =
-                    ids.iter().map(|&d| index.get_document_embeddings(d).unwrap()).collect();
+                let dense: Vec<Array2<f32>> = ids
+                    .iter()
+                    .map(|&d| index.get_document_embeddings(d).unwrap())
+                    .collect();
                 gemm_ms.push(time3(|| {
                     let s: f32 = dense
                         .par_iter()

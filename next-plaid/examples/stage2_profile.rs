@@ -222,6 +222,14 @@ fn main() {
         corpus.dim,
     );
     println!("params: SearchParameters::default() (n_ivf_probe=8, n_full_scores=4096)");
+    // Name the kernel that will actually run, and any ablation in force.
+    // A speedup credited to a code path that never executed is the easiest
+    // measurement error to make and the hardest to spot afterwards.
+    println!(
+        "asym kernel: {}   ablation: {:?}",
+        next_plaid::residual_lut::active_kernel_name(corpus.dim, true),
+        next_plaid::residual_lut::ablation(),
+    );
     let params = SearchParameters::default();
     let index_root = std::env::var("INDEX_ROOT").ok();
     let build_only = std::env::var("BUILD_ONLY").is_ok();

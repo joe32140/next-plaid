@@ -175,6 +175,15 @@ jobs:
         run: |
           cargo test --release -p next-plaid --lib residual_lut
           cargo test --release -p next-plaid --test residual_lut_integration
+      # Every ablation must produce IDENTICAL scores — otherwise its timing
+      # measures a different computation and the attribution below is void.
+      - name: parity under every ablation
+        run: |
+          for m in force_avx2 no_tr no_vfold row_major naive_transpose; do
+            echo "--- NP_ASYM_ABLATE=$m"
+            NP_ASYM_ABLATE=$m cargo test --release -p next-plaid --lib residual_lut
+            NP_ASYM_ABLATE=$m cargo test --release -p next-plaid --test residual_lut_integration
+          done
 
       # Cell index dirs are uniquely named (shapes-<dataset>-<n>docs_<tag>),
       # so all per-cell artifacts merge into one flat INDEX_ROOT.
@@ -193,6 +202,31 @@ jobs:
         run: NO_BUILD=1 INDEX_TAGS=r4,binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 4000
       - name: corpus ladder — fiqa 52k docs (~7.0M tokens)
         run: NO_BUILD=1 INDEX_TAGS=r4,binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 52000
+
+      # Component attribution: same binary, same cached indexes, same
+      # queries — one switch off at a time. Ordered so each row is the
+      # previous row plus one component, which is what makes the deltas
+      # attributable:
+      #   row_major       the kernel as it stood before this line of work
+      #   no_vfold        + centroid-major cdot layout
+      #   no_tr           + vectorized fold
+      #   (none)          + transpose-reduce epilogue   [production]
+      #   naive_transpose production kernel, unblocked cdot transpose
+      #   force_avx2      x86 only: production minus AVX-512 VNNI
+      # QUERIES=20 keeps 12 profile runs inside the job budget; this step
+      # exists for the ratios between its own rows, not for absolutes.
+      - name: ablation — component attribution (scifact + fiqa15k, r4)
+        run: |
+          for cell in scifact fiqa; do
+            cap=""
+            [ "$cell" = fiqa ] && cap=15000
+            for m in row_major no_vfold no_tr "" naive_transpose force_avx2; do
+              echo "===== cell=$cell ablation=${m:-none}"
+              NP_ASYM_ABLATE=$m QUERIES=20 NO_BUILD=1 INDEX_TAGS=r4 INDEX_ROOT=indexes \
+                ./target/release/examples/stage2_profile \
+                shapes next-plaid/examples/shapes/$cell $cap || true
+            done
+          done
 
       - name: bench (synthetic 500 docs x 180 tokens, dim 128)
         run: ./target/release/examples/maxsim_bench synth 500

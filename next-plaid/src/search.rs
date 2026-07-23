@@ -281,6 +281,14 @@ pub fn exact_score_docs(
 /// `BLK` contiguous floats and write `BLK` runs of `nq` contiguous floats,
 /// so each cache line is used fully instead of once.
 fn transpose_cdot(cdot: &Array2<f32>) -> Array2<f32> {
+    use crate::residual_lut::{ablation, Ablation};
+    match ablation() {
+        // Hand the kernels stage-1's matrix as-is; they gather from it.
+        Ablation::RowMajor => return cdot.clone(),
+        // The naive element-wise transpose this function replaced.
+        Ablation::NaiveTranspose => return cdot.t().as_standard_layout().into_owned(),
+        _ => {}
+    }
     const BLK: usize = 64;
     let (nq, k) = (cdot.nrows(), cdot.ncols());
     let src = cdot.as_standard_layout();
@@ -924,10 +932,24 @@ fn search_one_mmap_batched(
             .enumerate()
             .map(|(row, &c)| (c as i64, row as i64))
             .collect();
-        let mut compact = Array2::<f32>::zeros((ids.len(), num_query_tokens));
-        for (row, &c) in ids.iter().enumerate() {
-            compact.row_mut(row).assign(&sparse_scores[&c]);
-        }
+        // Centroid-major, matching the dense path — except under the
+        // row-major ablation, which reproduces the pre-work layout on both
+        // paths so the two stay comparable.
+        let compact = if crate::residual_lut::ablation()
+            == crate::residual_lut::Ablation::RowMajor
+        {
+            let mut c = Array2::<f32>::zeros((num_query_tokens, ids.len()));
+            for (col, &cid) in ids.iter().enumerate() {
+                c.column_mut(col).assign(&sparse_scores[&cid]);
+            }
+            c
+        } else {
+            let mut c = Array2::<f32>::zeros((ids.len(), num_query_tokens));
+            for (row, &cid) in ids.iter().enumerate() {
+                c.row_mut(row).assign(&sparse_scores[&cid]);
+            }
+            c
+        };
         Some((compact, remap))
     } else {
         None
@@ -1094,6 +1116,12 @@ mod transpose_tests {
     /// one block) and for K not a multiple of the block size.
     #[test]
     fn blocked_transpose_matches_naive() {
+        // `row_major` deliberately hands the matrix through untransposed,
+        // and `naive_transpose` selects the implementation this test is the
+        // reference for; both make the assertion below meaningless.
+        if crate::residual_lut::ablation() != crate::residual_lut::Ablation::Off {
+            return;
+        }
         for &nq in &[1usize, 3, 32] {
             for &k in &[1usize, 7, 64, 65, 200, 4096] {
                 let a = Array2::<f32>::from_shape_fn((nq, k), |(q, c)| (q * 7919 + c) as f32);

@@ -267,7 +267,12 @@ pub fn maxsim_residual_lut_scalar(
             for (qd, wd) in qrow.iter().zip(&w[..dim]) {
                 acc += *qd as i32 * *wd as i32;
             }
-            let score = (q8.scales[qi] * lut.scale * acc as f32 + cdot_t[[cid, qi]]) * inv;
+            let cdot_qt = if ablation() == Ablation::RowMajor {
+                cdot_t[[qi, cid]]
+            } else {
+                cdot_t[[cid, qi]]
+            };
+            let score = (q8.scales[qi] * lut.scale * acc as f32 + cdot_qt) * inv;
             if score > *best_q {
                 *best_q = score;
             }
@@ -302,12 +307,17 @@ pub fn maxsim_residual_lut_i8(
     // ndarray-indexed scalar path, never read out of bounds. One pass over
     // the doc's codes is noise next to the scoring work.
     let nq = q8.values.nrows();
+    let row_major = ablation() == Ablation::RowMajor;
     assert!(dim <= MAX_DIM, "dim {dim} exceeds MAX_DIM {MAX_DIM}");
-    assert_eq!(
-        cdot_t.ncols(),
-        nq,
-        "cdot_t must be centroid-major [num_centroids, n_query_tokens]"
-    );
+    if !row_major {
+        assert_eq!(
+            cdot_t.ncols(),
+            nq,
+            "cdot_t must be centroid-major [num_centroids, n_query_tokens]"
+        );
+    } else {
+        assert_eq!(cdot_t.nrows(), nq, "row-major ablation expects [nq, K]");
+    }
     assert_eq!(q8.scales.len(), nq, "QueryI8 scales/values row mismatch");
     assert_eq!(doc_packed.nrows(), doc_codes.len(), "packed rows != codes");
     assert_eq!(inv_norms.len(), doc_codes.len(), "inv_norms != codes");
@@ -316,7 +326,7 @@ pub fn maxsim_residual_lut_i8(
         "packed row too short for dim {dim} at {} keys/byte",
         lut.keys_per_byte
     );
-    let ncent = cdot_t.nrows() as u64;
+    let ncent = if row_major { cdot_t.ncols() } else { cdot_t.nrows() } as u64;
     for &c in doc_codes {
         // A negative i64 wraps to a huge u64 and fails the same check.
         assert!((c as u64) < ncent, "centroid id {c} out of range {ncent}");
@@ -346,6 +356,18 @@ pub fn maxsim_residual_lut_i8(
                 });
             }
             #[cfg(target_arch = "x86_64")]
+            if has_avx512_vnni() && ablation() != Ablation::ForceAvx2 {
+                return SCRATCH.with(|s| {
+                    let (best, accs) = &mut *s.borrow_mut();
+                    unsafe {
+                        avx512::maxsim_residual_lut_avx512(
+                            q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms,
+                            dim, best, accs,
+                        )
+                    }
+                });
+            }
+            #[cfg(target_arch = "x86_64")]
             if is_x86_feature_detected!("avx2") {
                 return SCRATCH.with(|s| {
                     let (best, accs) = &mut *s.borrow_mut();
@@ -362,11 +384,89 @@ pub fn maxsim_residual_lut_i8(
     maxsim_residual_lut_scalar(q8, doc_packed, doc_codes, cdot_t, lut, inv_norms, dim)
 }
 
-/// Per-thread kernel scratch (`best`, `accs`), reused across the ~1024
-/// per-candidate kernel calls of a search. Two heap allocations per doc
-/// were measurable against a ~2 µs kernel call; each rayon worker gets its
-/// own copy, and the kernels size-and-initialize it on entry, so no state
-/// leaks between calls.
+/// Does this CPU have the full AVX-512 set the fused kernel needs?
+#[cfg(target_arch = "x86_64")]
+fn has_avx512_vnni() -> bool {
+    is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("avx512vnni")
+}
+
+/// Which optimization is switched *off* for an ablation run.
+///
+/// Each component we added is measurable in isolation only if everything
+/// else is held fixed — same binary, same indexes, same queries — so the
+/// choice is a process-wide switch read once from `NP_ASYM_ABLATE` rather
+/// than a build flag or a separate commit. `Off` (unset) is production.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ablation {
+    /// Everything on (production default).
+    Off,
+    /// x86: take the AVX2 kernel even where AVX-512 VNNI exists.
+    ForceAvx2,
+    /// aarch64: per-row `vaddvq` + `fold_block` instead of the `vpaddq`
+    /// transpose-reduce — i.e. the state before the `tr` rung.
+    NoTr,
+    /// Scalar float epilogue (one row at a time), centroid-major layout —
+    /// i.e. before the vectorized fold.
+    NoVfold,
+    /// Scalar epilogue *and* stage-1's original `[nq, K]` row-major
+    /// matrix, so each (row, token) gathers a lone f32 `K` floats away —
+    /// the kernel exactly as it stood before this whole line of work.
+    RowMajor,
+    /// Production kernel, but the search transposes with ndarray's naive
+    /// element-wise copy instead of the cache-blocked one.
+    NaiveTranspose,
+}
+
+/// The ablation switch, parsed once. Unknown values are ignored (production
+/// behavior) rather than failing a benchmark run late.
+pub fn ablation() -> Ablation {
+    static A: std::sync::OnceLock<Ablation> = std::sync::OnceLock::new();
+    *A.get_or_init(|| match std::env::var("NP_ASYM_ABLATE").as_deref() {
+        Ok("force_avx2") => Ablation::ForceAvx2,
+        Ok("no_tr") => Ablation::NoTr,
+        Ok("no_vfold") => Ablation::NoVfold,
+        Ok("row_major") => Ablation::RowMajor,
+        Ok("naive_transpose") => Ablation::NaiveTranspose,
+        _ => Ablation::Off,
+    })
+}
+
+/// Name of the kernel this process will actually run, for benchmark output.
+/// A speedup attributed to a path that never executed is the easiest
+/// measurement error to make and the hardest to notice, so harnesses print
+/// this next to their numbers.
+pub fn active_kernel_name(dim: usize, nibble_ok: bool) -> &'static str {
+    if !nibble_ok || !dim.is_multiple_of(8) || dim > MAX_DIM {
+        return "scalar (no SIMD dispatch)";
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512_vnni() && ablation() != Ablation::ForceAvx2 {
+            return "avx512-vnni";
+        }
+        if is_x86_feature_detected!("avx2") {
+            return "avx2";
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return match ablation() {
+                Ablation::NoVfold | Ablation::RowMajor => "neon-sdot (scalar fold)",
+                Ablation::NoTr => "neon-sdot (vfold)",
+                _ => "neon-sdot (tr)",
+            };
+        }
+    }
+    "scalar"
+}
+
+// Per-thread kernel scratch (best, accs), reused across the ~1024
+// per-candidate kernel calls of a search. Each rayon worker gets its own
+// copy, and the kernels size-and-initialize it on entry, so no state
+// leaks between calls.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 thread_local! {
     static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<i32>)> =
@@ -487,7 +587,14 @@ mod neon {
         let d_all = doc_packed.as_slice().expect("doc bytes must be contiguous");
         let pb = doc_packed.ncols();
         let cd = cdot_t.as_slice().expect("cdot_t must be standard layout");
-        debug_assert_eq!(cdot_t.ncols(), nq);
+        let abl = ablation();
+        // Under the row-major ablation the caller hands us stage-1's
+        // [nq, K] matrix untransposed, so the centroid term is a lone f32
+        // K floats away from its neighbour — the access pattern this work
+        // replaced.
+        let row_major = abl == Ablation::RowMajor;
+        let k_stride = cdot_t.ncols();
+        debug_assert!(row_major || k_stride == nq);
         let sqw: &[f32] = &planes.sqw;
         best.clear();
         best.resize(nq, f32::NEG_INFINITY);
@@ -538,9 +645,10 @@ mod neon {
             }
             let cid = code as usize;
             let wp = w.as_ptr();
-            let crow = cd.as_ptr().add(cid * nq);
             let inv = inv_norms[t];
             // Per-row SDOT accumulation over the shared expanded weights.
+            // Identical in every ablation — only the epilogue below varies,
+            // which is what makes the comparison a clean attribution.
             // Partial tail chunks are exact: both sides zero-pad past dim.
             macro_rules! row_acc {
                 ($qi:expr) => {{
@@ -562,23 +670,57 @@ mod neon {
                     vaddq_s32(a, b)
                 }};
             }
-            let mut qi = 0usize;
-            while qi + 4 <= nq {
-                let v0 = row_acc!(qi);
-                let v1 = row_acc!(qi + 1);
-                let v2 = row_acc!(qi + 2);
-                let v3 = row_acc!(qi + 3);
-                // Pairwise tree -> [Σv0, Σv1, Σv2, Σv3] in one register.
-                let accv = vpaddq_s32(vpaddq_s32(v0, v1), vpaddq_s32(v2, v3));
-                fold4(accv, qi, sqw, crow, inv, best);
-                qi += 4;
-            }
-            if qi < nq {
-                let rem = nq - qi;
-                for r in 0..rem {
-                    accs[r] = vaddvq_s32(row_acc!(qi + r));
+            if row_major {
+                // Pre-work baseline: scalar epilogue, strided centroid gather.
+                for (qi, best_qi) in best.iter_mut().enumerate() {
+                    let acc = vaddvq_s32(row_acc!(qi));
+                    let s = (sqw[qi] * acc as f32 + *cd.as_ptr().add(qi * k_stride + cid)) * inv;
+                    if s > *best_qi {
+                        *best_qi = s;
+                    }
                 }
-                fold_block(&accs[..rem], &sqw[qi..], crow.add(qi), inv, &mut best[qi..]);
+                continue;
+            }
+            let crow = cd.as_ptr().add(cid * nq);
+            match abl {
+                Ablation::NoVfold => {
+                    // Contiguous centroid strip, but folded one row at a time.
+                    for (qi, best_qi) in best.iter_mut().enumerate() {
+                        let acc = vaddvq_s32(row_acc!(qi));
+                        let s = (sqw[qi] * acc as f32 + *crow.add(qi)) * inv;
+                        if s > *best_qi {
+                            *best_qi = s;
+                        }
+                    }
+                }
+                Ablation::NoTr => {
+                    // Vectorized fold, but each row still horizontally
+                    // reduced into the scratch first.
+                    for (qi, acc_qi) in accs.iter_mut().enumerate() {
+                        *acc_qi = vaddvq_s32(row_acc!(qi));
+                    }
+                    fold_block(accs, sqw, crow, inv, best);
+                }
+                _ => {
+                    let mut qi = 0usize;
+                    while qi + 4 <= nq {
+                        let v0 = row_acc!(qi);
+                        let v1 = row_acc!(qi + 1);
+                        let v2 = row_acc!(qi + 2);
+                        let v3 = row_acc!(qi + 3);
+                        // Pairwise tree -> [Σv0, Σv1, Σv2, Σv3] in one register.
+                        let accv = vpaddq_s32(vpaddq_s32(v0, v1), vpaddq_s32(v2, v3));
+                        fold4(accv, qi, sqw, crow, inv, best);
+                        qi += 4;
+                    }
+                    if qi < nq {
+                        let rem = nq - qi;
+                        for r in 0..rem {
+                            accs[r] = vaddvq_s32(row_acc!(qi + r));
+                        }
+                        fold_block(&accs[..rem], &sqw[qi..], crow.add(qi), inv, &mut best[qi..]);
+                    }
+                }
             }
         }
         best.iter().sum()
@@ -661,7 +803,13 @@ mod avx2 {
         let d_all = doc_packed.as_slice().expect("doc bytes must be contiguous");
         let pb = doc_packed.ncols();
         let cd = cdot_t.as_slice().expect("cdot_t must be standard layout");
-        debug_assert_eq!(cdot_t.ncols(), nq);
+        let abl = ablation();
+        // Row-major ablation: the caller passes stage-1's [nq, K] matrix
+        // untransposed, so each (row, token) gathers one f32 from K floats
+        // away — the pre-work access pattern.
+        let row_major = abl == Ablation::RowMajor;
+        let k_stride = cdot_t.ncols();
+        debug_assert!(row_major || k_stride == nq);
         let sqw: &[f32] = &planes.sqw;
         best.clear();
         best.resize(nq, f32::NEG_INFINITY);
@@ -735,11 +883,215 @@ mod avx2 {
                 let s32 = _mm_add_epi32(s64, _mm_srli_si128(s64, 4));
                 *acc_qi = _mm_cvtsi128_si32(s32);
             }
-            fold_block(accs, sqw, cd.as_ptr().add(cid * nq), inv_norms[t], best);
+            // The integer accumulators above are identical in every
+            // ablation; only this epilogue differs.
+            let inv = inv_norms[t];
+            if row_major {
+                for (qi, best_qi) in best.iter_mut().enumerate() {
+                    let s = (sqw[qi] * accs[qi] as f32
+                        + *cd.as_ptr().add(qi * k_stride + cid))
+                        * inv;
+                    if s > *best_qi {
+                        *best_qi = s;
+                    }
+                }
+            } else if abl == Ablation::NoVfold {
+                let crow = cd.as_ptr().add(cid * nq);
+                for (qi, best_qi) in best.iter_mut().enumerate() {
+                    let s = (sqw[qi] * accs[qi] as f32 + *crow.add(qi)) * inv;
+                    if s > *best_qi {
+                        *best_qi = s;
+                    }
+                }
+            } else {
+                fold_block(accs, sqw, cd.as_ptr().add(cid * nq), inv, best);
+            }
         }
         best.iter().sum()
     }
 }
+
+/// AVX-512 + VNNI path for the fused asym kernel.
+///
+/// The expand stays 128-bit `pshufb` (it is charged once per doc token and
+/// amortized over every query row); what moves to 512 bits is the part
+/// charged per *(query row, token)* — ~32× more often — plus the fold.
+///
+/// The dot uses `vpdpbusd`, one µop for what AVX2 spends `maddubs` +
+/// `madd` on, over 64 lanes instead of 32. `vpdpbusd` wants
+/// unsigned × signed, so we feed it `|w|` (unsigned, ≤ 127 by the
+/// quantizer's clamp) against `sign(w)·q`. There is no 512-bit `vpsignb`,
+/// so the sign is applied with a mask: `movepi8_mask` extracts w's sign
+/// bits and `mask_sub_epi8` negates exactly those query lanes. Lanes where
+/// `w == 0` need no special handling — `|w| = 0` zeroes the product
+/// whatever the other operand is — and `-128` never occurs on either side
+/// (both are clamped to ±127 at quantization), so the negation is exact.
+#[cfg(target_arch = "x86_64")]
+mod avx512 {
+    use super::*;
+    use std::arch::x86_64::*;
+
+    /// 16-wide fold; same op order as the NEON/AVX2 twins, hence
+    /// bit-identical (see [`super::neon::fold_block`] for the argument).
+    #[inline(always)]
+    unsafe fn fold_block(accs: &[i32], sqw: &[f32], crow: *const f32, inv: f32, best: &mut [f32]) {
+        let nq = accs.len();
+        let invv = _mm512_set1_ps(inv);
+        let mut i = 0usize;
+        while i + 16 <= nq {
+            let a = _mm512_cvtepi32_ps(_mm512_loadu_si512(accs.as_ptr().add(i) as *const _));
+            let s = _mm512_mul_ps(
+                _mm512_add_ps(
+                    _mm512_mul_ps(_mm512_loadu_ps(sqw.as_ptr().add(i)), a),
+                    _mm512_loadu_ps(crow.add(i)),
+                ),
+                invv,
+            );
+            let b = _mm512_loadu_ps(best.as_ptr().add(i));
+            _mm512_storeu_ps(best.as_mut_ptr().add(i), _mm512_max_ps(b, s));
+            i += 16;
+        }
+        while i < nq {
+            let s = (sqw[i] * accs[i] as f32 + *crow.add(i)) * inv;
+            if s > best[i] {
+                best[i] = s;
+            }
+            i += 1;
+        }
+    }
+
+    /// # Safety
+    /// Requires `avx512f,avx512bw,avx512vnni`; `dim % 8 == 0 && dim <= MAX_DIM`.
+    /// Reads 64-byte chunks of the query planes, whose stride is a multiple
+    /// of 64 ([`crate::binary::padded_stride`]), and of the `[i8; MAX_DIM]`
+    /// expansion buffer, which `dim <= 256` keeps in bounds.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn maxsim_residual_lut_avx512(
+        q8: &QueryI8,
+        planes: &QueryPlanes,
+        doc_packed: &ArrayView2<u8>,
+        doc_codes: &[i64],
+        cdot_t: &ArrayView2<f32>,
+        lut: &ResidualLut,
+        nib: &NibbleLut,
+        inv_norms: &[f32],
+        dim: usize,
+        best: &mut Vec<f32>,
+        accs: &mut Vec<i32>,
+    ) -> f32 {
+        let nq = q8.values.nrows();
+        if nq == 0 || doc_packed.nrows() == 0 {
+            return 0.0;
+        }
+        let kpb = lut.keys_per_byte;
+        let pdim = dim / kpb;
+        let ps = planes.stride;
+        let qp_base = planes.data.as_ptr();
+        let d_all = doc_packed.as_slice().expect("doc bytes must be contiguous");
+        let pb = doc_packed.ncols();
+        let cd = cdot_t.as_slice().expect("cdot_t must be standard layout");
+        let abl = ablation();
+        // Row-major ablation: the caller passes stage-1's [nq, K] matrix
+        // untransposed, so each (row, token) gathers one f32 from K floats
+        // away — the pre-work access pattern.
+        let row_major = abl == Ablation::RowMajor;
+        let k_stride = cdot_t.ncols();
+        debug_assert!(row_major || k_stride == nq);
+        let sqw: &[f32] = &planes.sqw;
+        best.clear();
+        best.resize(nq, f32::NEG_INFINITY);
+        accs.clear();
+        accs.resize(nq, 0);
+        let mut w = [0i8; MAX_DIM];
+        let mut tabs = [_mm_setzero_si128(); 8];
+        for k in 0..kpb {
+            tabs[k] = _mm_loadu_si128(nib.tables[k].as_ptr() as *const __m128i);
+        }
+        let low_mask = _mm_set1_epi8(0x0F);
+        let zero = _mm512_setzero_si512();
+
+        for (t, &code) in doc_codes.iter().enumerate() {
+            let row = &d_all[t * pb..t * pb + pb];
+            let wp = w.as_mut_ptr();
+            let mut i = 0usize;
+            while i + 16 <= pdim {
+                let v = _mm_loadu_si128(row.as_ptr().add(i) as *const __m128i);
+                let hi = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
+                let lo = _mm_and_si128(v, low_mask);
+                for k in 0..kpb {
+                    let idx = if nib.from_hi[k] { hi } else { lo };
+                    _mm_storeu_si128(
+                        wp.add(k * pdim + i) as *mut __m128i,
+                        _mm_shuffle_epi8(tabs[k], idx),
+                    );
+                }
+                i += 16;
+            }
+            if i < pdim {
+                let rem = pdim - i;
+                let mut src = [0u8; 16];
+                src[..rem].copy_from_slice(&row[i..pdim]);
+                let v = _mm_loadu_si128(src.as_ptr() as *const __m128i);
+                let hi = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
+                let lo = _mm_and_si128(v, low_mask);
+                let mut dst = [0i8; 16];
+                for k in 0..kpb {
+                    let idx = if nib.from_hi[k] { hi } else { lo };
+                    _mm_storeu_si128(
+                        dst.as_mut_ptr() as *mut __m128i,
+                        _mm_shuffle_epi8(tabs[k], idx),
+                    );
+                    w[k * pdim + i..k * pdim + pdim].copy_from_slice(&dst[..rem]);
+                }
+            }
+            let cid = code as usize;
+            let wp = w.as_ptr();
+            for (qi, acc_qi) in accs.iter_mut().enumerate() {
+                let qp = qp_base.add(qi * ps);
+                let mut acc = zero;
+                let mut k = 0usize;
+                // Both sides zero-pad past dim, so a trailing partial
+                // 64-lane chunk contributes exactly zero.
+                while k < dim {
+                    let qv = _mm512_loadu_si512(qp.add(k) as *const _);
+                    let wv = _mm512_loadu_si512(wp.add(k) as *const _);
+                    let mag = _mm512_abs_epi8(wv);
+                    let neg = _mm512_movepi8_mask(wv);
+                    let sq = _mm512_mask_sub_epi8(qv, neg, zero, qv);
+                    acc = _mm512_dpbusd_epi32(acc, mag, sq);
+                    k += 64;
+                }
+                *acc_qi = _mm512_reduce_add_epi32(acc);
+            }
+            // The integer accumulators above are identical in every
+            // ablation; only this epilogue differs.
+            let inv = inv_norms[t];
+            if row_major {
+                for (qi, best_qi) in best.iter_mut().enumerate() {
+                    let s = (sqw[qi] * accs[qi] as f32
+                        + *cd.as_ptr().add(qi * k_stride + cid))
+                        * inv;
+                    if s > *best_qi {
+                        *best_qi = s;
+                    }
+                }
+            } else if abl == Ablation::NoVfold {
+                let crow = cd.as_ptr().add(cid * nq);
+                for (qi, best_qi) in best.iter_mut().enumerate() {
+                    let s = (sqw[qi] * accs[qi] as f32 + *crow.add(qi)) * inv;
+                    if s > *best_qi {
+                        *best_qi = s;
+                    }
+                }
+            } else {
+                fold_block(accs, sqw, cd.as_ptr().add(cid * nq), inv, best);
+            }
+        }
+        best.iter().sum()
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -747,6 +1099,26 @@ mod tests {
     use ndarray::{Array1, Array2};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+
+    /// Put a `[num_centroids, nq]` centroid-score matrix into whichever
+    /// orientation the active ablation expects, so the semantics tests below
+    /// are about decoding, not layout.
+    fn orient(cd: Array2<f32>) -> Array2<f32> {
+        if ablation() == Ablation::RowMajor {
+            cd.t().as_standard_layout().into_owned()
+        } else {
+            cd
+        }
+    }
+
+    /// Read `(centroid, query row)` from a matrix produced by [`orient`].
+    fn cd_at(cd: &Array2<f32>, cid: usize, qi: usize) -> f32 {
+        if ablation() == Ablation::RowMajor {
+            cd[[qi, cid]]
+        } else {
+            cd[[cid, qi]]
+        }
+    }
 
     /// Build a small residual codec with synthetic centroids and quantile
     /// buckets, mirroring the training in `index.rs`.
@@ -873,7 +1245,17 @@ mod tests {
                     let res = Array2::from_shape_fn((13, dim), |_| rng.gen_range(-0.4f32..0.4));
                     let packed = codec.quantize_residuals(&res).unwrap();
                     let codes: Vec<i64> = (0..13).map(|_| rng.gen_range(0..k as i64)).collect();
-                    let cdot_t = Array2::from_shape_fn((k, nq), |_| rng.gen_range(-1.0f32..1.0));
+                    // Build the centroid matrix in whichever orientation the
+                    // active ablation expects, so `NP_ASYM_ABLATE=<mode>
+                    // cargo test` proves bit-exactness for every mode we
+                    // benchmark — an ablation that silently changed results
+                    // would make its timing meaningless.
+                    let shape = if ablation() == Ablation::RowMajor {
+                        (nq, k)
+                    } else {
+                        (k, nq)
+                    };
+                    let cdot_t = Array2::from_shape_fn(shape, |_| rng.gen_range(-1.0f32..1.0));
                     let inv: Vec<f32> = (0..13).map(|_| rng.gen_range(0.5f32..1.5)).collect();
 
                 let scalar = maxsim_residual_lut_scalar(
@@ -951,7 +1333,7 @@ mod tests {
                 let packed = codec.quantize_residuals(&res).unwrap();
                 let codes: Vec<i64> = (0..9).map(|_| rng.gen_range(0..k as i64)).collect();
                 let cents = Array2::from_shape_fn((k, dim), |(i, d)| codec.centroids.row(i)[d]);
-                let cdot_t = cents.dot(&query.t());
+                let cdot_t = orient(cents.dot(&query.t()));
                 let inv = compute_inv_norms(&codec, &codes, &packed.view()).unwrap();
                 let planes = build_query_planes(&q8, &lut, dim);
 
@@ -1017,7 +1399,7 @@ mod tests {
                 let res = Array2::from_shape_fn((9, dim), |_| rng.gen_range(-0.4f32..0.4));
                 let packed = codec.quantize_residuals(&res).unwrap();
                 let codes: Vec<i64> = (0..9).map(|_| rng.gen_range(0..k as i64)).collect();
-                let cdot_t = Array2::from_shape_fn((k, 6), |_| rng.gen_range(-1.0f32..1.0));
+                let cdot_t = orient(Array2::from_shape_fn((k, 6), |_| rng.gen_range(-1.0f32..1.0)));
                 let inv: Vec<f32> = (0..9).map(|_| rng.gen_range(0.5f32..1.5)).collect();
                 let planes = build_query_planes(&q8, &lut, dim);
 
@@ -1050,7 +1432,7 @@ mod tests {
                             }
                         }
                         let s = (q8.scales[qi] as f64 * lut.scale as f64 * acc as f64
-                            + cdot_t[[codes[t] as usize, qi]] as f64)
+                            + cd_at(&cdot_t, codes[t] as usize, qi) as f64)
                             * inv[t] as f64;
                         best = best.max(s);
                     }

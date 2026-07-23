@@ -86,13 +86,82 @@ next real win is stage-1, not stage-2.**
 
 ## 5. Component attribution
 
-<!--ABLATION-->
+`NP_ASYM_ABLATE` switches off exactly one component per run — same binary,
+same cached indexes, same queries — and the bit-exactness suite runs under
+every mode, so an ablation cannot quietly change the computation it is
+timing. Each row below adds one component to the row above it.
+
+### Apple M4 (native arm64, idle machine, r4, exact-kernel ms)
+
+| ablation | scifact | fiqa-15k | this row adds | gain |
+|---|---:|---:|---|---|
+| `row_major` | 3.499 | 3.283 | *(the kernel before this work)* | baseline |
+| `no_vfold` | 2.863 | 2.605 | centroid-major cdot layout | **1.22× / 1.26×** |
+| `no_tr` | 3.583 | 3.150 | vectorized fold | **0.80× / 0.83×** ⚠ |
+| *(production)* | 2.730 | 2.679 | transpose-reduce | 1.31× / 1.18× |
+| | | | **total** | **1.28× / 1.23×** |
+
+Three findings, none of which I predicted correctly:
+
+1. **The memory layout did the work.** Making a token's centroid scores
+   contiguous across query rows — not any epilogue vectorisation — is where
+   the gain lives.
+2. **The vectorised fold alone is a *regression* on M4** (0.80×, reproduced
+   in 2 further repeats: 2.69/2.99 scalar vs 3.43/3.69 vfold). Writing each
+   row's accumulator to a scratch and reading it back costs more than
+   folding four rows at once saves.
+3. **`vfold` + `tr` together ≈ scalar fold + good layout** (2.73 vs 2.86,
+   and 2.68 vs 2.61 — a wash). The two epilogue rungs are worth roughly
+   nothing on Apple silicon once the layout is right.
+
+The honest reading: I imported two optimisations from a sibling project
+where they were measured to pay, and on this kernel shape they did not —
+while the unglamorous change I made *in passing* to enable them (the
+layout) was the entire win.
+
+### Transpose implementation
+
+Making the centroid term contiguous requires transposing stage-1's matrix
+once per query. How that transpose is written matters enormously, and
+differently per platform:
+
+| | M4 (prep µs) | x86 (prep) |
+|---|---:|---|
+| blocked (production) | 146–157 | µs-scale |
+| naive `as_standard_layout` | 184–195 | **2–16 ms** |
+| penalty | ~40 µs | up to ~100× worse |
+
+Same code, wildly different penalty: Apple's memory system absorbs the
+strided access that x86's TLB does not. A benchmark on one machine would
+have mis-ranked this change completely.
 
 ---
 
 ## 6. Platform coverage
 
-<!--PLATFORM-->
+| CPU | binary kernel | asym kernel | status |
+|---|---|---|---|
+| x86 AVX2 | AVX2 SAD | `pshufb` + `maddubs` | shipped, CI-verified |
+| x86 AVX-512 VNNI | `vpdpbusd` | **`vpdpbusd` + 16-wide fold (new)** | see §6.1 |
+| aarch64 (Neoverse) | SDOT | `tbl` + SDOT + tr | shipped, CI-verified |
+| Apple M-series | SDOT | `tbl` + SDOT + tr | shipped, verified natively |
+
+### 6.1 AVX-512 bridge
+
+The residual-LUT path had no AVX-512 kernel (the binary path already had
+one). The new kernel keeps the expand at 128-bit `pshufb` — it is charged
+once per doc token and amortised over every query row — and moves the part
+charged per *(query row, token)*, ~32× more often, to 64-lane `vpdpbusd`
+plus a 16-wide fold.
+
+`vpdpbusd` multiplies unsigned × signed, so it gets `|w|` against
+`sign(w)·q`. There is no 512-bit `vpsignb`, so the sign is applied with a
+mask (`movepi8_mask` + `mask_sub_epi8`). Two things make this exact: lanes
+where `w == 0` need no handling because `|w| = 0` zeroes the product
+regardless, and `-128` never occurs on either side (both clamp to ±127 at
+quantisation), so the negation cannot overflow.
+
+<!--AVX512-STATUS-->
 
 ---
 

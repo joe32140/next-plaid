@@ -6,6 +6,82 @@ order, with the evidence for each step. Companion docs:
 [scaling-1b-docs.md](scaling-1b-docs.md) (1B-doc analysis),
 nano-plaid `docs/class4.html` (the kernel story + port epilogue).
 
+### 2026-07-23 (night) — the clean CR, and what its CI gates caught
+
+Overnight goal: fold the ablation results into class 4, and shape the LUT
+work into a clean CR stacked on #155. This branch
+(`feat/asymmetric-lut-residual`) stays frozen as the research record —
+notes/, scripts/, the bench workflow, the ablation harness, all of it. The
+CR is a new branch built from it.
+
+**The CR: `feat/asymmetric-residual-lut`** (fork, stacked directly on
+`feat/asymmetric-binary-quant` = #155, which it is 0 commits behind).
+Two commits, 6 files, +1,814/−59 — down from the research branch's 62
+commits and +5,959:
+
+- **In**: `residual_lut.rs` (scalar + NEON/AVX2/AVX-512 kernels + parity
+  and semantics tests), `search.rs` integration (`residual_asym` flag,
+  blocked transpose, batched-path compact matrix), `index.rs` inv-norms
+  cache, `lib.rs`/`binary.rs` glue, the 4 integration tests.
+- **Out**: examples (stage2_profile, maxsim_bench, binary_ndcg), shape
+  manifests, maxsim-bench.yml, notes/, scripts/ — measurement harness,
+  not product. Precedent: #155 itself dropped its kernel_bench example
+  before review.
+- **Out, deliberately: the whole `NP_ASYM_ABLATE` machinery.** Reasons:
+  (1) the `row_major` mode makes a *public function's matrix orientation*
+  depend on an env var — a library footgun no reviewer should accept;
+  (2) its testing job is done better without it — the parity suite now
+  calls each arch kernel *directly* (so AVX2 is covered even on VNNI
+  hardware, where the old ForceAvx2 escape hatch was needed) plus the
+  dispatcher; (3) attribution is a research question, answered, archived
+  here. The ablation stays fully reproducible on this branch.
+- Kept: `active_kernel_name()` (the print-what-you-dispatch lesson,
+  20 lines), the AVX-512 kernel (feature-gated, honest not-executed-on-CI
+  status; #155 ships AVX-512 too), all hard asserts.
+- Also fixed while porting: `transpose_cdot`'s doc comment still carried
+  the *retracted* "2–16 ms, half the kernel win" transpose claim — now
+  states the controlled numbers (~0.3–0.4 ms x86, ~40 µs M4). A retracted
+  number almost shipped in a doc comment; grep your docs when you retract.
+- `stage1_shortlist` demoted pub → pub(crate) (its `pub` only served the
+  profiler); `exact_score_docs{,_prepared,_prepared_t}` and
+  `cdot_to_kernel_layout` exist only for harnesses → not in the CR.
+
+**What the CI gates caught (the night's real finding).** `ci.yml` only
+triggers on PRs targeting main — fork-branch pushes never ran it. So all
+week, "CI green" meant the test + bench workflows, *never* the clippy/doc
+gates the upstream PR will face. Exercised them three ways: clippy on
+native arm64, clippy on `--target x86_64-apple-darwin` (the runner's
+view), and a fork-internal draft PR (joe32140#3, base=fork main) that
+runs the real ci.yml. Caught and fixed, all of which would have failed
+the upstream PR at `-D warnings`:
+
+1. `clippy::large_enum_variant` on `ScoreQuery` (392 B) — boxed the LUT.
+2. 4× `needless_range_loop` in the avx2/avx512 expand/init loops +
+   1 in neon (x86 clippy sees the modules local clippy can't) —
+   iterator forms.
+3. `too_many_arguments` on the safe dispatcher — allowed, as the kernels
+   already do.
+4. 2× `rustdoc::private_intra_doc_links` (public docs linking private
+   `derive_nibble_lut`, `padded_stride`) — caught only by the draft PR's
+   Documentation job; local repro added via `RUSTDOCFLAGS="-D warnings"
+   cargo doc --no-deps`.
+
+Validation: 146 lib + 4 integration tests pass natively (arm64-verified
+binary); clippy clean on both targets; rustdoc clean; fork PR #3 runs the
+full matrix. The upstream PR against lightonai:main is *not* opened —
+stacked on an unmerged #155 it would show both diffs; the body is ready
+in [lut-cr-pr-body.md](lut-cr-pr-body.md) for when #155 lands (Joe's
+call).
+
+**Class 4 updated** (nano-plaid 5b537f6): the port epilogue gains "The
+ablation: who actually earned the speedup" — the per-CPU attribution
+table, the three findings (layout dominant everywhere; the fold's sign
+flips with microarchitecture and tr's real job is repairing the M4
+regression; chapter 09's 2.1× did not transfer to the runtime-dim shape —
+"an optimization's value moves to a new kernel shape as a hypothesis, not
+as a number"), and the two harness lessons (route benchmarks through the
+measured layout policy; an inert ablation is a free noise floor).
+
 ### 2026-07-23 — ablation: what each component actually contributed (M4)
 
 Built `NP_ASYM_ABLATE`, which switches off exactly one component per run in

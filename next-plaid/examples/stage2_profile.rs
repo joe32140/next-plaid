@@ -62,7 +62,8 @@ use ndarray::{s, Array1, Array2};
 use ndarray_npy::ReadNpyExt;
 use next_plaid::index::MmapIndex;
 use next_plaid::search::{
-    exact_score_docs_prepared, search_one_mmap, stage1_shortlist, SearchParameters,
+    exact_score_docs_prepared, exact_score_docs_prepared_t, search_one_mmap, stage1_shortlist,
+    SearchParameters,
 };
 use next_plaid::IndexConfig;
 
@@ -353,11 +354,19 @@ fn main() {
             let mut prep_ms = Vec::new();
             let mut exact_ms = Vec::new();
             for (q, (cdot, ids)) in queries.iter().zip(&shortlists) {
+                // The prep row includes the [nq, K] -> [K, nq] transpose the
+                // asym path pays once per query in production; the exact row
+                // must NOT re-pay it (a K-dependent cost the float column
+                // never sees), so the exact timing gets the pre-transposed
+                // matrix and times scoring only.
                 prep_ms.push(time3(|| {
                     std::hint::black_box(exact_score_docs_prepared(&index, q, cdot, &[], asym));
                 }));
+                let cdot_t = cdot.t().as_standard_layout().into_owned();
                 exact_ms.push(time3(|| {
-                    std::hint::black_box(exact_score_docs_prepared(&index, q, cdot, ids, asym));
+                    std::hint::black_box(exact_score_docs_prepared_t(
+                        &index, q, &cdot_t, ids, asym,
+                    ));
                 }));
             }
             // The whole pipeline through the public API (stage-1 + prep +

@@ -228,8 +228,8 @@ pub fn maxsim_residual_lut_scalar(
     inv_norms: &[f32],
     dim: usize,
 ) -> f32 {
-    debug_assert!(dim <= MAX_DIM);
-    debug_assert_eq!(doc_packed.nrows(), doc_codes.len());
+    assert!(dim <= MAX_DIM, "dim {dim} exceeds MAX_DIM {MAX_DIM}");
+    assert_eq!(doc_packed.nrows(), doc_codes.len());
     let nq = q8.values.nrows();
     if nq == 0 || doc_packed.nrows() == 0 {
         return 0.0;
@@ -289,6 +289,37 @@ pub fn maxsim_residual_lut_i8(
     inv_norms: &[f32],
     dim: usize,
 ) -> f32 {
+    // This is a safe public entry over kernels that do raw pointer loads, so
+    // every precondition the SIMD paths rely on is a hard assert here — a
+    // shape mismatch or out-of-range centroid id must panic like the
+    // ndarray-indexed scalar path, never read out of bounds. One pass over
+    // the doc's codes is noise next to the scoring work.
+    let nq = q8.values.nrows();
+    assert!(dim <= MAX_DIM, "dim {dim} exceeds MAX_DIM {MAX_DIM}");
+    assert_eq!(
+        cdot_t.ncols(),
+        nq,
+        "cdot_t must be centroid-major [num_centroids, n_query_tokens]"
+    );
+    assert_eq!(q8.scales.len(), nq, "QueryI8 scales/values row mismatch");
+    assert_eq!(doc_packed.nrows(), doc_codes.len(), "packed rows != codes");
+    assert_eq!(inv_norms.len(), doc_codes.len(), "inv_norms != codes");
+    assert!(
+        doc_packed.ncols() >= dim.div_ceil(lut.keys_per_byte),
+        "packed row too short for dim {dim} at {} keys/byte",
+        lut.keys_per_byte
+    );
+    let ncent = cdot_t.nrows() as u64;
+    for &c in doc_codes {
+        // A negative i64 wraps to a huge u64 and fails the same check.
+        assert!((c as u64) < ncent, "centroid id {c} out of range {ncent}");
+    }
+    if let Some(p) = planes {
+        assert!(
+            p.stride >= dim && p.data.len() >= nq * p.stride,
+            "QueryPlanes too small for nq {nq} x dim {dim}"
+        );
+    }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let _ = planes;
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -735,20 +766,25 @@ mod tests {
             return;
         }
         let mut rng = StdRng::seed_from_u64(23);
-        for &nbits in &[1usize, 2, 4] {
-            for &dim in &[8usize, 16, 40, 48, 128, 200, 256] {
-                let k = 12;
-                let codec = toy_codec(dim, nbits, k, &mut rng);
-                let lut = quantize_lut(&codec).unwrap();
-                let nib = lut.nibble.as_ref().expect("nibble tables");
-                let query = Array2::from_shape_fn((7, dim), |_| rng.gen_range(-1.0f32..1.0));
-                let q8 = crate::binary::quantize_query_i8(&query.view());
-                let planes = build_query_planes(&q8, lut.keys_per_byte, dim);
-                let res = Array2::from_shape_fn((13, dim), |_| rng.gen_range(-0.4f32..0.4));
-                let packed = codec.quantize_residuals(&res).unwrap();
-                let codes: Vec<i64> = (0..13).map(|_| rng.gen_range(0..k as i64)).collect();
-                let cdot_t = Array2::from_shape_fn((k, 7), |_| rng.gen_range(-1.0f32..1.0));
-                let inv: Vec<f32> = (0..13).map(|_| rng.gen_range(0.5f32..1.5)).collect();
+        // nq values chosen to exercise every fold_block branch: 3 = pure
+        // scalar tail, 7 = one NEON vector iter + tail (AVX2 tail-only),
+        // 8 = exactly one AVX2 vector iter, 9 = vector iter(s) + 1-lane
+        // tail on both ISAs, 32 = the production query shape, vector-only.
+        for &nq in &[3usize, 7, 8, 9, 32] {
+            for &nbits in &[1usize, 2, 4] {
+                for &dim in &[8usize, 16, 40, 48, 128, 200, 256] {
+                    let k = 12;
+                    let codec = toy_codec(dim, nbits, k, &mut rng);
+                    let lut = quantize_lut(&codec).unwrap();
+                    let nib = lut.nibble.as_ref().expect("nibble tables");
+                    let query = Array2::from_shape_fn((nq, dim), |_| rng.gen_range(-1.0f32..1.0));
+                    let q8 = crate::binary::quantize_query_i8(&query.view());
+                    let planes = build_query_planes(&q8, lut.keys_per_byte, dim);
+                    let res = Array2::from_shape_fn((13, dim), |_| rng.gen_range(-0.4f32..0.4));
+                    let packed = codec.quantize_residuals(&res).unwrap();
+                    let codes: Vec<i64> = (0..13).map(|_| rng.gen_range(0..k as i64)).collect();
+                    let cdot_t = Array2::from_shape_fn((k, nq), |_| rng.gen_range(-1.0f32..1.0));
+                    let inv: Vec<f32> = (0..13).map(|_| rng.gen_range(0.5f32..1.5)).collect();
 
                 let scalar = maxsim_residual_lut_scalar(
                     &q8,
@@ -787,11 +823,12 @@ mod tests {
                         dim,
                     )
                 };
-                assert_eq!(
-                    scalar.to_bits(),
-                    simd.to_bits(),
-                    "nbits={nbits} dim={dim}: scalar {scalar} != simd {simd}"
-                );
+                    assert_eq!(
+                        scalar.to_bits(),
+                        simd.to_bits(),
+                        "nq={nq} nbits={nbits} dim={dim}: scalar {scalar} != simd {simd}"
+                    );
+                }
             }
         }
     }

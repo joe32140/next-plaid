@@ -177,9 +177,23 @@ fn main() {
                 (2, false) => "r2",
                 _ => "r1",
             };
+            // The cache identity must include the value SOURCE, not just the
+            // shape: a real-bundle run with the same (n_docs, tokens) as a
+            // cached synthetic index must never silently load LCG values.
+            // Synth mode keeps the exact naming of stage2_profile's CI
+            // artifacts (that cross-tool bit-identity is the cache's point).
             let cache_dir = std::env::var("INDEX_ROOT").ok().map(|root| {
+                let src = if arg1 == "synth" {
+                    "synth".to_string()
+                } else {
+                    let stem = PathBuf::from(&arg1)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "bundle".into());
+                    format!("bundle-{stem}")
+                };
                 PathBuf::from(root).join(format!(
-                    "synth-{}x{}_{tag}",
+                    "{src}-{}x{}_{tag}",
                     docs.len(),
                     docs[0].nrows()
                 ))

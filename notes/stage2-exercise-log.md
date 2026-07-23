@@ -215,6 +215,59 @@ Overnight #28 re-armed afterwards; it now measures the post-vfold tree,
 which is what the final table should carry anyway (CI run 29960245502
 remains the pre-vfold reference point for the asym columns).
 
+### 2026-07-22 — pre-close implementation review (user: "check the implementation before we close our LUT direction")
+
+Three parallel review angles (kernel line-scan, integration line-scan,
+measurement-harness validity; a conventions pass returned clean), each
+candidate verified against source. 13 findings, all confirmed. Fixed
+immediately (same evening, before the overnight run):
+
+1. **inv-norms OnceLock deadlock** (index.rs) — the initializer ran a
+   global-pool `par_iter` inside `get_or_init` while being reachable from
+   inside rayon workers; work-stealing during its joins could re-enter the
+   OnceLock on the initializing thread → permanent hang under concurrent
+   API load on a cold index. Fix: the compute now runs on a dedicated
+   one-shot pool, so it depends on no global-pool worker.
+2. **Kernel API soundness** (residual_lut.rs) — the vfold commit had
+   downgraded out-of-range centroid ids from a clean panic (slice index)
+   to raw-pointer OOB reads (UB) from a safe pub fn, and shape mismatches
+   (packed width, planes size, scales len, old [nq,K] orientation, dim >
+   256) were unchecked or debug-only. Fix: one hard-assert validation
+   block in the dispatcher (a pass over ~130 codes/doc — noise), scalar
+   path's debug_asserts promoted.
+3. **AVX2 fold had zero bit-exact coverage** — parity tests used nq=7/6,
+   so the 8-wide vector fold body never executed under `to_bits` equality
+   (NEON's 4-wide did). Fix: the parity test now sweeps
+   nq ∈ {3,7,8,9,32}, covering both vector bodies and both tails.
+4. **Profiler exact-phase contamination** (stage2_profile) — since the
+   vfold commit, the timed exact region re-paid the [nq,K]→[K,nq]
+   transpose (K-dependent, ~4 MB/call at 52k) already counted in prep,
+   inflating asym exact columns and skewing the in-flight pre/post-vfold
+   A/B *against* vfold at tall rungs. Fix: new `exact_score_docs_prepared_t`
+   takes the pre-transposed matrix; the profiler transposes per query
+   outside the timer (prep row still charges it — production pays it).
+5. **Bundle/synth cache collision** (maxsim_bench) — INDEX_ROOT dirs were
+   named `synth-{n}x{t}_{tag}` even for real-embedding bundles, so the
+   planned real-data 786 row would have silently mmap'd synthetic-LCG
+   indexes. Fix: bundle mode now prefixes `bundle-{stem}-`; synth naming
+   untouched (CI-artifact bit-identity depends on it).
+6. **Stale `residual_asym` doc** — still claimed "ignored on the
+   batched-centroid path" post-#34. Fixed.
+
+Deferred, deliberately (documented so they aren't forgotten):
+- **CI cache-key hardening** — keys carry no builder-code fingerprint
+  (`stage2-idx-v1-*`; synth786 has no content hash at all), and partial /
+  split-job banking can freeze sibling indexes at different builder
+  generations. Real poisoning risk, but adding source hashes tonight
+  would invalidate every cache mid-exercise and force multi-hour
+  rebuilds; do it as part of upstream-PR polish, with the v-bump
+  discipline holding until then (builder untouched since the caches were
+  banked — verified).
+- **Query length disclosure** — the "mixedbread protocol" rows use a
+  32-token query vs their 33×128 (~3% flattering on absolutes, ratios
+  unaffected). Not changing mid-exercise (would break comparability with
+  every prior run); the final table gets a query-length caveat instead.
+
 ### 2026-07-22 — #30: dim-48 SIMD tail — fixed, with an honest negative
 
 The narrow-dim expand fix landed: sub-16-byte packed tails now pad into a

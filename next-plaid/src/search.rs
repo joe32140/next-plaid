@@ -48,9 +48,11 @@ pub struct SearchParameters {
     /// Score residual candidates asymmetrically — int8 query × int8 LUT over
     /// the stored codes plus the centroid term from the IVF probe matrix —
     /// instead of decompress→f32 MaxSim. Compute-only: same index, same
-    /// storage, so the two modes can be A/B'd per search. Ignored for binary
-    /// indexes and on the batched-centroid path (no dense query×centroid
-    /// matrix there). Default off.
+    /// storage, so the two modes can be A/B'd per search. Honored on both
+    /// the dense and batched-centroid search paths (the batched path packs
+    /// its sparse centroid scores into a compact matrix); ignored for
+    /// binary indexes and for dims the fused kernels don't support
+    /// (> 256), which fall back to the float path. Default off.
     #[serde(default)]
     pub residual_asym: bool,
 }
@@ -294,6 +296,31 @@ pub fn exact_score_docs_prepared(
     doc_ids
         .par_iter()
         .map(|&d| exact_doc_score(index, &sq, cdot_t.as_ref(), d).unwrap_or(f32::NEG_INFINITY))
+        .collect()
+}
+
+/// Like [`exact_score_docs_prepared`], but taking the query×centroid matrix
+/// already in the kernels' centroid-major `[K, nq]` layout, so the timed
+/// call contains *only* scoring work. This is the profiler's exact-phase
+/// entry: the `[nq, K]` → `[K, nq]` transpose is per-query preparation (the
+/// production search pays it once per query, and the profiler's prep phase
+/// accounts for it); leaving it inside the exact timing would add a
+/// K-dependent cost to the asym column that the float column never pays.
+#[doc(hidden)]
+pub fn exact_score_docs_prepared_t(
+    index: &crate::index::MmapIndex,
+    query: &Array2<f32>,
+    cdot_t: &Array2<f32>,
+    doc_ids: &[usize],
+    residual_asym: bool,
+) -> Vec<f32> {
+    let sq = prepare_score_query(index, query, residual_asym);
+    if matches!(&sq, ScoreQuery::ResidualLut { .. }) {
+        let _ = index.residual_inv_norms();
+    }
+    doc_ids
+        .par_iter()
+        .map(|&d| exact_doc_score(index, &sq, Some(cdot_t), d).unwrap_or(f32::NEG_INFINITY))
         .collect()
 }
 

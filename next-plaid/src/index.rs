@@ -1381,7 +1381,23 @@ impl MmapIndex {
                 let n = *self.doc_offsets.last()?;
                 let codes = self.mmap_codes.slice(0, n);
                 let packed = self.mmap_residuals.slice_rows(0, n);
-                crate::residual_lut::compute_inv_norms(&self.codec, &codes, &packed)
+                // Run the parallel compute on its own one-shot pool, never
+                // the global one: this initializer is reached from inside
+                // rayon workers (search_many_mmap par_iter -> search ->
+                // here), and a global-pool par_iter inside get_or_init can
+                // deadlock — the initializing worker's join steals a
+                // sibling query, which re-enters get_or_init on the same
+                // thread; meanwhile every other worker may already be
+                // parked on this OnceLock, leaving no one to run the
+                // stolen work. A dedicated pool's threads depend on
+                // neither. Pool spin-up is noise against the
+                // seconds-per-million-tokens compute.
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .build()
+                    .expect("inv-norms init pool");
+                pool.install(|| {
+                    crate::residual_lut::compute_inv_norms(&self.codec, &codes, &packed)
+                })
             })
             .as_deref()
     }

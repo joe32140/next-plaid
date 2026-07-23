@@ -2,8 +2,51 @@
 
 Running log of the closing phase of the stage-2 exercise: what was done, in
 order, with the evidence for each step. Companion docs:
+[stage2-final-summary.md](stage2-final-summary.md) (the results doc),
 [scaling-1b-docs.md](scaling-1b-docs.md) (1B-doc analysis),
 nano-plaid `docs/class4.html` (the kernel story + port epilogue).
+
+### 2026-07-23 — ablation: what each component actually contributed (M4)
+
+Built `NP_ASYM_ABLATE`, which switches off exactly one component per run in
+the *same binary* against the *same* cached indexes, and made the parity
+suite run under every mode (an ablation that changed results would make its
+own timing meaningless). Native M4, machine idle, r4, 20 queries, exact
+kernel ms:
+
+| ablation | scifact | fiqa-15k | component this row adds |
+|---|---:|---:|---|
+| `row_major` (pre-work kernel) | 3.499 | 3.283 | — baseline |
+| `no_vfold` | 2.863 | 2.605 | **centroid-major cdot layout → 1.22× / 1.26×** |
+| `no_tr` | 3.583 | 3.150 | vectorized fold → **0.80× / 0.83× (regression!)** |
+| *(production)* | 2.730 | 2.679 | transpose-reduce → 1.31× / 1.18× |
+| total | | | **1.28× / 1.23×** |
+
+Three things this says, none of which I would have got right by reasoning:
+
+1. **The layout change did the work.** Making the centroid term contiguous
+   per token — not any epilogue vectorization — is where the M4 gain lives.
+2. **vfold on its own is a regression here** (0.80×): writing every row's
+   accumulator to a scratch and re-reading it costs more than folding four
+   rows at once saves. It only pays once `tr` removes the round-trip by
+   keeping the accumulators in registers.
+3. **vfold + tr together ≈ scalar fold + good layout** on M4 (2.730 vs
+   2.863 on scifact = 1.05×; 2.679 vs 2.605 on fiqa = 0.97×, i.e. a wash).
+   The two epilogue rungs I spent the evening on are, on Apple silicon,
+   worth roughly nothing over simply fixing the memory layout — which is
+   the same lesson the earlier misses were pointing at and I kept
+   attributing to the wrong cause.
+
+Blocked vs naive transpose on M4: prep 146→184 µs (scifact), 157→195 µs
+(fiqa) — ~40 µs/query at K=16,384. On x86 the same naive transpose measured
+2–16 ms. Same code, ~100× difference in penalty: Apple's memory system
+absorbs the strided access that x86's TLB does not.
+
+Harness bug found while doing this: the profiler hard-coded the transpose
+outside the timed region, bypassing the ablation switch, so `row_major`
+handed the kernel a `[K, nq]` matrix and tripped its own assert — losing
+exactly the row that turned out to matter most. Fixed by exporting
+`cdot_to_kernel_layout` so benchmarks apply the production layout policy.
 
 ## State when this log opened (2026-07-22)
 

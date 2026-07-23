@@ -65,6 +65,15 @@ jobs:
           # rayon threads to shrink k-means scratch and buy real headroom.
           - { cell: fiqa52k-r4,  shapes: fiqa,  cap: "52000", tags: "r4",     timeout: 300, threads: 2 }
           - { cell: fiqa52k-bin, shapes: fiqa,  cap: "52000", tags: "binary", timeout: 300, threads: 2 }
+          # Dim-48 ladder (edge-class models like edge17m ship dim 48): same
+          # fiqa token distributions, only dim changes — isolating the dim
+          # effect on the scaling story. Narrow dims also exercise the
+          # sub-16-byte SIMD expand tail at scale. Smaller payloads, so the
+          # 52k builds have real headroom where dim-128 had zero.
+          - { cell: fiqa4k-d48,      shapes: fiqa, cap: "4000",  dim: "48", tags: "r4,binary", timeout: 45 }
+          - { cell: fiqa15k-d48,     shapes: fiqa, cap: "15000", dim: "48", tags: "r4,binary", timeout: 120 }
+          - { cell: fiqa52k-d48-r4,  shapes: fiqa, cap: "52000", dim: "48", tags: "r4",     timeout: 300, threads: 2 }
+          - { cell: fiqa52k-d48-bin, shapes: fiqa, cap: "52000", dim: "48", tags: "binary", timeout: 300, threads: 2 }
     name: build-${{ matrix.cell }}
     runs-on: ubuntu-latest
     timeout-minutes: ${{ matrix.timeout }}
@@ -94,6 +103,7 @@ jobs:
       - name: build (${{ matrix.cell }})
         run: |
           if [ -n "${{ matrix.threads }}" ]; then export RAYON_NUM_THREADS=${{ matrix.threads }}; fi
+          if [ -n "${{ matrix.dim }}" ]; then export SHAPE_DIM=${{ matrix.dim }}; fi
           TAGS="${{ matrix.tags }}"
           for t in $(echo "${TAGS:-r4,r2,r1,binary}" | tr ',' ' '); do
             BUILD_ONLY=1 INDEX_TAGS=$t INDEX_ROOT=indexes /usr/bin/time -v \
@@ -202,6 +212,17 @@ jobs:
         run: NO_BUILD=1 INDEX_TAGS=r4,binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 4000
       - name: corpus ladder — fiqa 52k docs (~7.0M tokens)
         run: NO_BUILD=1 INDEX_TAGS=r4,binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 52000
+
+      # Dim-48 ladder: the same fiqa shapes at edge-model dim. Latency is a
+      # function of (shapes, dim), not embedding values, so this IS the
+      # "how does it scale on an edge-class model" axis, with the token
+      # distribution held fixed so dim is the only variable.
+      - name: dim-48 ladder — fiqa 4k docs @ dim 48
+        run: SHAPE_DIM=48 NO_BUILD=1 INDEX_TAGS=r4,binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 4000
+      - name: dim-48 ladder — fiqa 15k docs @ dim 48
+        run: SHAPE_DIM=48 NO_BUILD=1 INDEX_TAGS=r4,binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 15000
+      - name: dim-48 ladder — fiqa 52k docs @ dim 48
+        run: SHAPE_DIM=48 NO_BUILD=1 INDEX_TAGS=r4,binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 52000
 
       # Component attribution: same binary, same cached indexes, same
       # queries — one switch off at a time. Ordered so each row is the

@@ -161,10 +161,18 @@ fn main() {
             .take(n_queries)
             .map(|&l| lcg_unit_rows(&mut qseed, l as usize, dim))
             .collect();
+        // Dim is part of the index identity: a dim-48 run must never mmap a
+        // cached dim-128 index. Default dim keeps the historical name so
+        // existing CI artifacts stay valid.
         let name = format!(
-            "shapes-{}-{}docs",
+            "shapes-{}-{}docs{}",
             dir.file_name().unwrap().to_string_lossy(),
-            doc_lens.len()
+            doc_lens.len(),
+            if dim == 128 {
+                String::new()
+            } else {
+                format!("-d{dim}")
+            },
         );
         let lens_for_gen = doc_lens.clone();
         let gen_docs = Box::new(move || {

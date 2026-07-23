@@ -140,13 +140,19 @@ pub fn quantize_lut(codec: &ResidualCodec) -> Option<ResidualLut> {
 pub struct QueryPlanes {
     pub data: Vec<i8>,
     pub stride: usize,
+    /// Per query row: `q8.scales[qi] * lut.scale` — the query-constant
+    /// factor the fold applies to each integer accumulator. Built once per
+    /// query; the kernels used to rebuild this Vec on every per-doc call
+    /// (~1024×/query), a pure per-doc waste.
+    pub sqw: Vec<f32>,
 }
 
 /// Build [`QueryPlanes`] from already-quantized query codes. `dim` must be a
 /// multiple of 8 (the SIMD dispatch precondition), so every plane holds
-/// exactly `dim / keys_per_byte` lanes.
-pub fn build_query_planes(q8: &QueryI8, keys_per_byte: usize, dim: usize) -> QueryPlanes {
+/// exactly `dim / lut.keys_per_byte` lanes.
+pub fn build_query_planes(q8: &QueryI8, lut: &ResidualLut, dim: usize) -> QueryPlanes {
     let nq = q8.values.nrows();
+    let keys_per_byte = lut.keys_per_byte;
     let stride = crate::binary::padded_stride(dim);
     let pdim = dim / keys_per_byte;
     let qv = q8.values.as_slice().expect("QueryI8.values is contiguous");
@@ -160,7 +166,8 @@ pub fn build_query_planes(q8: &QueryI8, keys_per_byte: usize, dim: usize) -> Que
             }
         }
     }
-    QueryPlanes { data, stride }
+    let sqw = q8.scales.iter().map(|&s| s * lut.scale).collect();
+    QueryPlanes { data, stride, sqw }
 }
 
 /// Per-token `1 / ||centroid + dequantized residual||` for a whole index —
@@ -319,6 +326,7 @@ pub fn maxsim_residual_lut_i8(
             p.stride >= dim && p.data.len() >= nq * p.stride,
             "QueryPlanes too small for nq {nq} x dim {dim}"
         );
+        assert_eq!(p.sqw.len(), nq, "QueryPlanes sqw/rows mismatch");
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let _ = planes;
@@ -327,23 +335,42 @@ pub fn maxsim_residual_lut_i8(
         if dim.is_multiple_of(8) && dim <= MAX_DIM {
             #[cfg(target_arch = "aarch64")]
             if std::arch::is_aarch64_feature_detected!("dotprod") {
-                return unsafe {
-                    neon::maxsim_residual_lut_neon(
-                        q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim,
-                    )
-                };
+                return SCRATCH.with(|s| {
+                    let (best, accs) = &mut *s.borrow_mut();
+                    unsafe {
+                        neon::maxsim_residual_lut_neon(
+                            q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms,
+                            dim, best, accs,
+                        )
+                    }
+                });
             }
             #[cfg(target_arch = "x86_64")]
             if is_x86_feature_detected!("avx2") {
-                return unsafe {
-                    avx2::maxsim_residual_lut_avx2(
-                        q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim,
-                    )
-                };
+                return SCRATCH.with(|s| {
+                    let (best, accs) = &mut *s.borrow_mut();
+                    unsafe {
+                        avx2::maxsim_residual_lut_avx2(
+                            q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms,
+                            dim, best, accs,
+                        )
+                    }
+                });
             }
         }
     }
     maxsim_residual_lut_scalar(q8, doc_packed, doc_codes, cdot_t, lut, inv_norms, dim)
+}
+
+/// Per-thread kernel scratch (`best`, `accs`), reused across the ~1024
+/// per-candidate kernel calls of a search. Two heap allocations per doc
+/// were measurable against a ~2 µs kernel call; each rayon worker gets its
+/// own copy, and the kernels size-and-initialize it on entry, so no state
+/// leaks between calls.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+thread_local! {
+    static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<i32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -413,6 +440,8 @@ mod neon {
         nib: &NibbleLut,
         inv_norms: &[f32],
         dim: usize,
+        best: &mut Vec<f32>,
+        accs: &mut Vec<i32>,
     ) -> f32 {
         let nq = q8.values.nrows();
         if nq == 0 || doc_packed.nrows() == 0 {
@@ -426,9 +455,11 @@ mod neon {
         let pb = doc_packed.ncols();
         let cd = cdot_t.as_slice().expect("cdot_t must be standard layout");
         debug_assert_eq!(cdot_t.ncols(), nq);
-        let sqw: Vec<f32> = q8.scales.iter().map(|&s| s * lut.scale).collect();
-        let mut best = vec![f32::NEG_INFINITY; nq];
-        let mut accs = vec![0i32; nq];
+        let sqw: &[f32] = &planes.sqw;
+        best.clear();
+        best.resize(nq, f32::NEG_INFINITY);
+        accs.clear();
+        accs.resize(nq, 0);
         let mut w = [0i8; MAX_DIM];
         let mut tabs = [vdupq_n_s8(0); 8];
         for k in 0..kpb {
@@ -493,7 +524,7 @@ mod neon {
                 }
                 *acc_qi = vaddvq_s32(vaddq_s32(a, b));
             }
-            fold_block(&accs, &sqw, cd.as_ptr().add(cid * nq), inv_norms[t], &mut best);
+            fold_block(accs, sqw, cd.as_ptr().add(cid * nq), inv_norms[t], best);
         }
         best.iter().sum()
     }
@@ -561,6 +592,8 @@ mod avx2 {
         nib: &NibbleLut,
         inv_norms: &[f32],
         dim: usize,
+        best: &mut Vec<f32>,
+        accs: &mut Vec<i32>,
     ) -> f32 {
         let nq = q8.values.nrows();
         if nq == 0 || doc_packed.nrows() == 0 {
@@ -574,9 +607,11 @@ mod avx2 {
         let pb = doc_packed.ncols();
         let cd = cdot_t.as_slice().expect("cdot_t must be standard layout");
         debug_assert_eq!(cdot_t.ncols(), nq);
-        let sqw: Vec<f32> = q8.scales.iter().map(|&s| s * lut.scale).collect();
-        let mut best = vec![f32::NEG_INFINITY; nq];
-        let mut accs = vec![0i32; nq];
+        let sqw: &[f32] = &planes.sqw;
+        best.clear();
+        best.resize(nq, f32::NEG_INFINITY);
+        accs.clear();
+        accs.resize(nq, 0);
         let mut w = [0i8; MAX_DIM];
         let mut tabs = [_mm_setzero_si128(); 8];
         for k in 0..kpb {
@@ -645,7 +680,7 @@ mod avx2 {
                 let s32 = _mm_add_epi32(s64, _mm_srli_si128(s64, 4));
                 *acc_qi = _mm_cvtsi128_si32(s32);
             }
-            fold_block(&accs, &sqw, cd.as_ptr().add(cid * nq), inv_norms[t], &mut best);
+            fold_block(accs, sqw, cd.as_ptr().add(cid * nq), inv_norms[t], best);
         }
         best.iter().sum()
     }
@@ -779,7 +814,7 @@ mod tests {
                     let nib = lut.nibble.as_ref().expect("nibble tables");
                     let query = Array2::from_shape_fn((nq, dim), |_| rng.gen_range(-1.0f32..1.0));
                     let q8 = crate::binary::quantize_query_i8(&query.view());
-                    let planes = build_query_planes(&q8, lut.keys_per_byte, dim);
+                    let planes = build_query_planes(&q8, &lut, dim);
                     let res = Array2::from_shape_fn((13, dim), |_| rng.gen_range(-0.4f32..0.4));
                     let packed = codec.quantize_residuals(&res).unwrap();
                     let codes: Vec<i64> = (0..13).map(|_| rng.gen_range(0..k as i64)).collect();
@@ -795,6 +830,9 @@ mod tests {
                     &inv,
                     dim,
                 );
+                // Fresh scratch per call — also proves the kernels fully
+                // initialize it (no state carried between calls).
+                let (mut best, mut accs) = (Vec::new(), Vec::new());
                 #[cfg(target_arch = "aarch64")]
                 let simd = unsafe {
                     super::neon::maxsim_residual_lut_neon(
@@ -807,6 +845,8 @@ mod tests {
                         nib,
                         &inv,
                         dim,
+                        &mut best,
+                        &mut accs,
                     )
                 };
                 #[cfg(target_arch = "x86_64")]
@@ -821,6 +861,8 @@ mod tests {
                         nib,
                         &inv,
                         dim,
+                        &mut best,
+                        &mut accs,
                     )
                 };
                     assert_eq!(
@@ -856,7 +898,7 @@ mod tests {
                 let cents = Array2::from_shape_fn((k, dim), |(i, d)| codec.centroids.row(i)[d]);
                 let cdot_t = cents.dot(&query.t());
                 let inv = compute_inv_norms(&codec, &codes, &packed.view()).unwrap();
-                let planes = build_query_planes(&q8, lut.keys_per_byte, dim);
+                let planes = build_query_planes(&q8, &lut, dim);
 
                 let got = maxsim_residual_lut_i8(
                     &q8,
@@ -922,7 +964,7 @@ mod tests {
                 let codes: Vec<i64> = (0..9).map(|_| rng.gen_range(0..k as i64)).collect();
                 let cdot_t = Array2::from_shape_fn((k, 6), |_| rng.gen_range(-1.0f32..1.0));
                 let inv: Vec<f32> = (0..9).map(|_| rng.gen_range(0.5f32..1.5)).collect();
-                let planes = build_query_planes(&q8, lut.keys_per_byte, dim);
+                let planes = build_query_planes(&q8, &lut, dim);
 
                 let got = maxsim_residual_lut_i8(
                     &q8,

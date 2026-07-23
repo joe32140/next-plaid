@@ -135,9 +135,9 @@ fn prepare_score_query<'a>(
         if let Some(lut) = crate::residual_lut::quantize_lut(&index.codec) {
             let dim = index.codec.embedding_dim();
             let q8 = crate::binary::quantize_query_i8(&query.view());
-            let planes = dim.is_multiple_of(8).then(|| {
-                crate::residual_lut::build_query_planes(&q8, lut.keys_per_byte, dim)
-            });
+            let planes = dim
+                .is_multiple_of(8)
+                .then(|| crate::residual_lut::build_query_planes(&q8, &lut, dim));
             return ScoreQuery::ResidualLut { q8, lut, planes };
         }
     }

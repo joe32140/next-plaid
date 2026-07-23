@@ -59,6 +59,15 @@ Measurement program complete, CI-verified on x86 AVX2 / Neoverse / Apple M1:
 - ~~**#32 vfold port**~~ — un-held 2026-07-22 on user go; see the #32 log
   entry below. The "asym conservative, ~2× headroom" footnote retires if
   the dataset-scale measurements confirm the port.
+- **tr rung (transpose-reduce)** — the post-vfold M4 rungs are dead flat
+  (r4/r2/r1 ≈ 1.76/1.77/1.77 ms at ¼–1× the SDOT work), fingerprinting
+  the per-row horizontal reduce + fold machinery as the remaining floor.
+  nano-plaid's `tr` (vpaddq tree lands 4 rows' accs in one register →
+  `fold4`, no scratch, no per-row `vaddvq`) is the measured next lever;
+  predict 1.15–1.35× kernel, flat line drops uniformly. Decision gate:
+  take it only if the post-vfold CI cells show the same flat-across-rungs
+  signature on x86/Neoverse; falsifier: flat line not dropping means the
+  floor is loop/dispatch machinery instead.
 - **#33 stage-1 optimization** — the sequel. Instrument stage-1 phases
   first; then cdot int8 GEMM, cdot transpose + vectorized approx scorer,
   centroid-scan pruning, cell-level approx scoring. Reprioritized by the
@@ -214,6 +223,24 @@ JetsamEvent reports, the scheduler died mid-sleep, well before firing).
 Overnight #28 re-armed afterwards; it now measures the post-vfold tree,
 which is what the final table should carry anyway (CI run 29960245502
 remains the pre-vfold reference point for the asym columns).
+
+### 2026-07-22 — opportunity #2 (alloc/sqw hoist): done, honest negative on M4
+
+Post-review opportunity list, item 2 executed: `sqw` (query-constant
+`scales[qi]·lut.scale`) moved into `QueryPlanes`, built once per query
+instead of per doc call; kernel `best`/`accs` scratch moved to a
+per-rayon-thread `thread_local` reused across the ~1024 per-candidate
+calls (kernels size-and-initialize on entry; parity test passes fresh
+empty Vecs to prove no state carries).
+
+Predicted 3–8% from alloc-cost arithmetic; **measured: no change on M4**
+(asym 1.79/1.83/1.80 vs 1.76/1.77/1.77 baseline, binary noise gauge ±6%).
+The model missed because macOS's thread-cached allocator makes repeated
+same-size per-doc alloc/free nearly free. Kept anyway: correct, tested
+(196/196), removes real churn, and the CI glibc cells (different
+allocator economics) are the remaining test of the prediction.
+
+**Opportunity #1 (tr rung) noted, not taken** — see on-hold ledger.
 
 ### 2026-07-22 — pre-close implementation review (user: "check the implementation before we close our LUT direction")
 

@@ -241,6 +241,7 @@ Found by review and by harness discipline, not by tests failing:
 | 4 | AVX2 8-wide fold had zero bit-exact coverage (parity test used nq=7) | a wrong x86 fold would pass the whole suite |
 | 5 | cdot transpose was eating ~half the kernel win at e2e | we would have shipped a kernel gain the user never sees |
 | 6 | dim-48 packed rows fell off the SIMD path | narrow-dim models silently slower |
+| 7 | the ablation harness itself bypassed its own switch (profiler hard-coded the transpose) | the `row_major` row — the largest component — was lost to an assert; had the assert not existed, it would have silently measured the wrong layout |
 
 Plus measurement traps caught before they corrupted a claim: rustup
 defaulting to x86-under-Rosetta on Apple silicon (bit us again in this

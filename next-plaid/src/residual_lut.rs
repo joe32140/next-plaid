@@ -416,15 +416,48 @@ mod neon {
         }
     }
 
+    /// One 4-row block of the transpose-reduce fold: `accv` already holds
+    /// four query rows' final integer accumulators (lane `r` = row
+    /// `base + r`, delivered by a `vpaddq` tree instead of four per-row
+    /// `vaddvq` reduces), so this applies the shared float tail — same
+    /// ops, same order as [`fold_block`], hence bit-identical.
+    #[inline(always)]
+    unsafe fn fold4(
+        accv: int32x4_t,
+        base: usize,
+        sqw: &[f32],
+        crow: *const f32,
+        inv: f32,
+        best: &mut [f32],
+    ) {
+        let a = vcvtq_f32_s32(accv);
+        let s = vmulq_f32(
+            vaddq_f32(
+                vmulq_f32(vld1q_f32(sqw.as_ptr().add(base)), a),
+                vld1q_f32(crow.add(base)),
+            ),
+            vdupq_n_f32(inv),
+        );
+        let b = vld1q_f32(best.as_ptr().add(base));
+        vst1q_f32(best.as_mut_ptr().add(base), vmaxq_f32(b, s));
+    }
+
     /// Fused NEON path: expand each doc token's packed bytes through the
     /// nibble tables with `tbl` — one lookup per key position per 16 packed
     /// bytes, stored straight to that key's plane (no interleave) — then
     /// score all query rows with SDOT against the matching
     /// [`QueryPlanes`] rows (whose zero padding makes the buffer's padding
-    /// contribute nothing). Per-row accumulators land in a scratch and the
-    /// float epilogue runs through [`fold_block`], four rows per
-    /// instruction, reading the token's centroid scores as one contiguous
-    /// strip of the centroid-major `cdot_t`.
+    /// contribute nothing).
+    ///
+    /// Epilogue is nano-plaid's `tr` rung: query rows go 4 at a time, each
+    /// block keeping four full accumulator *vectors*; a `vpaddq` pairwise
+    /// tree lands their four horizontal sums in one register (integer adds
+    /// — lane-for-lane the values the per-row `vaddvq` produced), which
+    /// [`fold4`] folds directly. This removes the per-row horizontal
+    /// reduce and the scratch round-trip that the flat-across-rungs
+    /// measurement fingerprinted as the kernel's floor. Leftover rows
+    /// (nq % 4) take the previous path: scalar reduce into `accs`, then
+    /// [`fold_block`] over the tail slice.
     ///
     /// # Safety
     /// Requires the `dotprod` CPU feature; `dim % 8 == 0 && dim <= MAX_DIM`.
@@ -505,26 +538,48 @@ mod neon {
             }
             let cid = code as usize;
             let wp = w.as_ptr();
-            for (qi, acc_qi) in accs.iter_mut().enumerate() {
-                let qp = qp_base.add(qi * ps);
-                let mut a = vdupq_n_s32(0);
-                let mut b = vdupq_n_s32(0);
-                let mut k = 0usize;
-                // Partial tail chunks are exact: both sides zero-pad past dim.
-                while k < dim {
-                    a = crate::binary::sdot_asm(a, vld1q_s8(qp.add(k)), vld1q_s8(wp.add(k)));
-                    if k + 16 < dim {
-                        b = crate::binary::sdot_asm(
-                            b,
-                            vld1q_s8(qp.add(k + 16)),
-                            vld1q_s8(wp.add(k + 16)),
-                        );
+            let crow = cd.as_ptr().add(cid * nq);
+            let inv = inv_norms[t];
+            // Per-row SDOT accumulation over the shared expanded weights.
+            // Partial tail chunks are exact: both sides zero-pad past dim.
+            macro_rules! row_acc {
+                ($qi:expr) => {{
+                    let qp = qp_base.add($qi * ps);
+                    let mut a = vdupq_n_s32(0);
+                    let mut b = vdupq_n_s32(0);
+                    let mut k = 0usize;
+                    while k < dim {
+                        a = crate::binary::sdot_asm(a, vld1q_s8(qp.add(k)), vld1q_s8(wp.add(k)));
+                        if k + 16 < dim {
+                            b = crate::binary::sdot_asm(
+                                b,
+                                vld1q_s8(qp.add(k + 16)),
+                                vld1q_s8(wp.add(k + 16)),
+                            );
+                        }
+                        k += 32;
                     }
-                    k += 32;
-                }
-                *acc_qi = vaddvq_s32(vaddq_s32(a, b));
+                    vaddq_s32(a, b)
+                }};
             }
-            fold_block(accs, sqw, cd.as_ptr().add(cid * nq), inv_norms[t], best);
+            let mut qi = 0usize;
+            while qi + 4 <= nq {
+                let v0 = row_acc!(qi);
+                let v1 = row_acc!(qi + 1);
+                let v2 = row_acc!(qi + 2);
+                let v3 = row_acc!(qi + 3);
+                // Pairwise tree -> [Σv0, Σv1, Σv2, Σv3] in one register.
+                let accv = vpaddq_s32(vpaddq_s32(v0, v1), vpaddq_s32(v2, v3));
+                fold4(accv, qi, sqw, crow, inv, best);
+                qi += 4;
+            }
+            if qi < nq {
+                let rem = nq - qi;
+                for r in 0..rem {
+                    accs[r] = vaddvq_s32(row_acc!(qi + r));
+                }
+                fold_block(&accs[..rem], &sqw[qi..], crow.add(qi), inv, &mut best[qi..]);
+            }
         }
         best.iter().sum()
     }

@@ -59,15 +59,14 @@ Measurement program complete, CI-verified on x86 AVX2 / Neoverse / Apple M1:
 - ~~**#32 vfold port**~~ — un-held 2026-07-22 on user go; see the #32 log
   entry below. The "asym conservative, ~2× headroom" footnote retires if
   the dataset-scale measurements confirm the port.
-- **tr rung (transpose-reduce)** — the post-vfold M4 rungs are dead flat
-  (r4/r2/r1 ≈ 1.76/1.77/1.77 ms at ¼–1× the SDOT work), fingerprinting
-  the per-row horizontal reduce + fold machinery as the remaining floor.
-  nano-plaid's `tr` (vpaddq tree lands 4 rows' accs in one register →
-  `fold4`, no scratch, no per-row `vaddvq`) is the measured next lever;
-  predict 1.15–1.35× kernel, flat line drops uniformly. Decision gate:
-  take it only if the post-vfold CI cells show the same flat-across-rungs
-  signature on x86/Neoverse; falsifier: flat line not dropping means the
-  floor is loop/dispatch machinery instead.
+- ~~**tr rung (transpose-reduce)**~~ — taken same evening (NEON only),
+  prediction falsified (~3–5%, not 1.15–1.35×), kept for the consistent
+  small win; see log entry. Successor candidates, evidence-driven:
+  **dim-128-specialized straight-line inner loop** (kill the per-iteration
+  `k < dim` branch — where nano's rung gains actually lived) and
+  **doc-token blocking** (binary's structure: 4 tokens per query-row
+  pass, quartering query-row re-streaming). AVX2 tr remains gated on a
+  reference/measurement.
 - **#33 stage-1 optimization** — the sequel. Instrument stage-1 phases
   first; then cdot int8 GEMM, cdot transpose + vectorized approx scorer,
   centroid-scan pruning, cell-level approx scoring. Reprioritized by the
@@ -223,6 +222,32 @@ JetsamEvent reports, the scheduler died mid-sleep, well before firing).
 Overnight #28 re-armed afterwards; it now measures the post-vfold tree,
 which is what the final table should carry anyway (CI run 29960245502
 remains the pre-vfold reference point for the asym columns).
+
+### 2026-07-22 — opportunity #1 (tr rung, NEON): done — prediction falsified, kept anyway
+
+Ported nano's transpose-reduce to the NEON kernel (AVX2 untouched — no
+reference exists, gate stands): query rows in blocks of 4 keep full
+accumulator vectors; a `vpaddq` pairwise tree lands the four horizontal
+sums in one register (integer adds — lane-identical to the per-row
+`vaddvq`), folded by `fold4`; nq%4 tail rows take the vfold path.
+Bit-exact across all 105 parity cells (nq 3/7/8/9/32 covers all-tail,
+mixed, and vector-only shapes); 196/196.
+
+Predicted 1.15–1.35× with the flat line dropping uniformly. **Measured:
+1.79/1.83/1.80 → 1.74/1.76/1.71 ms (~3–5%), binary gauge stable.** The
+registered falsifier fired: the per-row reduce was NOT the M4 floor.
+Combined with the vfold miss, the revised model: nano's rung gains lived
+in fixed-dim-128 straight-line kernels; next-plaid's generic-dim kernel
+spends its floor in the `while k < dim` per-iteration branch + loop
+machinery, and in re-streaming the query rows once per doc token
+(binary's 4-token blocking pays that once per 4). Rung lessons do not
+transfer proportionally across kernel shapes — a Class-04-worthy lesson.
+
+Kept: consistent improvement on all rungs, strictly less work, exactness
+proven. New evidence-driven candidates for the ledger (not tonight):
+dim-128-specialized straight-line inner loop, and doc-token blocking
+(opportunity #3) — the two structural differences from the kernels whose
+numbers we imported.
 
 ### 2026-07-22 — opportunity #2 (alloc/sqw hoist): done, honest negative on M4
 

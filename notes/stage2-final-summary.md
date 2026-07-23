@@ -231,6 +231,32 @@ profiler double-counting prep inside the timed region.
 
 ---
 
+## 7.1 What this exercise taught about measuring
+
+Five lessons, each paid for with a wrong prediction:
+
+1. **Benchmark at the working-set size you deploy at.** The vectorised-fold
+   change measured 1.2× on a local synthetic cell (K = 4,096, centroid
+   matrix cache-resident) and 1.5–2.8× on real dataset cells (K = 8k–32k).
+   Same code. The small benchmark hid the entire effect, because the effect
+   *was* a memory-access change.
+2. **Port measured results, not measured conclusions.** Two optimisations
+   imported from a sibling project — both genuinely measured there — did
+   not reproduce here, because that kernel is fixed-dim and fully unrolled
+   and ours is not. The rung ladder transferred; the numbers did not.
+3. **Keep a control in every comparison.** The binary kernel was untouched
+   all session, so its 0.97–1.03× across every cell is what licenses
+   reading the asym deltas as signal rather than runner drift.
+4. **A fair harness finds real bugs.** The cdot transpose was invisible
+   while it sat inside the timed exact region — it just inflated one
+   column. Moving it out *for fairness* is what exposed it as a genuine
+   per-query cost eating half the win.
+5. **Ablations must be proven inert.** Every `NP_ASYM_ABLATE` mode runs the
+   full bit-exactness suite in CI. An ablation that quietly changed the
+   computation would produce a confident, meaningless number.
+
+---
+
 ## 8. What is deliberately not done
 
 | item | why it is parked |

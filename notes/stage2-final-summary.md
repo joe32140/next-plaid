@@ -44,13 +44,19 @@ checkpoints — that finding is why the grid exists.
 
 Decompression, not arithmetic, is the cost the fused kernels delete:
 
-| phase (real shapes) | share of the float exact path |
-|---|---|
-| decompress to f32 | **65–84%** |
-| GEMM + max | 16–35% |
+| phase (real shapes, float r4 exact path) | x86 | Apple M4 |
+|---|---|---|
+| decompress to f32 | **65–84%** | **48–72%** |
+| GEMM + max | 16–35% | 21–36% |
 
 This is why "we beat BLAS" would be the wrong claim. We don't out-multiply
 BLAS — we skip the step before it.
+
+The share is platform- and corpus-dependent, and it *falls* as the corpus
+grows (72% → 48% across the M4 ladder), because larger corpora bring longer
+candidate documents and the GEMM scales worse than the byte-unpacking. That
+decay is the leading indicator of the fused kernels' ceiling: the win is
+bounded by whatever fraction decompression represents.
 
 ---
 

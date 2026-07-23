@@ -168,15 +168,18 @@ Making the centroid term contiguous requires transposing stage-1's matrix
 once per query. How that transpose is written matters enormously, and
 differently per platform:
 
-| | M4 (prep µs) | x86 (prep) |
-|---|---:|---|
-| blocked (production) | 146–157 | µs-scale |
-| naive `as_standard_layout` | 184–195 | **2–16 ms** |
-| penalty | ~40 µs | up to ~100× worse |
+| per-query prep | M4, K=16k | M4, K=32k | x86, K=16k |
+|---|---:|---:|---|
+| blocked (production) | 146–157 µs | 191 µs | (see CI) |
+| naive `as_standard_layout` | 184–195 µs | 238 µs | **0.7–15.8 ms** |
+| penalty | ~40 µs | ~47 µs | **milliseconds** |
 
-Same code, wildly different penalty: Apple's memory system absorbs the
-strided access that x86's TLB does not. A benchmark on one machine would
-have mis-ranked this change completely.
+Same code, wildly different penalty. Apple's memory system absorbs the
+strided access almost entirely (~50 µs to transpose 4 MB); on x86 the same
+access pattern costs milliseconds, because every element read is both a
+cache and a TLB miss. Had this been benchmarked only on the Mac, the
+transpose would have looked free and shipped as-is — and x86 users would
+have paid half the kernel win back without anyone seeing it.
 
 ---
 

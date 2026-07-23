@@ -73,6 +73,37 @@ stacked on an unmerged #155 it would show both diffs; the body is ready
 in [lut-cr-pr-body.md](lut-cr-pr-body.md) for when #155 lands (Joe's
 call).
 
+**Independent review round** (1 subagent over the final diff; 8 confirmed
+findings, all fixed; final commits 8f27fe4 + 80dbb93):
+
+1. *Soundness (the real catch)*: the dispatcher asserted
+   `planes.stride >= dim`, but the kernels read whole SIMD chunks past
+   `dim` (64 B on AVX-512) into the rows' zero padding — a hand-built
+   `QueryPlanes` (all-pub fields) with `stride == dim` passed every
+   assert and read up to 56 B out of bounds from a safe `pub fn`. Assert
+   is now `stride >= padded_stride(dim)`; NEON/AVX2 safety docs gained
+   the stride precondition AVX-512's already had.
+2. Integration-test comments still described the *pre-inv-norms* state
+   ("renormalize … quality-neutral") — the exact claim whose refutation
+   (−0.17 NDCG at nbits=1) created `residual_inv_norms`. Fixed; a
+   maintainer trusting that header could have deleted the norms cache
+   and shipped green.
+3. Coverage: the `planes = None` scalar dispatch and the dim > MAX_DIM
+   float fallback had zero surviving tests. Added: dim-44 cells in the
+   unit reference test, a dim-44 integration test, a dim-272
+   fallback-equivalence test. Trying dim 44 at nbits=1 found a
+   *pre-existing codec bug*: `quantize_residuals` sizes its buffer with
+   truncating `dim*nbits/8` and OOB-panics for non-byte-aligned
+   products (spawned as a separate task; out of CR scope — the codec
+   should validate, not crash).
+4. Cosmetics that reviewers would catch: cfg-impossible
+   `[super::neon::fold_block]` doc link in the avx512 module,
+   "nano-plaid's fold_block" naming an out-of-tree repo, a false
+   "toy K never exceeds one block" test rationale (kmeans gives K=256
+   there), stranded `pub(crate)` on `transpose_cdot`/`stage1_shortlist`
+   (now private), and a redundant `dim <= MAX_DIM` re-check in the
+   dispatch guard.
+
 **Class 4 updated** (nano-plaid 5b537f6): the port epilogue gains "The
 ablation: who actually earned the speedup" — the per-CPU attribution
 table, the three findings (layout dominant everywhere; the fold's sign

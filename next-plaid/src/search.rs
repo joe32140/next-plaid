@@ -1050,7 +1050,12 @@ pub fn stage1_shortlist(
         _ => {
             // Emit the f32 centroid-major matrix in the same pass when the
             // asym Stage-2 will need it — one traversal serves both stages.
-            let emit_f32 = params.residual_asym && !index.metadata.binary;
+            // Only when no stage-2 ablation is in force: the RowMajor rung's
+            // kernels expect [nq, K] untransposed, and the NaiveTranspose
+            // rung must pay its own transpose to measure it.
+            let emit_f32 = params.residual_asym
+                && !index.metadata.binary
+                && crate::residual_lut::ablation() == crate::residual_lut::Ablation::Off;
             let (qt, t32) = transpose_quantize_cdot(&query_centroid_scores, emit_f32);
             cdot_t_shared = t32;
             // u32 code side-array: 4 B/token reads instead of the mmap's 8.

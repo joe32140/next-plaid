@@ -692,3 +692,29 @@ Two lessons with teeth:
 Amdahl arc closes: cutting stage-1 re-exposes the stage-2 kernels at
 scale — both schemes share stage-1, so the float-vs-binary/asym e2e
 ratios at 7M tokens now move back toward their kernel ratios.
+
+### 2026-07-24 — mechanics landed; the full-journey grid, all platforms
+
+Run 30071435430 (post-mechanics, post ablation-contract fix). Cross-run
+absolutes drifted (shared runners, rowmajor baselines moved 11–37%
+between runs), so mechanics gains are judged run-normalized: flood share
+of the rowmajor baseline fell 0.37→0.23 (x86 52k, 1.61×), 0.13→0.07
+(Neoverse, 1.87×), 0.61→0.54 (CI mac, 1.13×). The u32 side-array is
+worth most exactly where memory is slowest — same physics as every
+layout result in this project.
+
+**The full-journey column** (float + rowmajor stage-1 → each scheme +
+q8 stage-1, within one run — the whole project end-to-end):
+
+| platform | fiqa | LUT (quality-free) | binary (model bet) |
+|---|---|---:|---:|
+| x86 AVX2 | 15k | 4.66× | 7.26× |
+| x86 AVX2 | 52k | 4.02× | **5.37×** |
+| Neoverse | 15k | 5.32× | 7.77× |
+| Neoverse | 52k | **6.09×** | **8.46×** |
+| CI mac | 15k | 4.32× | 5.00× |
+| CI mac | 52k | 2.39× | 3.65× |
+
+At 7M tokens — where the original e2e advantage had decayed to
+1.6–2.4× — the stack now delivers 4–6× quality-free and 5.4–8.5× on the
+binary bet. The Amdahl decay was the flood, not destiny.

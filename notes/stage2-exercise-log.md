@@ -656,3 +656,39 @@ Also filed `~/beir-data/quant_grid/results/STALE-ASYM-WARNING.md`: the
 read *inverted* — arguana/lateon/r1 shows NDCG 0.1711 and asym slower than
 float, vs 0.3402 and 1.62× faster on fixed code. The float and binary
 columns there are fine and cross-check exactly against the M4 re-run.
+
+### 2026-07-24 — stage-1: the flood was the query, and Neoverse was paying 8×
+
+`NP_S1_PHASES` decomposition: the candidate-flood approx scorer is 62–67%
+of stage-1 at every corpus size (21.6k docs scored to keep 1,024 at
+fiqa-52k); cdot GEMM ~18%, probe select ~9%. Fix: the same centroid-major
+transpose that carried stage-2, plus PLAID-style u8 score quantization
+(fused transpose+quantize pass, `umax` 16-lane accumulator), plus
+partial-select before the prune sort. Three rungs via `NP_S1_ABLATE`
+(rowmajor / f32 / default q8), commit a38c318.
+
+CI run 30065517863, fiqa-52k, binary e2e vs rowmajor baseline:
+
+| platform | flood gain | stage-1 gain | e2e gain |
+|---|---:|---:|---:|
+| x86 AVX2 | 3.25× | 2.41× | **2.20×** (37.6→17.1 ms) |
+| Neoverse | **8.2×** | 5.00× | **4.42×** (78.6→17.8 ms) |
+| CI mac | 2.7× | 2.22× | 2.24× |
+
+Quality: nDCG identical to 4 decimals vs rowmajor on real fiqa
+embeddings (n4000, all schemes, dep + asym) — floor-quant ties never
+reach top-10.
+
+Two lessons with teeth:
+1. **The branchy u8 max does not autovectorize.** `if v > *a {*a = v}`
+   compiled scalar and made q8 a 0.9× *regression*; `(*a).max(v)` emits
+   `umax.16b` and flips it to the fastest rung. One line was the whole
+   sign of the result.
+2. **Local M4 undersells layout wins ~2–4×.** Its L2 absorbs the
+   scatter (local: flood 1.54×, s1 1.31×); Neoverse paid 8× for the
+   same loads. Same physics as the stage-2 transpose ablation — never
+   judge a layout change on Apple silicon alone.
+
+Amdahl arc closes: cutting stage-1 re-exposes the stage-2 kernels at
+scale — both schemes share stage-1, so the float-vs-binary/asym e2e
+ratios at 7M tokens now move back toward their kernel ratios.

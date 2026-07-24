@@ -213,6 +213,24 @@ jobs:
       - name: corpus ladder — fiqa 52k docs (~7.0M tokens)
         run: NO_BUILD=1 INDEX_TAGS=r4,binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 52000
 
+      # Stage-1 flood rung ladder: same run (thermal-consistent ratios),
+      # binary index only (the flood is scheme-independent). Rungs:
+      # default = quantized centroid-major (q8), f32 = layout only,
+      # rowmajor = the scattered baseline. NP_S1_PHASES prints the
+      # per-phase decomposition to stderr for attribution.
+      - name: stage1 rung — fiqa 15k q8 (default)
+        run: NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 15000
+      - name: stage1 rung — fiqa 15k f32 layout-only
+        run: NP_S1_ABLATE=f32 NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 15000
+      - name: stage1 rung — fiqa 15k rowmajor baseline
+        run: NP_S1_ABLATE=rowmajor NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 15000
+      - name: stage1 rung — fiqa 52k q8 (default)
+        run: NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 52000
+      - name: stage1 rung — fiqa 52k f32 layout-only
+        run: NP_S1_ABLATE=f32 NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 52000
+      - name: stage1 rung — fiqa 52k rowmajor baseline
+        run: NP_S1_ABLATE=rowmajor NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 52000
+
       # Dim-48 ladder: the same fiqa shapes at edge-model dim. Latency is a
       # function of (shapes, dim), not embedding values, so this IS the
       # "how does it scale on an edge-class model" axis, with the token

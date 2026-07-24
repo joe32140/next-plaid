@@ -107,7 +107,7 @@ fn biased_stride(dim: usize) -> usize {
 /// 64-lane zmm groups the AVX-512 VNNI kernel loads (also a multiple of the
 /// NEON kernel's 16-lane chunks).
 #[inline]
-fn padded_stride(dim: usize) -> usize {
+pub(crate) fn padded_stride(dim: usize) -> usize {
     dim.div_ceil(64) * 64
 }
 
@@ -611,7 +611,7 @@ unsafe fn maxsim_avx2_sad_dyn(
 /// Requires the `dotprod` target feature at runtime (caller must check).
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn sdot_asm(
+pub(crate) unsafe fn sdot_asm(
     acc: std::arch::aarch64::int32x4_t,
     a: std::arch::aarch64::int8x16_t,
     b: std::arch::aarch64::int8x16_t,

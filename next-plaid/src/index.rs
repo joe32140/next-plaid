@@ -1059,6 +1059,12 @@ pub struct MmapIndex {
     /// residual scoring path — the same normalization `decompress` applies.
     /// Derived data (function of codes + codec), built once on first use.
     residual_inv_norms: std::sync::OnceLock<Option<Vec<f32>>>,
+    /// Lazily-built u32 copy of the token codes for the stage-1 candidate
+    /// flood: the mmap stores i64 (8 B/token), so a flood pass over millions
+    /// of candidate tokens reads 4x more code bytes than the values need
+    /// (num_centroids always fits u32). RAM cost is 4 B/token, paid on first
+    /// search only — same lazy-derived-data pattern as `residual_inv_norms`.
+    codes_u32: std::sync::OnceLock<Vec<u32>>,
 }
 
 impl MmapIndex {
@@ -1181,7 +1187,21 @@ impl MmapIndex {
             doc_offsets,
             mmap_codes,
             residual_inv_norms: std::sync::OnceLock::new(),
+            codes_u32: std::sync::OnceLock::new(),
             mmap_residuals,
+        })
+    }
+
+    /// Token codes as u32, built once on first use (one sequential pass over
+    /// the code mmap). Indexed by the same `doc_offsets` as `mmap_codes`.
+    pub fn codes_u32(&self) -> &[u32] {
+        self.codes_u32.get_or_init(|| {
+            let n = self.doc_offsets.last().copied().unwrap_or(0);
+            self.mmap_codes
+                .slice(0, n)
+                .iter()
+                .map(|&c| c as u32)
+                .collect()
         })
     }
 

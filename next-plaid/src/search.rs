@@ -696,7 +696,10 @@ struct QuantCdotT {
 
 /// One fused pass: blocked transpose + u8 quantization of the `[nq, K]`
 /// score matrix. Same blocking as [`transpose_cdot`].
-fn transpose_quantize_cdot(cdot: &Array2<f32>) -> QuantCdotT {
+fn transpose_quantize_cdot(
+    cdot: &Array2<f32>,
+    emit_f32: bool,
+) -> (QuantCdotT, Option<Array2<f32>>) {
     const BLK: usize = 64;
     let (nq, k) = (cdot.nrows(), cdot.ncols());
     let src = cdot.as_standard_layout();
@@ -709,30 +712,61 @@ fn transpose_quantize_cdot(cdot: &Array2<f32>) -> QuantCdotT {
     let scale = if hi > lo { (hi - lo) / 255.0 } else { 1.0 };
     let inv = 1.0 / scale;
     let mut q = vec![0u8; k * nq];
-    let mut c0 = 0usize;
-    while c0 < k {
-        let c1 = (c0 + BLK).min(k);
-        for qi in 0..nq {
-            let row = &src[qi * k + c0..qi * k + c1];
-            for (j, &v) in row.iter().enumerate() {
-                // Saturating float->int cast (guaranteed since Rust 1.45):
-                // no round, no clamp — floor is a uniform shift, invisible
-                // to ranking, and this autovectorizes to fcvtzu/cvttps.
-                q[(c0 + j) * nq + qi] = ((v - lo) * inv) as u8;
+    // When Stage-2 will score asymmetrically it needs the same matrix
+    // centroid-major in f32; emitting it here makes the two transposes one
+    // pass over `src` instead of two.
+    let mut t32 = emit_f32.then(|| Array2::<f32>::zeros((k, nq)));
+    let dst32 = t32
+        .as_mut()
+        .map(|a| a.as_slice_mut().expect("fresh array is contiguous"));
+    // One pass: each src block row is read once while hot and feeds both
+    // outputs (the u8 quantized matrix, and optionally the f32 transpose).
+    match dst32 {
+        Some(dst) => {
+            let mut c0 = 0usize;
+            while c0 < k {
+                let c1 = (c0 + BLK).min(k);
+                for qi in 0..nq {
+                    let row = &src[qi * k + c0..qi * k + c1];
+                    for (j, &v) in row.iter().enumerate() {
+                        dst[(c0 + j) * nq + qi] = v;
+                        q[(c0 + j) * nq + qi] = ((v - lo) * inv) as u8;
+                    }
+                }
+                c0 = c1;
             }
         }
-        c0 = c1;
+        None => {
+            let mut c0 = 0usize;
+            while c0 < k {
+                let c1 = (c0 + BLK).min(k);
+                for qi in 0..nq {
+                    let row = &src[qi * k + c0..qi * k + c1];
+                    for (j, &v) in row.iter().enumerate() {
+                        // Saturating float->int cast (guaranteed since Rust
+                        // 1.45): no round, no clamp — floor is a uniform
+                        // shift, invisible to ranking, and it autovectorizes
+                        // to fcvtzu/cvttps.
+                        q[(c0 + j) * nq + qi] = ((v - lo) * inv) as u8;
+                    }
+                }
+                c0 = c1;
+            }
+        }
     }
-    QuantCdotT {
-        q,
-        nq,
-        lo_sum: nq as f32 * lo,
-        scale,
-    }
+    (
+        QuantCdotT {
+            q,
+            nq,
+            lo_sum: nq as f32 * lo,
+            scale,
+        },
+        t32,
+    )
 }
 
 /// u8 flood scorer over the quantized centroid-major matrix.
-fn approximate_score_flood_q8(qt: &QuantCdotT, doc_codes: &[i64], acc: &mut [u8]) -> f32 {
+fn approximate_score_flood_q8(qt: &QuantCdotT, doc_codes: &[u32], acc: &mut [u8]) -> f32 {
     acc.fill(0);
     let nq = qt.nq;
     for &code in doc_codes {
@@ -784,7 +818,8 @@ pub fn search_one_mmap(
         return search_one_mmap_batched(index, query, params, subset);
     }
 
-    let (query_centroid_scores, to_decompress) = stage1_shortlist(index, query, params, subset)?;
+    let (query_centroid_scores, cdot_t_shared, to_decompress) =
+        stage1_shortlist(index, query, params, subset)?;
 
     if to_decompress.is_empty() {
         return Ok(QueryResult {
@@ -801,11 +836,9 @@ pub fn search_one_mmap(
     let cdot_t = if matches!(&exact_query, ScoreQuery::ResidualLut { .. }) {
         // Build the per-token norm cache once, outside the parallel loop.
         let _ = index.residual_inv_norms();
-        // One transpose pass per query: stage-1 needs [nq, K] row-major for
-        // per-token probing, the exact kernels want centroid-major [K, nq]
-        // so a token's scores across query rows are one contiguous strip
-        // (vectorized fold + no K-strided gather per row).
-        Some(transpose_cdot(&query_centroid_scores))
+        // Stage-1's fused pass usually emitted the centroid-major matrix
+        // already; transpose here only on the ablation rungs that didn't.
+        Some(cdot_t_shared.unwrap_or_else(|| transpose_cdot(&query_centroid_scores)))
     } else {
         None
     };
@@ -863,7 +896,7 @@ pub fn stage1_shortlist(
     query: &Array2<f32>,
     params: &SearchParameters,
     subset: Option<&[i64]>,
-) -> Result<(Array2<f32>, Vec<i64>)> {
+) -> Result<(Array2<f32>, Option<Array2<f32>>, Vec<i64>)> {
     let num_centroids = index.codec.num_centroids();
     let num_query_tokens = query.nrows();
 
@@ -921,28 +954,33 @@ pub fn stage1_shortlist(
     let cells_to_probe: Vec<usize> = {
         let mut selected_centroids = HashSet::new();
 
+        // Select on a reused u32 index buffer over each row slice: the
+        // tuple-vec this replaces allocated and filled K (usize, f32) pairs
+        // per query token — 8 MB/query of churn at K = 32k — to select 8.
+        let qcs = query_centroid_scores
+            .as_slice()
+            .expect("query x centroid scores are standard layout");
+        let mut idx_buf: Vec<u32> = Vec::with_capacity(num_centroids);
         for q_idx in 0..num_query_tokens {
-            let mut centroid_scores: Vec<(usize, f32)> = match &eligible_centroids {
-                Some(eligible) => eligible
-                    .iter()
-                    .map(|&c| (c, query_centroid_scores[[q_idx, c]]))
-                    .collect(),
-                None => (0..num_centroids)
-                    .map(|c| (c, query_centroid_scores[[q_idx, c]]))
-                    .collect(),
-            };
+            let row = &qcs[q_idx * num_centroids..(q_idx + 1) * num_centroids];
+            idx_buf.clear();
+            match &eligible_centroids {
+                Some(eligible) => idx_buf.extend(eligible.iter().map(|&c| c as u32)),
+                None => idx_buf.extend(0..num_centroids as u32),
+            }
 
             // Partial selection: O(K) average instead of O(K log K) for full sort
             // After this, the top n elements are in positions 0..n
             // (but not sorted among themselves - which is fine since we use a HashSet)
-            let n_probe = effective_n_ivf_probe.min(centroid_scores.len());
-            if centroid_scores.len() > n_probe {
-                centroid_scores
-                    .select_nth_unstable_by(n_probe - 1, |a, b| cmp_score_descending(a.1, b.1));
+            let n_probe = effective_n_ivf_probe.min(idx_buf.len());
+            if idx_buf.len() > n_probe {
+                idx_buf.select_nth_unstable_by(n_probe - 1, |&a, &b| {
+                    cmp_score_descending(row[a as usize], row[b as usize])
+                });
             }
 
-            for (c, _) in centroid_scores.iter().take(n_probe) {
-                selected_centroids.insert(*c);
+            for &c in idx_buf.iter().take(n_probe) {
+                selected_centroids.insert(c as usize);
             }
         }
 
@@ -972,7 +1010,7 @@ pub fn stage1_shortlist(
     }
 
     if candidates.is_empty() {
-        return Ok((query_centroid_scores, vec![]));
+        return Ok((query_centroid_scores, None, vec![]));
     }
 
     // Compute approximate scores. Default: quantized centroid-major flood.
@@ -980,6 +1018,7 @@ pub fn stage1_shortlist(
     // NP_S1_ABLATE=rowmajor reverts to the scattered row-major path.
     // Research-branch ladder, same pattern as NP_ASYM_ABLATE.
     let s1_ablate = std::env::var("NP_S1_ABLATE").unwrap_or_default();
+    let mut cdot_t_shared: Option<Array2<f32>> = None;
     let mut approx_scores: Vec<(i64, f32)> = match s1_ablate.as_str() {
         "rowmajor" => candidates
             .par_iter()
@@ -1009,19 +1048,28 @@ pub fn stage1_shortlist(
                 .collect()
         }
         _ => {
-            let qt = transpose_quantize_cdot(&query_centroid_scores);
-            candidates
+            // Emit the f32 centroid-major matrix in the same pass when the
+            // asym Stage-2 will need it — one traversal serves both stages.
+            let emit_f32 = params.residual_asym && !index.metadata.binary;
+            let (qt, t32) = transpose_quantize_cdot(&query_centroid_scores, emit_f32);
+            cdot_t_shared = t32;
+            // u32 code side-array: 4 B/token reads instead of the mmap's 8.
+            let codes_all = index.codes_u32();
+            let scores = candidates
                 .par_iter()
                 .map_init(
                     || vec![0u8; num_query_tokens],
                     |acc, &doc_id| {
                         let start = index.doc_offsets[doc_id as usize];
                         let end = index.doc_offsets[doc_id as usize + 1];
-                        let codes = index.mmap_codes.slice(start, end);
-                        (doc_id, approximate_score_flood_q8(&qt, &codes, acc))
+                        (
+                            doc_id,
+                            approximate_score_flood_q8(&qt, &codes_all[start..end], acc),
+                        )
                     },
                 )
-                .collect()
+                .collect();
+            scores
         }
     };
     let t_approx = t_all.elapsed();
@@ -1070,7 +1118,7 @@ pub fn stage1_shortlist(
         );
     }
 
-    Ok((query_centroid_scores, to_decompress))
+    Ok((query_centroid_scores, cdot_t_shared, to_decompress))
 }
 
 /// Memory-efficient batched search for MmapIndex with large centroid counts.
@@ -1415,9 +1463,16 @@ mod transpose_tests {
 
             // q8 rung: monotone quantization keeps per-lane maxes; the
             // dequantized score is within nq * scale/2 of exact.
-            let qt = transpose_quantize_cdot(&cdot);
+            let (qt, t32) = transpose_quantize_cdot(&cdot, true);
+            let t32 = t32.expect("emit_f32 requested");
+            for q in 0..nq {
+                for c in 0..k {
+                    assert_eq!(t32[[c, q]], cdot[[q, c]], "fused f32 emit at ({q},{c})");
+                }
+            }
+            let codes32: Vec<u32> = codes.iter().map(|&c| c as u32).collect();
             let mut acc8 = vec![0u8; nq];
-            let got8 = approximate_score_flood_q8(&qt, &codes, &mut acc8);
+            let got8 = approximate_score_flood_q8(&qt, &codes32, &mut acc8);
             let tol = nq as f32 * qt.scale + 1e-4; // floor quant: err < 1 LSB per lane
             assert!(
                 (got8 - want).abs() <= tol,

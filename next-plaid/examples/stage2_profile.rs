@@ -377,7 +377,7 @@ fn main() {
         let mut cand_tokens = 0usize;
         for q in &queries {
             let t = Instant::now();
-            let (cdot, ids) = stage1_shortlist(&index, q, &params, None).unwrap();
+            let (cdot, _cdot_t, ids) = stage1_shortlist(&index, q, &params, None).unwrap();
             stage1_ms.push(t.elapsed().as_secs_f64() * 1e3);
             let ids: Vec<usize> = ids.iter().map(|&d| d as usize).collect();
             cand_docs += ids.len();

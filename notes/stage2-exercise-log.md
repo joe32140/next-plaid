@@ -596,3 +596,63 @@ edge17m is the per-(row,token) float fold + cdot gather epilogue — i.e.
 the on-hold vfold port (#32), not the expand. Kept the fix anyway: it is
 strictly correct, removes the "falls to scalar tail" asterisk from the
 final table, and the r4/r2 gain is real if modest.
+
+### 2026-07-23 — the Pareto figure, and a thermal drift that eats absolutes
+
+Built the blog's hero figure (x = NDCG@10, y = e2e qps, one ladder per
+scheme, dot area ∝ B/token). Three things came out of it worth keeping.
+
+**1. The join is exact for nfcorpus and scifact, and impossible for
+edge17m.** The shape manifests were extracted from those very bundles, so
+`nfcorpus` replays 862,599 tokens and the gte/lateon_reg quality cells are
+*also* 862,599 (scifact: 1,191,618 both sides). Same doc count, same token
+count, same dim — the latency/quality join needs no hand-waving. edge17m
+tokenizes the same corpora to 1,037,874 / 1,382,899 tokens, which no
+manifest matches, so it cannot carry a latency axis at all; the dim-48 CI
+cells replay *gte-tokenized* fiqa lengths at dim 48, which is a clean
+isolation of the dim variable but is not edge17m's real shape. fiqa joins
+only approximately at every size (quality strip used 4k/7k/14k/28k/57.6k
+doc subsets with judged docs pinned; the shape ladder is 4k/15k/52k
+prefixes).
+
+**2. Sustained-load thermal drift is 20–50% on absolutes and ~4% on
+ratios.** Five back-to-back profiler repeats on the M4, every cell, both
+schemes, monotonic: rep1→2 +19 to +38%, rep2→3 +3 to +17%, rep3→4 +1 to
++6%. It is not noise and it does not average out — a median over a
+drifting series is just a function of how many reps you ran. The
+float/asym ratio held to ±4% throughout, because the profiler measures
+both on one index seconds apart at the same thermal state. There is a
+within-repeat version too: cells run in fixed order, so the *first* cell
+drifts most between reps (28–32%) and the last least (19–20%) — rep 1 ran
+it cold, rep 2 ran it hot. **Protocol adopted: reps 1–2 are warm-up and
+are discarded; reps 3+ are the sustained state.** This is almost certainly
+the mechanism behind the retracted fiqa-15k "tie".
+
+**3. The result the figure is actually about.** At sustained state the
+float ladder slopes and the LUT ladder does not:
+
+| | r4 | r2 | r1 | slope |
+|---|---:|---:|---:|---|
+| nfcorpus float | 42.2 | 45.8 | 47.9 qps | +13.5% |
+| nfcorpus LUT | 142.3 | 143.9 | 145.0 qps | **+1.9%** |
+| scifact float | 32.6 | 35.7 | 37.1 qps | +13.8% |
+| scifact LUT | 83.5 | 84.0 | 83.7 qps | **+0.6%** |
+
+Mechanism: float's decompress cost scales with nbits, the LUT kernel's
+does not. So the gain is largest exactly where you want to operate (3.37×
+at r4 → 3.02× at r1 on nfcorpus; 2.56× → 2.26× on scifact), and **under
+LUT the residual-bits knob stops being a latency dial at all** — it is
+purely storage-vs-quality. Across all 12 points the largest quality gap
+between float and LUT is 0.0018 NDCG, favouring LUT.
+
+Two footnotes the write-up must carry: `e2e` is *not* `stage1 + prep +
+exact` (nfcorpus r4 leaves a 3.4 ms residual on float vs 0.57 ms on asym —
+the float path materializes ~134 MB of decompressed f32 per query that the
+`time3` loop partly amortizes), and the LUT path pays a one-time 29–59 ms
+inv-norms build on the first query per index.
+
+Also filed `~/beir-data/quant_grid/results/STALE-ASYM-WARNING.md`: the
+`asym` blocks in those Modal JSONs are from sha `60b0156` (pre-fix) and
+read *inverted* — arguana/lateon/r1 shows NDCG 0.1711 and asym slower than
+float, vs 0.3402 and 1.62× faster on fixed code. The float and binary
+columns there are fine and cross-check exactly against the M4 re-run.

@@ -1,14 +1,15 @@
-# Upstream PR body — ready for when #155 merges
+# Upstream PR body — READY (rebased on main 2026-07-23)
 
-Branch: `joe32140:feat/asymmetric-residual-lut` → `lightonai:main`
-(rebase onto main once #155 lands; the branch is stacked directly on it,
-so the rebase should be clean or empty).
+Branch: `joe32140:feat/asymmetric-residual-lut` → `lightonai:main`.
+#155 squash-merged as dd3ab5c; the CR is rebased onto origin/main
+(post-1.6.4, post-#159) with zero conflicts. Gates re-run on the rebased
+tree 2026-07-23: fmt ✓, clippy native ✓, clippy x86_64-apple-darwin ✓,
+`RUSTDOCFLAGS="-D warnings" cargo doc` ✓, 200 tests ✓.
 
-Open with (the PR body is everything below the `---`; extract it to a
-temp file first, or paste it into the GitHub UI):
+Open with (the PR body is everything below the `---`):
 
 ```bash
-cd /Users/joe/next-plaid-cr && git fetch origin && git rebase origin/main && git push --force-with-lease fork feat/asymmetric-residual-lut && gh pr create --repo lightonai/next-plaid --base main --head joe32140:feat/asymmetric-residual-lut --title "feat: asymmetric residual scoring — int8 query × fused LUT with SIMD MaxSim kernels" --body-file <(sed '1,/^---$/d' /Users/joe/next-plaid-lut/notes/lut-cr-pr-body.md)
+gh pr create --repo lightonai/next-plaid --base main --head joe32140:feat/asymmetric-residual-lut --title "feat: asymmetric residual scoring — int8 query × fused LUT with SIMD MaxSim kernels" --body-file <(sed '1,/^---$/d' /Users/joe/next-plaid-lut/notes/lut-cr-pr-body.md)
 ```
 
 ---
@@ -87,5 +88,20 @@ dense path).
 
 Measurement details, per-component ablations, and the bench harness live
 on the research branch `feat/asymmetric-lut-residual`.
+
+## Prior art
+
+The mechanism — scoring quantized codes in registers instead of
+decompressing them — is the asymmetric-distance-computation lineage:
+FAISS FastScan / [André et al., VLDB 2016](http://www.vldb.org/pvldb/vol9/p288-andre.pdf)
+established the SIMD-register nibble-LUT (`pshufb`) form for PQ, and
+[WARP (SIGIR 2025)](https://arxiv.org/abs/2501.17788) applied "implicit
+decompression" to late-interaction retrieval on CPU for XTR's PQ-style
+codec. This PR is the counterpart for **PLAID's per-dimension scalar
+residual codec**: rather than a precomputed-distance table (which fits
+PQ subspace codebooks), it expands codes to int8 *weights* in registers
+and runs an explicit int8 dot (SDOT / `maddubs` / `vpdpbusd`), which is
+what lets it reuse Stage-1's centroid term exactly and stay bit-compatible
+with the float path's renormalized semantics.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)

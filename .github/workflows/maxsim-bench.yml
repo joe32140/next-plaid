@@ -219,17 +219,17 @@ jobs:
       # rowmajor = the scattered baseline. NP_S1_PHASES prints the
       # per-phase decomposition to stderr for attribution.
       - name: stage1 rung — fiqa 15k q8 (default)
-        run: NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 15000
+        run: NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=r4,binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 15000
       - name: stage1 rung — fiqa 15k f32 layout-only
-        run: NP_S1_ABLATE=f32 NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 15000
+        run: NP_S1_ABLATE=f32 NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=r4,binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 15000
       - name: stage1 rung — fiqa 15k rowmajor baseline
-        run: NP_S1_ABLATE=rowmajor NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 15000
+        run: NP_S1_ABLATE=rowmajor NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=r4,binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 15000
       - name: stage1 rung — fiqa 52k q8 (default)
-        run: NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 52000
+        run: NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=r4,binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 52000
       - name: stage1 rung — fiqa 52k f32 layout-only
-        run: NP_S1_ABLATE=f32 NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 52000
+        run: NP_S1_ABLATE=f32 NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=r4,binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 52000
       - name: stage1 rung — fiqa 52k rowmajor baseline
-        run: NP_S1_ABLATE=rowmajor NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 52000
+        run: NP_S1_ABLATE=rowmajor NP_S1_PHASES=1 NO_BUILD=1 INDEX_TAGS=r4,binary INDEX_ROOT=indexes ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/fiqa 52000
 
       # Dim-48 ladder: the same fiqa shapes at edge-model dim. Latency is a
       # function of (shapes, dim), not embedding values, so this IS the

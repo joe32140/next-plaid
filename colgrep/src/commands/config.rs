@@ -56,7 +56,9 @@ pub fn cmd_set_model(model: &str) -> Result<()> {
     // Suppress stderr during model loading to hide CoreML's harmless
     // "Context leak detected" warnings on macOS
     let build_result = colgrep::stderr::with_suppressed_stderr(|| {
-        Colbert::builder(&model_path).with_quantized(true).build()
+        Colbert::builder(&model_path)
+            .with_quantized(colgrep::resolve_quantized(&model_path, true))
+            .build()
     });
     match build_result {
         Ok(_) => {

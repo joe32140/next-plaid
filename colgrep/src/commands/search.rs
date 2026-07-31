@@ -1065,6 +1065,8 @@ fn search_single_path(
     // Ensure model is downloaded (quiet if we already have an index)
     let has_existing_index = local_index_exists || parent_info.is_some();
     let model_path = ensure_model(Some(&model), has_existing_index)?;
+    // The repo may ship only one precision; fall back rather than fail at load.
+    let quantized = colgrep::resolve_quantized(&model_path, quantized);
 
     // Determine effective project root and subdirectory filter
     let (effective_root, subdir_filter): (PathBuf, Option<PathBuf>) = match &parent_info {

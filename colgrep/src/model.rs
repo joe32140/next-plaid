@@ -6,15 +6,17 @@ pub const DEFAULT_MODEL: &str = "lightonai/LateOn-Code-edge";
 
 /// Files required for ColBERT model
 const REQUIRED_FILES: &[&str] = &[
-    "model_int8.onnx",
     "tokenizer.json",
     "config_sentence_transformers.json",
     "config.json",
     "onnx_config.json",
 ];
 
-/// Optional files (non-quantized model)
-const OPTIONAL_FILES: &[&str] = &["model.onnx"];
+/// Model weight files. At least one must be present, but neither is required on
+/// its own: repos legitimately ship FP32 only, INT8 only, or both. Requiring
+/// `model_int8.onnx` outright made FP32-only repos undownloadable even on CUDA
+/// builds, which never load the quantized weights.
+const WEIGHT_FILES: &[&str] = &["model.onnx", "model_int8.onnx"];
 
 /// Load model from cache or download from HuggingFace.
 /// Returns path to the model directory.
@@ -62,10 +64,43 @@ pub fn ensure_model(model_id: Option<&str>, _quiet: bool) -> Result<PathBuf> {
         }
     }
 
-    // Try to download optional files (non-quantized model) - ignore errors
-    for file in OPTIONAL_FILES {
-        let _ = repo.get(file);
+    // Fetch whichever weight files the repo publishes. Missing ones are fine as
+    // long as at least one variant lands.
+    let mut available_weights = Vec::new();
+    for file in WEIGHT_FILES {
+        if let Ok(path) = repo.get(file) {
+            if model_dir.is_none() {
+                model_dir = path.parent().map(|p| p.to_path_buf());
+            }
+            available_weights.push(*file);
+        }
+    }
+
+    if available_weights.is_empty() {
+        anyhow::bail!(
+            "Model '{}' publishes neither model.onnx nor model_int8.onnx. \
+             It does not look like an ONNX export; run `pylate-onnx-export {}` first.",
+            model_id,
+            model_id
+        );
     }
 
     model_dir.ok_or_else(|| anyhow::anyhow!("Failed to determine model directory"))
+}
+
+/// Resolve the precision that is actually loadable from `model_dir`.
+///
+/// `requested` follows the user's `--fp32`/`--int8` preference (or the per-build
+/// default), but a repo may ship only one variant. Falling back keeps a
+/// FP32-only or INT8-only model usable instead of failing at session load.
+pub fn resolve_quantized(model_dir: &std::path::Path, requested: bool) -> bool {
+    let has_int8 = model_dir.join("model_int8.onnx").exists();
+    let has_fp32 = model_dir.join("model.onnx").exists();
+    match (requested, has_int8, has_fp32) {
+        // Wanted INT8, only FP32 shipped.
+        (true, false, true) => false,
+        // Wanted FP32, only INT8 shipped.
+        (false, true, false) => true,
+        _ => requested,
+    }
 }

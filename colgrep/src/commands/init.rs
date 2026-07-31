@@ -56,6 +56,8 @@ pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
 
     // Ensure model is downloaded
     let model_path = ensure_model(Some(&model), has_existing_index)?;
+    // The repo may ship only one precision; fall back rather than fail at load.
+    let quantized = colgrep::resolve_quantized(&model_path, quantized);
 
     let mut builder = IndexBuilder::with_options(
         &effective_root,

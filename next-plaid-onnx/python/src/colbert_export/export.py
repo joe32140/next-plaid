@@ -199,9 +199,21 @@ def export_model(
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save tokenizer for later use (save the underlying fast tokenizer)
+    # Save tokenizer for later use (save the underlying fast tokenizer).
+    #
+    # Clear any truncation/padding state first. pylate sets these per call
+    # (query_length for queries, document_length for documents), so whatever
+    # happens to be configured at export time would otherwise be frozen into
+    # tokenizer.json. lightonai/Reason-ModernColBERT, for instance, ships a
+    # query-shaped truncation of 127, which silently clips every document to
+    # 127 tokens instead of document_length (8192). The Rust reader truncates
+    # to query_length/document_length itself and builds its own padding, so the
+    # exported tokenizer must carry neither.
     tokenizer_output_path = output_dir / "tokenizer.json"
-    tokenizer.backend_tokenizer.save(str(tokenizer_output_path))
+    backend_tokenizer = tokenizer.backend_tokenizer
+    backend_tokenizer.no_truncation()
+    backend_tokenizer.no_padding()
+    backend_tokenizer.save(str(tokenizer_output_path))
 
     if verbose:
         print(f"Saved tokenizer to: {tokenizer_output_path}")

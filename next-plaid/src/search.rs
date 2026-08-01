@@ -945,11 +945,8 @@ pub fn search_one_mmap(
     // in-flight decompressed docs are bounded by the thread count either
     // way, and the chunk count (8 at n_decompress = 1024) underfilled and
     // straggled the pool — measured 6.1 effective threads on a 10-core M4.
-    // min_len floors task granularity: at ~17 µs per asym doc, fully
-    // per-doc tasks measurably pay steal overhead on 4-core runners.
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
         .par_iter()
-        .with_min_len(8)
         .filter_map(|&doc_id| {
             let score = exact_doc_score(index, &exact_query, cdot_t.as_ref(), doc_id as usize)?;
             Some((doc_id, score))
@@ -1478,10 +1475,9 @@ fn search_one_mmap_batched(
     // Per-doc parallelism, same rationale as the dense path: adaptive
     // splitting feeds every core; in-flight decompressed docs are bounded by
     // the thread count, so the old fixed 128-doc chunking bought no memory
-    // safety — only pool underfill. min_len floors steal granularity.
+    // safety — only pool underfill.
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
         .par_iter()
-        .with_min_len(8)
         .filter_map(|&doc_id| {
             let score = match (&exact_query, &asym_compact) {
                 (ScoreQuery::ResidualLut { q8, lut, planes }, Some((cd, remap))) => {

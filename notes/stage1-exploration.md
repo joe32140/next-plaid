@@ -292,6 +292,36 @@ is the method doing its job.
 Combined night effect at fiqa-52k on M4: **asym e2e 5.01 → 3.77 ms**
 (stage-1 round) → and the stage-1 wins carry every scheme.
 
+### Cross-platform read of the par_iter fix + the granularity floor
+
+Cross-run CI (30692851529 → 30708616379 → 30709931168), and a
+methodological faceplant worth keeping:
+
+1. Eyeballing the fiqa-52k rows of the par_iter run, I read "x86 asym
+   consistently 0.95–0.97×", diagnosed steal overhead at ~17 µs/doc
+   tasks, and committed a `with_min_len(8)` floor (fbe6f0c).
+2. The *geomean over all 32 cells* told the truth: pure per-doc on x86
+   was **1.006×** — neutral. The 0.95s were instance noise concentrated
+   in the rows I happened to look at. The floor run then measured 0.914×
+   on a *different* x86 instance — the same noise class, now pointing the
+   other way. Neoverse: 1.028× (per-doc) vs 1.057× (floor), also within
+   the band.
+3. Theory agrees the two shapes are near-identical: rayon splits ranges
+   adaptively on steal demand — it never creates per-element tasks — so
+   a manual floor defends against a machine that doesn't exist. Both M4
+   measurements concur (2.19 vs 2.25 ms, noise).
+
+**Reverted the floor; pure per-doc par_iter is the final shape.**
+Lesson recorded next to the thermal-drift protocol: cross-run CI deltas
+are per-instance; never diagnose from a row subset when the harness gives
+you 32 cells to geomean — and when a "fix" only helps under a theory the
+scheduler doesn't implement, re-derive before committing.
+
+Net cross-platform read of the stage-2 round (vs pre-round, all cells):
+M4 asym e2e 4.49 → 3.77 ms (1.19×, clean same-box A/B); Neoverse
++3–6% geomean; x86 neutral; macOS VM unreadable. The M4/Neoverse win is
+real and core-count-dependent, exactly as adaptive splitting predicts.
+
 ### Follow-ups deliberately left
 - Port the same mechanics to the batched-centroid path (>~335k docs).
 - Recall-coupled ideas (bound pruning, adaptive probing) — quality-gated

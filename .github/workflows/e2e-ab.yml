@@ -95,11 +95,13 @@ jobs:
           for r in r4 r2 r1; do
             for idx in indexes/shapes-*_${r}; do
               [ -d "$idx" ] || { echo "SKIP pattern $r"; continue; }
+              ds=$(basename "$idx"); ds=${ds#shapes-}; ds=${ds%%-*}
+              lens=next-plaid/examples/shapes/$ds/query_lens.npy
               for rep in 1 2; do
                 echo "===== idx=$idx rep=$rep variant=main"
-                NP_S1_PHASES=1 NP_S2_PHASES=1 "$MAIN" "$idx" '{}' 100
+                NP_S1_PHASES=1 NP_S2_PHASES=1 "$MAIN" "$idx" "$lens" '{}'
                 echo "===== idx=$idx rep=$rep variant=ours"
-                NP_S1_PHASES=1 NP_S2_PHASES=1 "$OURS" "$idx" '{}' 100
+                NP_S1_PHASES=1 NP_S2_PHASES=1 "$OURS" "$idx" "$lens" '{}'
               done
             done
           done

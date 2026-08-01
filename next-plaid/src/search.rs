@@ -18,10 +18,23 @@ type ProbePartial = (
     HashMap<usize, f32>,
 );
 
-/// Maximum number of documents to decompress concurrently during exact scoring.
-/// This limits peak memory usage from parallel decompression.
-/// With 128 docs × ~300KB per doc = ~40MB max concurrent decompression memory.
-const DECOMPRESS_CHUNK_SIZE: usize = 128;
+// EXPERIMENT(stage-2 decomposition): NP_S2_PHASES=1 prints one line per query
+// with wall micros for each region of search_one_mmap after stage-1, plus
+// per-doc kernel CPU time accumulated across the scoring pool. The mmap views
+// are lazy — bytes fault inside the kernel — so a load/compute split needs
+// NP_S2_PRETOUCH=1, which walks the residual bytes (one per cache line) in a
+// separately-timed pass; the kernel-time delta between modes is memory wait.
+// Research branch only.
+fn s2_phases() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("NP_S2_PHASES").is_ok())
+}
+fn s2_pretouch() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("NP_S2_PRETOUCH").is_ok())
+}
+static S2_KERN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static S2_LOAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Search parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,20 +169,60 @@ fn exact_doc_score(
     cdot_t: Option<&Array2<f32>>,
     doc_id: usize,
 ) -> Option<f32> {
+    // Timed pre-touch of the doc's residual bytes (one read per cache line):
+    // attributes page-fault/memory wait separately from kernel compute.
+    let pretouch = |start: usize, end: usize| {
+        if s2_pretouch() {
+            let t = std::time::Instant::now();
+            let rows = index.mmap_residuals.slice_rows(start, end);
+            if let Some(s) = rows.as_slice() {
+                let mut acc = 0u64;
+                for i in (0..s.len()).step_by(64) {
+                    acc = acc.wrapping_add(s[i] as u64);
+                }
+                std::hint::black_box(acc);
+            }
+            S2_LOAD_NS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    };
+    let timed = |f: &mut dyn FnMut() -> Option<f32>| {
+        if s2_phases() {
+            let t = std::time::Instant::now();
+            let s = f();
+            S2_KERN_NS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            s
+        } else {
+            f()
+        }
+    };
     match query {
         ScoreQuery::Binary(q8) => {
             let start = index.doc_offsets[doc_id];
             let end = index.doc_offsets[doc_id + 1];
-            let doc_bits = index.mmap_residuals.slice_rows(start, end);
-            Some(crate::binary::maxsim_binary_i8(
-                q8,
-                &doc_bits,
-                index.codec.embedding_dim(),
-            ))
+            pretouch(start, end);
+            timed(&mut || {
+                let doc_bits = index.mmap_residuals.slice_rows(start, end);
+                Some(crate::binary::maxsim_binary_i8(
+                    q8,
+                    &doc_bits,
+                    index.codec.embedding_dim(),
+                ))
+            })
         }
         ScoreQuery::Float(q) => {
-            let doc = index.get_document_embeddings(doc_id).ok()?;
-            Some(colbert_score(&q.view(), &doc.view()))
+            let start = index.doc_offsets[doc_id];
+            let end = index.doc_offsets[doc_id + 1];
+            pretouch(start, end);
+            timed(&mut || {
+                let doc = index.get_document_embeddings(doc_id).ok()?;
+                Some(colbert_score(&q.view(), &doc.view()))
+            })
         }
         ScoreQuery::ResidualLut { q8, lut, planes } => {
             // Needs the query×centroid matrix for the centroid term, in the
@@ -179,18 +232,21 @@ fn exact_doc_score(
             let inv_norms = index.residual_inv_norms()?;
             let start = index.doc_offsets[doc_id];
             let end = index.doc_offsets[doc_id + 1];
-            let packed = index.mmap_residuals.slice_rows(start, end);
-            let codes = index.mmap_codes.slice(start, end);
-            Some(crate::residual_lut::maxsim_residual_lut_i8(
-                q8,
-                planes.as_ref(),
-                &packed,
-                &codes,
-                &cdot_t.view(),
-                lut,
-                &inv_norms[start..end],
-                index.codec.embedding_dim(),
-            ))
+            pretouch(start, end);
+            timed(&mut || {
+                let packed = index.mmap_residuals.slice_rows(start, end);
+                let codes = index.mmap_codes.slice(start, end);
+                Some(crate::residual_lut::maxsim_residual_lut_i8(
+                    q8,
+                    planes.as_ref(),
+                    &packed,
+                    &codes,
+                    &cdot_t.view(),
+                    lut,
+                    &inv_norms[start..end],
+                    index.codec.embedding_dim(),
+                ))
+            })
         }
     }
 }
@@ -852,8 +908,10 @@ pub fn search_one_mmap(
         return search_one_mmap_batched(index, query, params, subset);
     }
 
+    let t_all = std::time::Instant::now();
     let (query_centroid_scores, cdot_t_shared, to_decompress) =
         stage1_shortlist(index, query, params, subset)?;
+    let t_s1 = t_all.elapsed();
 
     if to_decompress.is_empty() {
         return Ok(QueryResult {
@@ -861,6 +919,10 @@ pub fn search_one_mmap(
             passage_ids: vec![],
             scores: vec![],
         });
+    }
+    if s2_phases() {
+        S2_KERN_NS.store(0, std::sync::atomic::Ordering::Relaxed);
+        S2_LOAD_NS.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     // Compute exact scores. Binary indexes score against an int8 query; the
@@ -876,19 +938,21 @@ pub fn search_one_mmap(
     } else {
         None
     };
+    let t_prep = t_all.elapsed();
+    // Per-doc parallelism: rayon splits adaptively, so all cores stay fed
+    // and variable doc lengths balance. The fixed 128-doc chunking this
+    // replaces served a decompression-memory rationale that no longer holds:
+    // in-flight decompressed docs are bounded by the thread count either
+    // way, and the chunk count (8 at n_decompress = 1024) underfilled and
+    // straggled the pool — measured 6.1 effective threads on a 10-core M4.
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
-        .par_chunks(DECOMPRESS_CHUNK_SIZE)
-        .flat_map(|chunk| {
-            chunk
-                .iter()
-                .filter_map(|&doc_id| {
-                    let score =
-                        exact_doc_score(index, &exact_query, cdot_t.as_ref(), doc_id as usize)?;
-                    Some((doc_id, score))
-                })
-                .collect::<Vec<_>>()
+        .par_iter()
+        .filter_map(|&doc_id| {
+            let score = exact_doc_score(index, &exact_query, cdot_t.as_ref(), doc_id as usize)?;
+            Some((doc_id, score))
         })
         .collect();
+    let t_score = t_all.elapsed();
 
     // Sort by exact score
     exact_scores.sort_by(|a, b| cmp_score_descending(a.1, b.1));
@@ -905,6 +969,21 @@ pub fn search_one_mmap(
         .take(result_count)
         .map(|(_, s)| *s)
         .collect();
+
+    if s2_phases() {
+        let t_end = t_all.elapsed();
+        eprintln!(
+            "S2PHASE s1={} prep={} score={} sortemit={} total={} ndocs={} kern_cpu={} load_cpu={}",
+            t_s1.as_micros(),
+            (t_prep - t_s1).as_micros(),
+            (t_score - t_prep).as_micros(),
+            (t_end - t_score).as_micros(),
+            t_end.as_micros(),
+            to_decompress.len(),
+            S2_KERN_NS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+            S2_LOAD_NS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+        );
+    }
 
     Ok(QueryResult {
         query_id: 0,
@@ -1393,29 +1472,28 @@ fn search_one_mmap_batched(
     } else {
         None
     };
+    // Per-doc parallelism, same rationale as the dense path: adaptive
+    // splitting feeds every core; in-flight decompressed docs are bounded by
+    // the thread count, so the old fixed 128-doc chunking bought no memory
+    // safety — only pool underfill.
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
-        .par_chunks(DECOMPRESS_CHUNK_SIZE)
-        .flat_map(|chunk| {
-            chunk
-                .iter()
-                .filter_map(|&doc_id| {
-                    let score = match (&exact_query, &asym_compact) {
-                        (ScoreQuery::ResidualLut { q8, lut, planes }, Some((cd, remap))) => {
-                            exact_doc_score_asym_compact(
-                                index,
-                                q8,
-                                lut,
-                                planes.as_ref(),
-                                cd,
-                                remap,
-                                doc_id as usize,
-                            )
-                        }
-                        _ => exact_doc_score(index, &exact_query, None, doc_id as usize),
-                    }?;
-                    Some((doc_id, score))
-                })
-                .collect::<Vec<_>>()
+        .par_iter()
+        .filter_map(|&doc_id| {
+            let score = match (&exact_query, &asym_compact) {
+                (ScoreQuery::ResidualLut { q8, lut, planes }, Some((cd, remap))) => {
+                    exact_doc_score_asym_compact(
+                        index,
+                        q8,
+                        lut,
+                        planes.as_ref(),
+                        cd,
+                        remap,
+                        doc_id as usize,
+                    )
+                }
+                _ => exact_doc_score(index, &exact_query, None, doc_id as usize),
+            }?;
+            Some((doc_id, score))
         })
         .collect();
 

@@ -239,6 +239,59 @@ r4+LUT on M4: 5.01 ms mean. Quality: unchanged to 4 decimals (gate above).
   par_iter upstream); extending it to the GEMM and transpose is
   consistency, not a new policy.
 
+## Stage-2 round (same night, after Joe's go-ahead)
+
+Applied the same method to stage-2. New NP_S2_PHASES instrumentation
+splits search_one_mmap into s1 / prep / score / sortemit / glue walls plus
+pooled kernel CPU time; NP_S2_PRETOUCH adds a timed cache-line walk of the
+residual bytes to separate memory wait from compute (the mmap views are
+lazy, so a naive load timer measures nothing).
+
+### Decomposition (M4, fiqa-52k, per-scheme medians)
+
+| scheme | total | s1 | prep | score wall | sortemit | glue | kern CPU |
+|---|---|---|---|---|---|---|---|
+| asym r4 | 4.49 | 1.59 | 0.01 | 2.86 | 0.02 | **0.01** | 17.35 |
+| float r4 | 16.09 | 1.49 | 0.00 | 14.64 | 0.02 | −0.06 | 92.25 |
+| binary | 2.56 | 1.50 | 0.00 | 1.06 | 0.00 | −0.01 | 6.13 |
+
+Hypotheses killed by the numbers, before any code:
+- **"Missing 0.85 ms of glue": DEAD.** Glue is ~0.01 ms. The earlier gap
+  was an artifact of comparing the harness's isolated-exact loop with e2e.
+- **Memory wait: ~nil on the warm M4.** Pretouch walk = 0.6 ms CPU across
+  the whole pool; kernel time unchanged. Id-sorted scoring and
+  RAM-resident residuals are non-events here (CI-cold-cache questions at
+  most).
+- Prep and sortemit: both ≈ 0. Nothing to do.
+
+What survived: **parallel shape.** score wall 2.86 ms vs 17.35 ms kernel
+CPU = 6.1 effective threads on a 10-core M4, because the loop split 1024
+docs into exactly 8 fixed chunks (DECOMPRESS_CHUNK_SIZE = 128): two cores
+never get work and one long-doc chunk straggles. The chunking's memory
+rationale is vestigial — in-flight decompressed docs are bounded by thread
+count either way (confirming the par_chunks study). Fix: plain par_iter
+with adaptive splitting, both dense and batched paths.
+
+### Fix measured (M4, fiqa-52k)
+
+| scheme | score wall | total | effective threads |
+|---|---|---|---|
+| asym r4 | 2.86 → **2.19 ms** (1.31×) | 4.49 → **3.77 ms** | 6.1 → 9.4 |
+| binary | 1.06 → **0.82 ms** (1.29×) | 2.56 → **2.29 ms** | |
+| float r4 | 14.64 → 12.56 ms (1.17×) | 16.09 → 14.43 ms | |
+
+Pooled kernel CPU rose (E-cores now participate and are slower per op) —
+wall is what matters, and the pool is full. With scheduling fixed, the
+remaining stage-2 time IS the kernel, which nano-plaid already
+characterized near its roofline. The only exact-mechanics idea left is
+doc-batching to amortize query tile loads — invasive, uncertain payoff,
+deliberately not started tonight. Everything else on the stage-2 idea list
+was killed by the decomposition before a line of code was written, which
+is the method doing its job.
+
+Combined night effect at fiqa-52k on M4: **asym e2e 5.01 → 3.77 ms**
+(stage-1 round) → and the stage-1 wins carry every scheme.
+
 ### Follow-ups deliberately left
 - Port the same mechanics to the batched-centroid path (>~335k docs).
 - Recall-coupled ideas (bound pruning, adaptive probing) — quality-gated

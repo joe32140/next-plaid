@@ -372,3 +372,62 @@ artifact (phase-ladder-diagram). fiqa-15k r4 headline: mainline
 are not bitwise identical between builds (expected — LCG queries sit in
 near-tie regimes and the q8 shortlist reshuffles tails); parity is claimed
 on real-embedding nDCG, not list identity.
+
+## Stage-2 wall split: decompress vs compute (diagram v2)
+
+Mainline's `exact_doc_score` float arm now times `get_document_embeddings`
+(S2_DEC_NS) and `colbert_score` (S2_COMP_NS) per doc when NP_S2_PHASES is
+set (worktree patch, exported to .github/mainline-phase-timers.patch on the
+branch). The stage-2 *wall* is split proportionally to those pooled CPU
+medians — the phases interleave inside one parallel loop, so a direct wall
+split doesn't exist; the CPU-share proxy is stated on the diagram. First
+measurement ran while the r2/r1 nDCG task owned the box: every phase ~2x
+inflated and dec shares off by up to 10 points vs clean (60.1% vs 70.8% on
+fiqa r4) — discarded per the idle-box rule, rerun clean (ph3 logs):
+
+  cell          dec_share  (dec_wall/comp_wall applied to published s2)
+  fiqa r4/r2/r1     70.8 / 68.5 / 66.6 %
+  scifact r4/r2/r1  66.0 / 62.7 / 61.0 %
+
+Branch bars carry no decompress segment at all — that absence IS the asym
+route's thesis, rendered literally.
+
+## Cross-platform mainline-vs-branch e2e (e2e-ab workflow)
+
+New dispatch-only fork workflow (.github/workflows/e2e-ab.yml): restores
+the maxsim-bench stage2-idx caches, checks out fork main @76092e1
+(= upstream v1.6.5) beside the branch, grafts the identical e2e_bench.rs
+into it plus the runtime-gated timer patch, builds both, and interleaves
+main/ours-float/ours-asym per cell (nfcorpus/scifact/fiqa15k x r4/r2/r1)
+on ubuntu-latest, macos-latest, ubuntu-24.04-arm. Registration copy of the
+yml lives on fork main (workflow_dispatch only resolves workflows present
+on the default branch; the run itself uses the feature branch's file and
+cache scope).
+
+Run 3 finding (main vs ours-float only): stage-1 replicates everywhere
+(x86 16.6->2.5 ms, Neoverse 20->1.9, macOS 13->1.8 on summed medians) but
+e2e ratios were only 1.19/1.43/1.41x geomean — because `{}` params leave
+residual_asym at its default FALSE, so ours ran the float stage-2, and on
+4-vCPU shared VMs the float rescore (~30-65 ms, dec share 65-83%) swamps
+e2e. Confirmed by digest fingerprints (22-27/50 agreement = float's
+signature; asym's is 1-10/50). Lesson: an e2e A/B measures the *config*,
+not the branch — state which switches are on. Run 4 adds the asym variant;
+verdict table below when it lands.
+
+Run 4 verdict (main `{}` vs ours `{}` vs ours `{"residual_asym":true}`,
+2 interleaved reps x 100 timed queries per cell, 9 cells/platform):
+
+  platform      stage-1 only   full campaign   mainline dec share
+  x86 AVX2         1.20x           5.85x           74-83%
+  Neoverse         1.47x           7.08x           67-76%
+  macOS arm64      1.34x           5.62x           71-80%
+  (geomeans over nfcorpus/scifact/fiqa15k x r4/r2/r1; M4 local single-cell
+   reference: 6.3x fiqa-15k r4, 6.5x fiqa-52k r4)
+
+Per-cell spread: full-campaign ratios 4.5-7.5x, largest on nfcorpus r4 and
+on Neoverse (scatter-heaviest stage 1). Stage-1 summed medians replicate
+the M4 story on every platform: x86 16.6->2.5 ms, Neoverse ~20-24->1.9,
+macOS ~15-18->2.6. The multi-platform claim now stands as: 5.6-7.1x e2e
+geomean vs upstream v1.6.5 on all three CI microarchitectures plus 6.3x
+measured natively on the M4, r in {1,2,4}, same-box interleave protocol
+everywhere. Logs: scratchpad s1x/ci_ab/, parser parse_ci_ab.py.

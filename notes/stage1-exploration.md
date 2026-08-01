@@ -322,6 +322,30 @@ M4 asym e2e 4.49 → 3.77 ms (1.19×, clean same-box A/B); Neoverse
 +3–6% geomean; x86 neutral; macOS VM unreadable. The M4/Neoverse win is
 real and core-count-dependent, exactly as adaptive splitting predicts.
 
+## Mainline head-to-head (the "zero CRs" comparison)
+
+`examples/e2e_bench.rs`: one source file that compiles against both trees
+(SearchParameters via JSON overlaid on defaults, so `residual_asym` is
+honored on the branch and serde-ignored on main). Upstream main @ 76092e1
+(1.6.5, includes the merged binary-quant work) in a worktree at
+`/Users/joe/np-mainline`; same cached indexes, same 50 LCG queries with
+real length manifests, warmup pass discarded, mainline↔ours interleaved
+per rep. M4, idle, arm64-verified.
+
+| cell | mainline | ours float | ours asym/binary | vs mainline |
+|---|---|---|---|---|
+| fiqa-52k r4 | 27.40 ms (p95 34.2) | 15.78 (1.74×) | **4.24** (p95 5.9) | **6.5×** |
+| fiqa-52k binary | 12.73 | — | **2.56** | **5.0×** |
+| scifact r4 | 20.71 | — | **3.65** | **5.7×** |
+| scifact binary | 5.91 | — | **1.90** | **3.1×** |
+
+Readings: (a) full stack = 5.7–6.5× on r4 at iso-quality; (b) "ours
+float" isolates the stage-1+scheduling CR value for existing users: 1.74×
+with stage-2 untouched; (c) mainline's binary is slower than our r4-asym
+at 52k — old stage-1 dominates so completely that the cheapest stage-2
+can't save it, which is the strongest argument that the stage-1 CR is
+what unlocks the already-merged binary work.
+
 ### Follow-ups deliberately left
 - Port the same mechanics to the batched-centroid path (>~335k docs).
 - Recall-coupled ideas (bound pruning, adaptive probing) — quality-gated

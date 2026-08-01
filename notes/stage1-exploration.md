@@ -135,6 +135,26 @@ quantize prep, same disjoint-block argument as E2).
   sort micro-opts) is < 0.1 ms on the table and platform-fragile.
   Committed as 4a2a917.
 
+## Self-review of the final diff (9d1f16d..4a7e600)
+
+Line-by-line pass over every hunk, hunting inverted conditions, bounds,
+ties, and empty-input edges. Findings:
+- `probe_top_k_scan`: a NaN score can occupy a slot during the fill phase
+  (first n values) and is never evicted (`v > thr` is false for NaN, and
+  argmin skips NaN). Reachable only with corrupt embeddings — the old
+  `select_nth` comparator had its own NaN-last convention, so behavior
+  differs only on corrupt data. Documented, not guarded.
+- `probe_top_k_scan` insert cost is O(n) per insert (argmin rescan); fine
+  at n_ivf_probe ≤ 64, degrades gracefully for exotic configs.
+- `get_candidates` now panics on an out-of-range ivf doc id where the old
+  code silently propagated it into `doc_offsets` (which then panicked
+  anyway). Strictly earlier failure, same class.
+- Empty-input edges (no candidates, empty rows, nq=0) all fall through to
+  the same results as before; sum overflow impossible (255·stride ≪ u32).
+Everything else: exact-equivalence arguments hold (bit-identity tests for
+par_cdot and the fused emit; value-multiset test for the scan; identical
+output construction for the bitmap gather).
+
 ## Cross-platform validation (fork CI run 30690316753 vs 30073526835)
 
 fiqa-52k, default rung, per-phase medians. Cross-run comparison on shared
@@ -176,9 +196,56 @@ Runs: {nfcorpus_gte, scifact_gte} × {default q8, NP_S1_ABLATE=f32} ×
 | nfcorpus | residual-nbits4 | 0.3809 | 0.3809 | **0.0000** |
 | nfcorpus | binary-int8x1bit | 0.2875 | 0.2875 | **0.0000** |
 | nfcorpus | r4 + asym-LUT | 0.3811 | 0.3811 | **0.0000** |
-| scifact | residual-nbits4 | 0.7609 | (running) | |
-| scifact | binary-int8x1bit | 0.6865 | (running) | |
-| scifact | r4 + asym-LUT | 0.7607 | (running) | |
+| scifact | residual-nbits4 | 0.7609 | 0.7609 | **0.0000** |
+| scifact | binary-int8x1bit | 0.6865 | 0.6865 | **0.0000** |
+| scifact | r4 + asym-LUT | 0.7607 | 0.7607 | **0.0000** |
+
+**GATE PASSED.** q8 flood is quality-free at nDCG@10 to four decimals on
+both datasets, both schemes, and under the stage-2 LUT overlay. q8 stays
+the default.
+
+## Night's conclusion
+
+### What worked (final combination, all default-on)
+1. **E2 par_cdot** — column-block-parallel GEMM, bit-identical. cdot
+   2.7–3.8× everywhere.
+2. **E1 probe_top_k_scan** — running-threshold chunk scan. 6.7× (M4) to
+   13× (Neoverse) on the probe; the biggest per-phase ratio of the night.
+3. **E7 register-accumulator flood** — stride-padded q8 matrix,
+   chunk-outer loop, `[u8;16]` in a vector register. Flood 3.6× on M4;
+   the single biggest absolute win (2.29 → 0.53 ms at 52k).
+4. **E8 bitmap gather** — O(postings) dedup emitting the sorted list
+   directly. 4–5.5× on the phase.
+5. **E5 parallel transpose+quantize** — bit-identical block parallelism;
+   modest (~1.7×) but free.
+6. **E4 sorted probe cells** — neutral on M4, kept for server parts where
+   sequential postings reads matter; cost ≈ 0.
+
+Stage-1 fiqa-52k end state: M4 6.70→1.66 ms (4.0×), Neoverse 12.63→3.81
+(3.3×), x86 15.62→5.52 (2.8×), macOS VM 16.98→4.84 (3.5×). e2e fiqa-52k
+r4+LUT on M4: 5.01 ms mean. Quality: unchanged to 4 decimals (gate above).
+
+### What didn't work / what we learned
+- **E3 code dedup: killed by a 10-minute measurement** (dup rate 1–4%) —
+  the cheapest kill of the night; measure before writing kernels.
+- The flood's cost was never the `umax`s — it was accumulator memory
+  traffic and dynamic-trip-count loop overhead. Same lesson as the last
+  round's `(*a).max(v)` story, one level up: **shape the loop so the hot
+  state lives in a register and the trip counts are static.**
+- The M4 understates every scatter win (probe 6.7× local vs 13× Neoverse;
+  gather neutral-looking E4). Cross-platform CI remains mandatory before
+  claiming a layout change is worthless.
+- Intra-query parallelism was already stage-1's contract (the flood used
+  par_iter upstream); extending it to the GEMM and transpose is
+  consistency, not a new policy.
+
+### Follow-ups deliberately left
+- Port the same mechanics to the batched-centroid path (>~335k docs).
+- Recall-coupled ideas (bound pruning, adaptive probing) — quality-gated
+  chapter, needs the WARP read first.
+- The stage-1 work now merits its own CR stacked on the stage-2 LUT CR;
+  curation night pattern applies (strip NP_S1_PHASES, keep NP_S1_ABLATE?
+  — decide at curation).
 
 The u8 quantization of flood scores is invisible at nDCG@10 to four
 decimals on nfcorpus — the 4096-deep prune cut absorbs sub-LSB rank

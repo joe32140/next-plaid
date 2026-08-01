@@ -74,6 +74,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: graft bench example + phase timers onto mainline
         run: |
+          mkdir -p mainline/next-plaid/examples
           cp next-plaid/examples/e2e_bench.rs mainline/next-plaid/examples/e2e_bench.rs
           git -C mainline apply --check ../.github/mainline-phase-timers.patch
           git -C mainline apply ../.github/mainline-phase-timers.patch

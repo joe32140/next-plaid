@@ -57,7 +57,10 @@ fn main() {
         .collect();
 
     // Pass 0 warms the page cache and lazy caches; passes 1-2 are timed.
+    // Pass 0 also digests each query's ranked ids (FNV-1a) so two builds can
+    // be compared for result-list identity on the same queries.
     let mut times_ms: Vec<f64> = Vec::new();
+    let mut digests: Vec<u64> = Vec::new();
     for pass in 0..3 {
         for q in &queries {
             let t = std::time::Instant::now();
@@ -65,9 +68,18 @@ fn main() {
             std::hint::black_box(r.passage_ids.len());
             if pass > 0 {
                 times_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            } else {
+                let mut h: u64 = 1469598103934665603;
+                for &id in &r.passage_ids {
+                    h ^= id as u64;
+                    h = h.wrapping_mul(1099511628211);
+                }
+                digests.push(h);
             }
         }
     }
+    let hex: Vec<String> = digests.iter().map(|h| format!("{h:016x}")).collect();
+    println!("RESULTS_DIGEST index={index_dir} params={params_json} q={}", hex.join(","));
     times_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mean = times_ms.iter().sum::<f64>() / times_ms.len() as f64;
     let p50 = times_ms[times_ms.len() / 2];

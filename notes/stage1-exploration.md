@@ -116,6 +116,25 @@ E8 (bitmap gather — emits the identical sorted, deduped candidate list
 without sorting the concatenated postings) and E5 (parallel transpose+
 quantize prep, same disjoint-block argument as E2).
 
+## Round 3 measurement (E5 + E8), M4 — the night's resting point
+
+| cell | total | cdot | probe | gather | tq | flood | sort | vs baseline |
+|---|---|---|---|---|---|---|---|---|
+| scifact r4 | 0.96 ms | 0.41 | 0.09 | 0.05 | 0.13 | 0.21 | 0.08 | **3.3×** |
+| scifact binary | 0.93 ms | 0.39 | 0.09 | 0.04 | 0.12 | 0.22 | 0.07 | 3.3× |
+| fiqa52k r4 | 1.66 ms | 0.64 | 0.11 | 0.10 | 0.20 | 0.53 | 0.12 | **4.0×** |
+| fiqa52k binary | 1.55 ms | 0.59 | 0.11 | 0.09 | 0.17 | 0.53 | 0.11 | 3.9× |
+
+- **E8: KEEP** — gather 0.41 → 0.10 ms (4×) at 52k; identical output.
+- **E5: KEEP** — tq 0.35 → 0.20 ms; modest, disjoint-block parallel,
+  bit-identical.
+- e2e fiqa-52k r4-asym: **5.01 ms mean** (was ~8.5 with the previous
+  stage-1; float+old-stage-1 comparison lands after CI).
+- Remaining profile is balanced (cdot 39–42% the largest). Stopping the
+  M4 exploration here: every further idea we costed (finer cdot blocking,
+  sort micro-opts) is < 0.1 ms on the table and platform-fragile.
+  Committed as 4a2a917.
+
 ## Quality gate (blocker for q8-as-default, independent of tonight's ideas)
 q8 flood quantizes shortlist scores and was never nDCG-validated.
 binary_ndcg A/B (default q8 vs NP_S1_ABLATE=f32) queued after the timed

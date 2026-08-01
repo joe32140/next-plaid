@@ -689,7 +689,6 @@ fn approximate_score_flood_t(cdot_t: &Array2<f32>, doc_codes: &[i64], acc: &mut 
 /// against real-embedding NDCG.
 struct QuantCdotT {
     q: Vec<u8>,
-    nq: usize,
     /// Row stride: `nq` rounded up to a multiple of 16 so the flood's inner
     /// loop is whole 16-lane chunks. Pad bytes are 0 — the quantized `lo`,
     /// neutral under `max` — and contribute 0 to the lane sum, so both flood
@@ -781,7 +780,6 @@ fn transpose_quantize_cdot(
     (
         QuantCdotT {
             q,
-            nq,
             stride,
             lo_sum: nq as f32 * lo,
             scale,

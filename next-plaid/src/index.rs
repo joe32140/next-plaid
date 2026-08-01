@@ -1206,19 +1206,36 @@ impl MmapIndex {
     }
 
     /// Get candidate documents from IVF for given centroid indices.
+    ///
+    /// EXPERIMENT(E8): doc ids are dense in `0..num_docs`, so a word bitmap
+    /// dedups in O(postings) and scanning its set bits emits the same
+    /// sorted, deduped list the previous `sort_unstable` + `dedup` produced —
+    /// without the O(n log n) sort of the concatenated postings.
     pub fn get_candidates(&self, centroid_indices: &[usize]) -> Vec<i64> {
-        let mut candidates: Vec<i64> = Vec::new();
-
+        let num_docs = self.doc_lengths.len();
+        let mut words = vec![0u64; num_docs.div_ceil(64)];
+        let mut count = 0usize;
         for &idx in centroid_indices {
             if idx < self.ivf_lengths.len() {
                 let start = self.ivf_offsets[idx] as usize;
                 let len = self.ivf_lengths[idx] as usize;
-                candidates.extend(self.ivf.slice(s![start..start + len]).iter());
+                for &d in self.ivf.slice(s![start..start + len]).iter() {
+                    let d = d as usize;
+                    let w = &mut words[d / 64];
+                    let bit = 1u64 << (d % 64);
+                    count += usize::from(*w & bit == 0);
+                    *w |= bit;
+                }
             }
         }
-
-        candidates.sort_unstable();
-        candidates.dedup();
+        let mut candidates: Vec<i64> = Vec::with_capacity(count);
+        for (wi, &word) in words.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                candidates.push((wi * 64 + w.trailing_zeros() as usize) as i64);
+                w &= w - 1;
+            }
+        }
         candidates
     }
 

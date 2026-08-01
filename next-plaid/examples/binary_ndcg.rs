@@ -312,6 +312,15 @@ fn main() {
         ("residual-nbits1", mk(1, false)),
         ("binary-int8x1bit", mk(4, true)),
     ];
+    // NDCG_CONFIGS=residual-nbits4,binary-int8x1bit runs a subset (A/B loops
+    // that don't need the full ladder).
+    let configs: Vec<(&'static str, IndexConfig)> = match std::env::var("NDCG_CONFIGS") {
+        Ok(list) => configs
+            .into_iter()
+            .filter(|(name, _)| list.split(',').any(|w| w == *name))
+            .collect(),
+        Err(_) => configs,
+    };
 
     let mut rows = Vec::new();
     for (name, config) in &configs {

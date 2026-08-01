@@ -690,6 +690,11 @@ fn approximate_score_flood_t(cdot_t: &Array2<f32>, doc_codes: &[i64], acc: &mut 
 struct QuantCdotT {
     q: Vec<u8>,
     nq: usize,
+    /// Row stride: `nq` rounded up to a multiple of 16 so the flood's inner
+    /// loop is whole 16-lane chunks. Pad bytes are 0 — the quantized `lo`,
+    /// neutral under `max` — and contribute 0 to the lane sum, so both flood
+    /// invariants hold without masking.
+    stride: usize,
     lo_sum: f32,
     scale: f32,
 }
@@ -704,14 +709,27 @@ fn transpose_quantize_cdot(
     let (nq, k) = (cdot.nrows(), cdot.ncols());
     let src = cdot.as_standard_layout();
     let src = src.as_slice().expect("cdot must be contiguous");
-    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-    for &v in src {
-        lo = lo.min(v);
-        hi = hi.max(v);
-    }
+    // EXPERIMENT(E5): parallel min/max prepass — chunk-local reductions are
+    // exact, and min/max is order-independent, so lo/hi are bit-identical to
+    // the sequential scan.
+    let (lo, hi) = src
+        .par_chunks(1 << 16)
+        .map(|c| {
+            let (mut l, mut h) = (f32::INFINITY, f32::NEG_INFINITY);
+            for &v in c {
+                l = l.min(v);
+                h = h.max(v);
+            }
+            (l, h)
+        })
+        .reduce(
+            || (f32::INFINITY, f32::NEG_INFINITY),
+            |a, b| (a.0.min(b.0), a.1.max(b.1)),
+        );
     let scale = if hi > lo { (hi - lo) / 255.0 } else { 1.0 };
     let inv = 1.0 / scale;
-    let mut q = vec![0u8; k * nq];
+    let stride = nq.div_ceil(16) * 16;
+    let mut q = vec![0u8; k * stride];
     // When Stage-2 will score asymmetrically it needs the same matrix
     // centroid-major in f32; emitting it here makes the two transposes one
     // pass over `src` instead of two.
@@ -721,43 +739,50 @@ fn transpose_quantize_cdot(
         .map(|a| a.as_slice_mut().expect("fresh array is contiguous"));
     // One pass: each src block row is read once while hot and feeds both
     // outputs (the u8 quantized matrix, and optionally the f32 transpose).
+    // EXPERIMENT(E5): centroid blocks own disjoint contiguous ranges of both
+    // outputs, so the blocks parallelize with no synchronization and
+    // bit-identical results.
     match dst32 {
         Some(dst) => {
-            let mut c0 = 0usize;
-            while c0 < k {
-                let c1 = (c0 + BLK).min(k);
-                for qi in 0..nq {
-                    let row = &src[qi * k + c0..qi * k + c1];
-                    for (j, &v) in row.iter().enumerate() {
-                        dst[(c0 + j) * nq + qi] = v;
-                        q[(c0 + j) * nq + qi] = ((v - lo) * inv) as u8;
+            q.par_chunks_mut(BLK * stride)
+                .zip(dst.par_chunks_mut(BLK * nq))
+                .enumerate()
+                .for_each(|(bi, (qb, db))| {
+                    let c0 = bi * BLK;
+                    let c1 = (c0 + BLK).min(k);
+                    for qi in 0..nq {
+                        let row = &src[qi * k + c0..qi * k + c1];
+                        for (j, &v) in row.iter().enumerate() {
+                            db[j * nq + qi] = v;
+                            qb[j * stride + qi] = ((v - lo) * inv) as u8;
+                        }
                     }
-                }
-                c0 = c1;
-            }
+                });
         }
         None => {
-            let mut c0 = 0usize;
-            while c0 < k {
-                let c1 = (c0 + BLK).min(k);
-                for qi in 0..nq {
-                    let row = &src[qi * k + c0..qi * k + c1];
-                    for (j, &v) in row.iter().enumerate() {
-                        // Saturating float->int cast (guaranteed since Rust
-                        // 1.45): no round, no clamp — floor is a uniform
-                        // shift, invisible to ranking, and it autovectorizes
-                        // to fcvtzu/cvttps.
-                        q[(c0 + j) * nq + qi] = ((v - lo) * inv) as u8;
+            q.par_chunks_mut(BLK * stride)
+                .enumerate()
+                .for_each(|(bi, qb)| {
+                    let c0 = bi * BLK;
+                    let c1 = (c0 + BLK).min(k);
+                    for qi in 0..nq {
+                        let row = &src[qi * k + c0..qi * k + c1];
+                        for (j, &v) in row.iter().enumerate() {
+                            // Saturating float->int cast (guaranteed since
+                            // Rust 1.45): no round, no clamp — floor is a
+                            // uniform shift, invisible to ranking, and it
+                            // autovectorizes to fcvtzu/cvttps.
+                            qb[j * stride + qi] = ((v - lo) * inv) as u8;
+                        }
                     }
-                }
-                c0 = c1;
-            }
+                });
         }
     }
     (
         QuantCdotT {
             q,
             nq,
+            stride,
             lo_sum: nq as f32 * lo,
             scale,
         },
@@ -766,16 +791,28 @@ fn transpose_quantize_cdot(
 }
 
 /// u8 flood scorer over the quantized centroid-major matrix.
-fn approximate_score_flood_q8(qt: &QuantCdotT, doc_codes: &[u32], acc: &mut [u8]) -> f32 {
-    acc.fill(0);
-    let nq = qt.nq;
-    for &code in doc_codes {
-        let row = &qt.q[code as usize * nq..code as usize * nq + nq];
-        for (a, &v) in acc.iter_mut().zip(row) {
-            *a = (*a).max(v);
+///
+/// Chunk-outer loop: for each 16-lane segment of the (stride-padded) row,
+/// sweep all doc tokens with a `[u8; 16]` accumulator — LLVM promotes it to
+/// one vector register, so the per-token work is load code, load 16 B, one
+/// `umax.16b`/`pmaxub`, with no accumulator memory traffic and no tail
+/// handling. Doc codes are re-read once per chunk (≤ 2 passes at nq ≤ 32;
+/// they are L1-hot on the second). Pad lanes hold quantized 0 everywhere,
+/// so they stay 0 through `max` and add nothing to the lane sum.
+fn approximate_score_flood_q8(qt: &QuantCdotT, doc_codes: &[u32]) -> f32 {
+    let stride = qt.stride;
+    let q = qt.q.as_slice();
+    let mut sum: u32 = 0;
+    for c0 in (0..stride).step_by(16) {
+        let mut m = [0u8; 16];
+        for &code in doc_codes {
+            let row = &q[code as usize * stride + c0..code as usize * stride + c0 + 16];
+            for i in 0..16 {
+                m[i] = m[i].max(row[i]);
+            }
         }
+        sum += m.iter().map(|&x| x as u32).sum::<u32>();
     }
-    let sum: u32 = acc.iter().map(|&x| x as u32).sum();
     qt.lo_sum + qt.scale * sum as f32
 }
 
@@ -891,6 +928,87 @@ pub fn search_one_mmap(
 /// This is the production path — `search_one_mmap` calls it — exposed
 /// (hidden) so the stage-2 profiler measures the identical shortlist.
 #[doc(hidden)]
+/// The `[nq, dim] · [dim, K]` query–centroid GEMM with the K output columns
+/// computed in parallel blocks. Each block is a disjoint column slice of the
+/// output, and the dim-128 reduction happens entirely inside one block, so
+/// per-element summation order — and therefore every output bit — matches
+/// the single-call `query.dot(centroids.t())` this replaces. Intra-query
+/// parallelism is already stage-1's contract (the candidate flood is a
+/// `par_iter`); rayon work-stealing degrades gracefully under concurrent
+/// queries.
+fn par_cdot(query: &Array2<f32>, centroids: &ArrayView2<f32>) -> Array2<f32> {
+    use ndarray::linalg::general_mat_mul;
+    use ndarray::parallel::prelude::*;
+    use ndarray::Axis;
+    const BLK: usize = 2048;
+    let (nq, k) = (query.nrows(), centroids.nrows());
+    let mut out = Array2::<f32>::zeros((nq, k));
+    if k <= BLK {
+        general_mat_mul(1.0, query, &centroids.t(), 0.0, &mut out);
+        return out;
+    }
+    out.axis_chunks_iter_mut(Axis(1), BLK)
+        .into_par_iter()
+        .zip(centroids.axis_chunks_iter(Axis(0), BLK).into_par_iter())
+        .for_each(|(mut oc, cc)| {
+            let cct = cc.t();
+            general_mat_mul(1.0, query, &cct, 0.0, &mut oc);
+        });
+    out
+}
+
+/// Index of the smallest value in a short slice (probe top-k bookkeeping).
+#[inline]
+fn argmin_f32(vals: &[f32]) -> usize {
+    let mut w = 0;
+    for i in 1..vals.len() {
+        if vals[i] < vals[w] {
+            w = i;
+        }
+    }
+    w
+}
+
+/// Top-`n` indices of `row` by value via a running-threshold chunk scan.
+/// Per 64-wide chunk the max is a plain reduction (autovectorizes on every
+/// platform); the chunk is skipped unless its max beats the current n-th
+/// best, so the scalar rescan almost never runs. Same top-k set by value as
+/// `select_nth_unstable`; tie choice is arbitrary in both. NaN never wins a
+/// `v > thr` comparison, matching `cmp_score_descending`'s NaN-last order.
+fn probe_top_k_scan(row: &[f32], n: usize, top_idx: &mut Vec<u32>, top_val: &mut Vec<f32>) {
+    const PROBE_CHUNK: usize = 64;
+    top_idx.clear();
+    top_val.clear();
+    let n = n.min(row.len());
+    let mut thr = f32::NEG_INFINITY;
+    let mut worst = 0usize;
+    for (ci, chunk) in row.chunks(PROBE_CHUNK).enumerate() {
+        let mut m = f32::NEG_INFINITY;
+        for &v in chunk {
+            m = m.max(v);
+        }
+        if top_val.len() == n && m <= thr {
+            continue;
+        }
+        let base = (ci * PROBE_CHUNK) as u32;
+        for (j, &v) in chunk.iter().enumerate() {
+            if top_val.len() < n {
+                top_idx.push(base + j as u32);
+                top_val.push(v);
+                if top_val.len() == n {
+                    worst = argmin_f32(top_val);
+                    thr = top_val[worst];
+                }
+            } else if v > thr {
+                top_idx[worst] = base + j as u32;
+                top_val[worst] = v;
+                worst = argmin_f32(top_val);
+                thr = top_val[worst];
+            }
+        }
+    }
+}
+
 pub fn stage1_shortlist(
     index: &crate::index::MmapIndex,
     query: &Array2<f32>,
@@ -906,8 +1024,9 @@ pub fn stage1_shortlist(
     let s1_phases = std::env::var("NP_S1_PHASES").is_ok();
     let t_all = std::time::Instant::now();
 
-    // Standard path: compute full query-centroid scores upfront
-    let query_centroid_scores = query.dot(&index.codec.centroids_view().t());
+    // Standard path: compute full query-centroid scores upfront.
+    // EXPERIMENT(E2): column-block-parallel GEMM, bit-identical output.
+    let query_centroid_scores = par_cdot(query, &index.codec.centroids_view());
     let t_cdot = t_all.elapsed();
 
     // When subset is provided, pre-compute eligible centroids: only those containing
@@ -961,26 +1080,34 @@ pub fn stage1_shortlist(
             .as_slice()
             .expect("query x centroid scores are standard layout");
         let mut idx_buf: Vec<u32> = Vec::with_capacity(num_centroids);
+        // EXPERIMENT(E1): no-subset probe select via probe_top_k_scan —
+        // one sequential read of each row, no K-length buffer fill.
+        let mut top_idx: Vec<u32> = Vec::with_capacity(effective_n_ivf_probe);
+        let mut top_val: Vec<f32> = Vec::with_capacity(effective_n_ivf_probe);
         for q_idx in 0..num_query_tokens {
             let row = &qcs[q_idx * num_centroids..(q_idx + 1) * num_centroids];
-            idx_buf.clear();
             match &eligible_centroids {
-                Some(eligible) => idx_buf.extend(eligible.iter().map(|&c| c as u32)),
-                None => idx_buf.extend(0..num_centroids as u32),
-            }
-
-            // Partial selection: O(K) average instead of O(K log K) for full sort
-            // After this, the top n elements are in positions 0..n
-            // (but not sorted among themselves - which is fine since we use a HashSet)
-            let n_probe = effective_n_ivf_probe.min(idx_buf.len());
-            if idx_buf.len() > n_probe {
-                idx_buf.select_nth_unstable_by(n_probe - 1, |&a, &b| {
-                    cmp_score_descending(row[a as usize], row[b as usize])
-                });
-            }
-
-            for &c in idx_buf.iter().take(n_probe) {
-                selected_centroids.insert(c as usize);
+                Some(eligible) => {
+                    // Subset path: unchanged partial selection over the
+                    // eligible pool.
+                    idx_buf.clear();
+                    idx_buf.extend(eligible.iter().map(|&c| c as u32));
+                    let n_probe = effective_n_ivf_probe.min(idx_buf.len());
+                    if idx_buf.len() > n_probe {
+                        idx_buf.select_nth_unstable_by(n_probe - 1, |&a, &b| {
+                            cmp_score_descending(row[a as usize], row[b as usize])
+                        });
+                    }
+                    for &c in idx_buf.iter().take(n_probe) {
+                        selected_centroids.insert(c as usize);
+                    }
+                }
+                None => {
+                    probe_top_k_scan(row, effective_n_ivf_probe, &mut top_idx, &mut top_val);
+                    for &c in &top_idx {
+                        selected_centroids.insert(c as usize);
+                    }
+                }
             }
         }
 
@@ -995,7 +1122,11 @@ pub fn stage1_shortlist(
             });
         }
 
-        selected_centroids.into_iter().collect()
+        // EXPERIMENT(E4): sorted cell order makes the gather's IVF postings
+        // reads sequential in the ivf array instead of hash order.
+        let mut cells: Vec<usize> = selected_centroids.into_iter().collect();
+        cells.sort_unstable();
+        cells
     };
     let t_probe = t_all.elapsed();
 
@@ -1019,6 +1150,9 @@ pub fn stage1_shortlist(
     // Research-branch ladder, same pattern as NP_ASYM_ABLATE.
     let s1_ablate = std::env::var("NP_S1_ABLATE").unwrap_or_default();
     let mut cdot_t_shared: Option<Array2<f32>> = None;
+    // EXPERIMENT: sub-phase timing — how much of `approx` is the
+    // transpose+quantize prep vs the flood proper.
+    let mut tq_micros: u128 = 0;
     let mut approx_scores: Vec<(i64, f32)> = match s1_ablate.as_str() {
         "rowmajor" => candidates
             .par_iter()
@@ -1056,23 +1190,22 @@ pub fn stage1_shortlist(
             let emit_f32 = params.residual_asym
                 && !index.metadata.binary
                 && crate::residual_lut::ablation() == crate::residual_lut::Ablation::Off;
+            let t_tq0 = std::time::Instant::now();
             let (qt, t32) = transpose_quantize_cdot(&query_centroid_scores, emit_f32);
+            tq_micros = t_tq0.elapsed().as_micros();
             cdot_t_shared = t32;
             // u32 code side-array: 4 B/token reads instead of the mmap's 8.
             let codes_all = index.codes_u32();
             let scores = candidates
                 .par_iter()
-                .map_init(
-                    || vec![0u8; num_query_tokens],
-                    |acc, &doc_id| {
-                        let start = index.doc_offsets[doc_id as usize];
-                        let end = index.doc_offsets[doc_id as usize + 1];
-                        (
-                            doc_id,
-                            approximate_score_flood_q8(&qt, &codes_all[start..end], acc),
-                        )
-                    },
-                )
+                .map(|&doc_id| {
+                    let start = index.doc_offsets[doc_id as usize];
+                    let end = index.doc_offsets[doc_id as usize + 1];
+                    (
+                        doc_id,
+                        approximate_score_flood_q8(&qt, &codes_all[start..end]),
+                    )
+                })
                 .collect();
             scores
         }
@@ -1110,7 +1243,7 @@ pub fn stage1_shortlist(
     if s1_phases {
         let t_sort = t_all.elapsed();
         eprintln!(
-            "S1PHASE cdot={} probe={} gather={} approx={} sort={} total={} ncells={} nflood={} floodtok={}",
+            "S1PHASE cdot={} probe={} gather={} approx={} sort={} total={} ncells={} nflood={} floodtok={} tq={}",
             t_cdot.as_micros(),
             (t_probe - t_cdot).as_micros(),
             (t_gather - t_probe).as_micros(),
@@ -1120,6 +1253,7 @@ pub fn stage1_shortlist(
             cells_to_probe.len(),
             n_flood,
             flood_tokens,
+            tq_micros,
         );
     }
 
@@ -1347,6 +1481,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn par_cdot_bit_identical_to_dot() {
+        // LCG-filled query [7, 32] and centroids [5000, 32]: K > BLK so the
+        // parallel column-block path runs, and 5000 % 2048 != 0 exercises the
+        // ragged last block.
+        let mut s = 0x5EED_u64;
+        let mut next = move || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+        let query = Array2::from_shape_fn((7, 32), |_| next());
+        let centroids = Array2::from_shape_fn((5000, 32), |_| next());
+        let expect = query.dot(&centroids.t());
+        let got = par_cdot(&query, &centroids.view());
+        assert_eq!(expect.shape(), got.shape());
+        for (a, b) in expect.iter().zip(got.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
+    #[test]
+    fn probe_scan_matches_partial_select() {
+        // Values quantized to coarse steps so ties are common — the scan and
+        // select_nth may pick different tied indices, but the top-k value
+        // multiset must match exactly, and every selected index must score
+        // >= the true n-th value.
+        let mut s = 0xA11CE_u64;
+        for &(k, n) in &[(5000usize, 8usize), (100, 8), (7, 8), (64, 3), (4096, 16)] {
+            let row: Vec<f32> = (0..k)
+                .map(|_| {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    ((s >> 40) as f32 / 256.0).floor() / 64.0
+                })
+                .collect();
+            let (mut ti, mut tv) = (Vec::new(), Vec::new());
+            probe_top_k_scan(&row, n, &mut ti, &mut tv);
+            let mut idx: Vec<u32> = (0..k as u32).collect();
+            let nn = n.min(k);
+            if k > nn {
+                idx.select_nth_unstable_by(nn - 1, |&a, &b| {
+                    cmp_score_descending(row[a as usize], row[b as usize])
+                });
+            }
+            let mut want: Vec<f32> = idx[..nn].iter().map(|&i| row[i as usize]).collect();
+            let mut got: Vec<f32> = tv.clone();
+            want.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            got.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            assert_eq!(got.len(), nn, "k={k} n={n}");
+            for (a, b) in want.iter().zip(got.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits(), "k={k} n={n}");
+            }
+            // Selected indices must actually hold their reported values.
+            for (&i, &v) in ti.iter().zip(tv.iter()) {
+                assert_eq!(row[i as usize].to_bits(), v.to_bits());
+            }
+        }
+    }
+
+    #[test]
     fn test_colbert_score() {
         // Query with 2 tokens, dim 4
         let query =
@@ -1476,8 +1668,7 @@ mod transpose_tests {
                 }
             }
             let codes32: Vec<u32> = codes.iter().map(|&c| c as u32).collect();
-            let mut acc8 = vec![0u8; nq];
-            let got8 = approximate_score_flood_q8(&qt, &codes32, &mut acc8);
+            let got8 = approximate_score_flood_q8(&qt, &codes32);
             let tol = nq as f32 * qt.scale + 1e-4; // floor quant: err < 1 LSB per lane
             assert!(
                 (got8 - want).abs() <= tol,

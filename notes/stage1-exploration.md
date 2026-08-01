@@ -135,6 +135,24 @@ quantize prep, same disjoint-block argument as E2).
   sort micro-opts) is < 0.1 ms on the table and platform-fragile.
   Committed as 4a2a917.
 
+## Cross-platform validation (fork CI run 30690316753 vs 30073526835)
+
+fiqa-52k, default rung, per-phase medians. Cross-run comparison on shared
+runners — machine instances differ between runs, so treat ratios as
+directional; they are far above runner noise. All parity gates green on
+all three platforms.
+
+| platform | before total | after total | ratio | probe | gather | cdot | approx |
+|---|---|---|---|---|---|---|---|
+| x86 (ubuntu-latest), r4 | 15.62 | 5.52 | **2.8×** | 2.14→0.26 | 0.55→0.10 | 5.39→2.02 | 7.44→3.06 |
+| Neoverse (24.04-arm), r4 | 12.63 | 3.81 | **3.3×** | 2.23→0.17 | 0.50→0.12 | 3.93→1.12 | 5.68→2.29 |
+| macOS VM, r4 | 16.98 | 4.84 | **3.5×** | 1.74→0.16 | 0.52→0.15 | 2.44→1.56 | 11.00→2.60 |
+| M4 local (clean same-box A/B) | 6.70 | 1.66 | **4.0×** | | | | |
+
+The M4 was the *least* favorable platform for these changes, confirming
+the working rule: scatter-elimination wins grow on server parts (the M4's
+L2 was absorbing what Neoverse/x86 pay for). Probe scan is 8–13× off-M4.
+
 ## Scope note — batched-centroid path
 All of tonight's changes live in `stage1_shortlist` (the dense path,
 K ≤ centroid_batch_size = 100k, i.e. corpora up to ~335k docs) plus
@@ -150,3 +168,21 @@ runs finish — timed and quality runs must not share the machine.
 Runs: {nfcorpus_gte, scifact_gte} × {default q8, NP_S1_ABLATE=f32} ×
 {residual-nbits4, binary-int8x1bit}, NDCG_DEPLOYED_ONLY=1, seed-42 builds
 (deterministic, so the two modes search identical indexes).
+
+### Results (real GTE embeddings, deployed regime)
+
+| bundle | scheme | q8 nDCG@10 | f32 nDCG@10 | Δ |
+|---|---|---|---|---|
+| nfcorpus | residual-nbits4 | 0.3809 | 0.3809 | **0.0000** |
+| nfcorpus | binary-int8x1bit | 0.2875 | 0.2875 | **0.0000** |
+| nfcorpus | r4 + asym-LUT | 0.3811 | 0.3811 | **0.0000** |
+| scifact | residual-nbits4 | 0.7609 | (running) | |
+| scifact | binary-int8x1bit | 0.6865 | (running) | |
+| scifact | r4 + asym-LUT | 0.7607 | (running) | |
+
+The u8 quantization of flood scores is invisible at nDCG@10 to four
+decimals on nfcorpus — the 4096-deep prune cut absorbs sub-LSB rank
+perturbations exactly as hypothesized. These runs also exercise the entire
+new stage-1 stack (E1/E2/E4/E5/E7/E8 active in both arms; only the flood
+mode differs), and reconfirm stage-2 LUT quality through the new stage-1
+(Δ vs float +0.0002 / −0.0001 on fresh seed-42 builds).

@@ -1207,10 +1207,10 @@ impl MmapIndex {
 
     /// Get candidate documents from IVF for given centroid indices.
     ///
-    /// EXPERIMENT(E8): doc ids are dense in `0..num_docs`, so a word bitmap
-    /// dedups in O(postings) and scanning its set bits emits the same
-    /// sorted, deduped list the previous `sort_unstable` + `dedup` produced —
-    /// without the O(n log n) sort of the concatenated postings.
+    /// Doc ids are dense in `0..num_docs`, so a word bitmap dedups in
+    /// O(postings) and scanning its set bits emits the same sorted, deduped
+    /// list a `sort_unstable` + `dedup` of the concatenated postings would —
+    /// without the O(n log n) sort (measured 4–5x on this phase at 52k docs).
     pub fn get_candidates(&self, centroid_indices: &[usize]) -> Vec<i64> {
         let num_docs = self.doc_lengths.len();
         let mut words = vec![0u64; num_docs.div_ceil(64)];

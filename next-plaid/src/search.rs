@@ -708,9 +708,9 @@ fn transpose_quantize_cdot(
     let (nq, k) = (cdot.nrows(), cdot.ncols());
     let src = cdot.as_standard_layout();
     let src = src.as_slice().expect("cdot must be contiguous");
-    // EXPERIMENT(E5): parallel min/max prepass — chunk-local reductions are
-    // exact, and min/max is order-independent, so lo/hi are bit-identical to
-    // the sequential scan.
+    // Parallel min/max prepass — chunk-local reductions are exact, and
+    // min/max is order-independent, so lo/hi are bit-identical to a
+    // sequential scan.
     let (lo, hi) = src
         .par_chunks(1 << 16)
         .map(|c| {
@@ -738,9 +738,8 @@ fn transpose_quantize_cdot(
         .map(|a| a.as_slice_mut().expect("fresh array is contiguous"));
     // One pass: each src block row is read once while hot and feeds both
     // outputs (the u8 quantized matrix, and optionally the f32 transpose).
-    // EXPERIMENT(E5): centroid blocks own disjoint contiguous ranges of both
-    // outputs, so the blocks parallelize with no synchronization and
-    // bit-identical results.
+    // Centroid blocks own disjoint contiguous ranges of both outputs, so the
+    // blocks parallelize with no synchronization and bit-identical results.
     match dst32 {
         Some(dst) => {
             q.par_chunks_mut(BLK * stride)
@@ -1022,8 +1021,8 @@ pub fn stage1_shortlist(
     let s1_phases = std::env::var("NP_S1_PHASES").is_ok();
     let t_all = std::time::Instant::now();
 
-    // Standard path: compute full query-centroid scores upfront.
-    // EXPERIMENT(E2): column-block-parallel GEMM, bit-identical output.
+    // Standard path: compute full query-centroid scores upfront
+    // (column-block-parallel GEMM, bit-identical to the single dot call).
     let query_centroid_scores = par_cdot(query, &index.codec.centroids_view());
     let t_cdot = t_all.elapsed();
 
@@ -1084,8 +1083,8 @@ pub fn stage1_shortlist(
         } else {
             Vec::new()
         };
-        // EXPERIMENT(E1): no-subset probe select via probe_top_k_scan —
-        // one sequential read of each row, no K-length buffer fill.
+        // No-subset probe select goes through probe_top_k_scan — one
+        // sequential read of each row, no K-length buffer fill.
         let mut top_idx: Vec<u32> = Vec::with_capacity(effective_n_ivf_probe);
         let mut top_val: Vec<f32> = Vec::with_capacity(effective_n_ivf_probe);
         for q_idx in 0..num_query_tokens {
@@ -1126,8 +1125,9 @@ pub fn stage1_shortlist(
             });
         }
 
-        // EXPERIMENT(E4): sorted cell order makes the gather's IVF postings
-        // reads sequential in the ivf array instead of hash order.
+        // Sorted cell order makes the gather's IVF postings reads sequential
+        // in the ivf array instead of hash order (free at ~200 cells; the
+        // win shows on server parts, not Apple L2).
         let mut cells: Vec<usize> = selected_centroids.into_iter().collect();
         cells.sort_unstable();
         cells

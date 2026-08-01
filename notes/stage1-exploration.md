@@ -360,3 +360,15 @@ perturbations exactly as hypothesized. These runs also exercise the entire
 new stage-1 stack (E1/E2/E4/E5/E7/E8 active in both arms; only the flood
 mode differs), and reconfirm stage-2 LUT quality through the new stage-1
 (Δ vs float +0.0002 / −0.0001 on fresh seed-42 builds).
+
+## Per-phase mainline ladder (diagram source)
+
+Mainline (instrumented worktree @ 76092e1, same seams/format) vs branch,
+r ∈ {4,2,1}, fiqa-15k + scifact, M4, per-phase medians. Full data:
+scratchpad ladder_table.json; rendered diagram published as a private
+artifact (phase-ladder-diagram). fiqa-15k r4 headline: mainline
+18.9 ms → branch 3.0 ms (6.3× on summed medians), with stage-2 exact
+14.25 → 2.08 and the flood 2.65 → 0.34. Result-digest note: top-10 lists
+are not bitwise identical between builds (expected — LCG queries sit in
+near-tie regimes and the q8 shortlist reshuffles tails); parity is claimed
+on real-embedding nDCG, not list identity.

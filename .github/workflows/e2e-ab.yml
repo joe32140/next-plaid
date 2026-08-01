@@ -102,6 +102,8 @@ jobs:
                 NP_S1_PHASES=1 NP_S2_PHASES=1 "$MAIN" "$idx" "$lens" '{}'
                 echo "===== idx=$idx rep=$rep variant=ours"
                 NP_S1_PHASES=1 NP_S2_PHASES=1 "$OURS" "$idx" "$lens" '{}'
+                echo "===== idx=$idx rep=$rep variant=asym"
+                NP_S1_PHASES=1 NP_S2_PHASES=1 "$OURS" "$idx" "$lens" '{"residual_asym": true}'
               done
             done
           done

@@ -135,7 +135,18 @@ quantize prep, same disjoint-block argument as E2).
   sort micro-opts) is < 0.1 ms on the table and platform-fragile.
   Committed as 4a2a917.
 
+## Scope note — batched-centroid path
+All of tonight's changes live in `stage1_shortlist` (the dense path,
+K ≤ centroid_batch_size = 100k, i.e. corpora up to ~335k docs) plus
+`get_candidates` (shared). The batched path (>100k centroids) still runs
+its own stage-1 loop and gets only the E8 gather win. Porting E1/E2/E5/E7
+there is mechanical but untested — deliberately out of tonight's scope;
+flagged for the CR conversation.
+
 ## Quality gate (blocker for q8-as-default, independent of tonight's ideas)
 q8 flood quantizes shortlist scores and was never nDCG-validated.
 binary_ndcg A/B (default q8 vs NP_S1_ABLATE=f32) queued after the timed
 runs finish — timed and quality runs must not share the machine.
+Runs: {nfcorpus_gte, scifact_gte} × {default q8, NP_S1_ABLATE=f32} ×
+{residual-nbits4, binary-int8x1bit}, NDCG_DEPLOYED_ONLY=1, seed-42 builds
+(deterministic, so the two modes search identical indexes).

@@ -914,18 +914,6 @@ pub fn search_one_mmap(
     })
 }
 
-/// Stage 1 of the standard (non-batched) search: dense query×centroid scores,
-/// per-token IVF cell selection, candidate gathering, approximate codes-only
-/// scoring, and pruning down to the exact-scoring shortlist. Everything a
-/// query pays *before* the Stage-2 kernels take over.
-///
-/// Returns the dense query×centroid matrix (reused by Stage-2 for the LUT
-/// path's centroid term) and the pruned candidate list, which is empty when
-/// nothing survives probing/filtering.
-///
-/// This is the production path — `search_one_mmap` calls it — exposed
-/// (hidden) so the stage-2 profiler measures the identical shortlist.
-#[doc(hidden)]
 /// The `[nq, dim] · [dim, K]` query–centroid GEMM with the K output columns
 /// computed in parallel blocks. Each block is a disjoint column slice of the
 /// output, and the dim-128 reduction happens entirely inside one block, so
@@ -1007,6 +995,18 @@ fn probe_top_k_scan(row: &[f32], n: usize, top_idx: &mut Vec<u32>, top_val: &mut
     }
 }
 
+/// Stage 1 of the standard (non-batched) search: dense query×centroid scores,
+/// per-token IVF cell selection, candidate gathering, approximate codes-only
+/// scoring, and pruning down to the exact-scoring shortlist. Everything a
+/// query pays *before* the Stage-2 kernels take over.
+///
+/// Returns the dense query×centroid matrix (reused by Stage-2 for the LUT
+/// path's centroid term) and the pruned candidate list, which is empty when
+/// nothing survives probing/filtering.
+///
+/// This is the production path — `search_one_mmap` calls it — exposed
+/// (hidden) so the stage-2 profiler measures the identical shortlist.
+#[doc(hidden)]
 pub fn stage1_shortlist(
     index: &crate::index::MmapIndex,
     query: &Array2<f32>,
@@ -1077,7 +1077,13 @@ pub fn stage1_shortlist(
         let qcs = query_centroid_scores
             .as_slice()
             .expect("query x centroid scores are standard layout");
-        let mut idx_buf: Vec<u32> = Vec::with_capacity(num_centroids);
+        // Subset-path scratch only: the default path never fills a K-length
+        // buffer.
+        let mut idx_buf: Vec<u32> = if eligible_centroids.is_some() {
+            Vec::with_capacity(num_centroids)
+        } else {
+            Vec::new()
+        };
         // EXPERIMENT(E1): no-subset probe select via probe_top_k_scan —
         // one sequential read of each row, no K-length buffer fill.
         let mut top_idx: Vec<u32> = Vec::with_capacity(effective_n_ivf_probe);

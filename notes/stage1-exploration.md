@@ -431,3 +431,15 @@ macOS ~15-18->2.6. The multi-platform claim now stands as: 5.6-7.1x e2e
 geomean vs upstream v1.6.5 on all three CI microarchitectures plus 6.3x
 measured natively on the M4, r in {1,2,4}, same-box interleave protocol
 everywhere. Logs: scratchpad s1x/ci_ab/, parser parse_ci_ab.py.
+
+## Parity table complete (r2/r1 on both bundles)
+
+Float vs asym-LUT dep-NDCG@10, real GTE embeddings, seed-42 builds:
+NFCorpus 0.3809/0.3811 (r4), 0.3779/0.3779 (r2), 0.3701/0.3705 (r1);
+SciFact 0.7609/0.7607 (r4), 0.7507/0.7507 (r2), 0.7427/0.7427 (r1).
+Max |delta| across all six cells: 0.0004. Ops notes: the r2+r1 combined
+scifact run jetsammed (two >1M-token builds, one process); split
+per-process, r2 passed but r1 still jetsammed solo — RAYON_NUM_THREADS=2
+(k-means scratch shrink) got it through (build 179 s). binary_ndcg's
+summary unwrap now guards against NDCG_CONFIGS-filtered rows. Diagram
+artifact republished with all six rows.

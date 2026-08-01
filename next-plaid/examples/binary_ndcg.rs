@@ -388,21 +388,23 @@ fn main() {
         );
     }
 
-    let by_name = |n: &str| rows.iter().find(|r| r.name == n).unwrap();
-    let res4 = by_name("residual-nbits4");
-    let bin = by_name("binary-int8x1bit");
-    println!(
-        "\nbinary retains {:.1}% (deployed) of residual-nbits4 NDCG@10 at {:.1}x less doc storage",
-        100.0 * bin.dep_ndcg / res4.dep_ndcg,
-        res4.bytes_per_token as f64 / bin.bytes_per_token as f64
-    );
-    if !deployed_only {
+    // The binary-vs-residual4 summary only applies when both rows ran (a
+    // NDCG_CONFIGS filter may exclude either).
+    let by_name = |n: &str| rows.iter().find(|r| r.name == n);
+    if let (Some(res4), Some(bin)) = (by_name("residual-nbits4"), by_name("binary-int8x1bit")) {
         println!(
-            "binary retains {:.1}% (wide-ANN) of residual4; deployed keeps {:.1}% (residual4) / {:.1}% (binary) of the wide-ANN sweep (true ceiling = numpy brute force)",
-            100.0 * bin.wide_ndcg / res4.wide_ndcg,
-            100.0 * res4.dep_ndcg / res4.wide_ndcg,
-            100.0 * bin.dep_ndcg / bin.wide_ndcg
+            "\nbinary retains {:.1}% (deployed) of residual-nbits4 NDCG@10 at {:.1}x less doc storage",
+            100.0 * bin.dep_ndcg / res4.dep_ndcg,
+            res4.bytes_per_token as f64 / bin.bytes_per_token as f64
         );
+        if !deployed_only {
+            println!(
+                "binary retains {:.1}% (wide-ANN) of residual4; deployed keeps {:.1}% (residual4) / {:.1}% (binary) of the wide-ANN sweep (true ceiling = numpy brute force)",
+                100.0 * bin.wide_ndcg / res4.wide_ndcg,
+                100.0 * res4.dep_ndcg / res4.wide_ndcg,
+                100.0 * bin.dep_ndcg / bin.wide_ndcg
+            );
+        }
     }
 
     // Machine-readable line (NDCG_JSON=1).

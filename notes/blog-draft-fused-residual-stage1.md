@@ -6,10 +6,6 @@ kernel's real product is a new bottleneck — and chased it upstream through fiv
 more phases. Every number below is measured; the ones from shared CI runners are
 quoted as ratios, never absolutes.*
 
-<!-- STATUS: draft. Two slots pending tonight's runs:
-     [CI-TABLE]   3-platform e2e verdict from e2e-ab run
-     [SCIFACT-PARITY] r2/r1 nDCG rows -->
-
 ## The uncomfortable starting point
 
 PLAID-style retrieval engines store every document token as a compressed code:
@@ -80,7 +76,7 @@ float.
 
 Then the trap we should have seen coming: with stage 2 fast, **stage 1 was
 suddenly most of the query**. On an M4 at fiqa-52k scale, stage 1 cost 6.70 ms
-against a ~1.7 ms fused rescore. So we profiled stage 1 into its five phases —
+against a ~2 ms fused rescore. So we profiled stage 1 into its five phases —
 centroid GEMM (cdot), IVF probe, candidate gather, approximate "flood" scoring,
 prune — and worked the list biggest-slice-first, re-profiling after every win.
 One night of profile-driven changes, each tied to a hardware principle:
@@ -154,7 +150,8 @@ float scoring vs the fused int8 path on identical indexes:
 | NFCorpus | 2 | 0.3779 | 0.3779 | 0.0000 |
 | NFCorpus | 1 | 0.3701 | 0.3705 | +0.0004 |
 | SciFact | 4 | 0.7609 | 0.7607 | −0.0002 |
-[SCIFACT-PARITY]
+| SciFact | 2 | 0.7507 | 0.7507 | 0.0000 |
+| SciFact | 1 | 0.7427 | 0.7427 | 0.0000 |
 
 The stage-1 quantized flood is held to the same standard: Δ = 0.0000 on both
 corpora against exact flooding.

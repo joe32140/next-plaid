@@ -6,6 +6,16 @@ kernel's real product is a new bottleneck — and chased it upstream through fiv
 more phases. Every number below is measured; the ones from shared CI runners are
 quoted as ratios, never absolutes.*
 
+![Per-phase latency, mainline v1.6.5 vs this branch — Apple M4, per-phase medians, r = 4/2/1 on FiQA-15k and SciFact](figs/phase-ladder.svg)
+
+*The whole campaign in one picture. Each pair is upstream mainline (top) vs
+this branch (bottom), split by pipeline phase. Two things to read: every
+stage-1 sliver shrinks, and the big green segment — decompression, 61–71% of
+mainline's rescore — simply does not exist in the branch bars, because the
+fused kernel scores the compressed codes directly. That deleted segment is
+the thesis of the whole post. (An interactive version with hover breakdowns
+and the full parity table accompanies this draft.)*
+
 ## The uncomfortable starting point
 
 PLAID-style retrieval engines store every document token as a compressed code:
@@ -112,8 +122,9 @@ slice it applies to. Chase slices, not ratios.
 ## The verdict, on three platforms plus the M4
 
 Single-stream, same prebuilt indexes, same length-realistic queries,
-interleaved runs so thermal drift hits both sides alike. On the idle M4
-(trustworthy absolutes), end-to-end at fiqa-15k, residual-4:
+interleaved runs so thermal drift hits both sides alike. The lead figure
+shows the full per-phase picture on the idle M4 (trustworthy absolutes);
+the headline cell, end-to-end at fiqa-15k, residual-4:
 
 | | mainline v1.6.5 | this branch (fused, asym) | speedup |
 |---|---|---|---|

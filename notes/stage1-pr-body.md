@@ -1,16 +1,16 @@
 # Draft PR body — stage-1 pipeline (stacked on the asym-LUT PR)
 
 Branch: `joe32140:perf/stage1-pipeline` → `lightonai:main`, opened as
-**draft**. Replace `#ASYM_PR` with the real PR number before opening.
+**draft**. Replace `#169` with the real PR number before opening.
 
 Title: `perf: rework the stage-1 shortlist pipeline; per-doc parallel exact scoring`
 
 ---
 
-> **Stacked on #ASYM_PR** — the first two commits are that PR; only the
+> **Stacked on #169** — the first two commits are that PR; only the
 > last two commits (`perf(search): rework the stage-1 shortlist pipeline`
 > and `perf(search): per-doc parallel exact scoring`) are under review
-> here. Once #ASYM_PR merges this rebases to a `search.rs` + `index.rs`
+> here. Once #169 merges this rebases to a `search.rs` + `index.rs`
 > change only (+514/−82).
 
 ## What
@@ -46,7 +46,7 @@ equivalence test against the path it replaces.
   chunks at n_decompress = 1024 underfilled the pool — 6.1 effective
   threads measured on a 10-core M4; 9.4 after.
 
-When the asym arm (#ASYM_PR) is active, the flood's fused pass also emits
+When the asym arm (#169) is active, the flood's fused pass also emits
 the f32 centroid-major matrix stage 2 needs, so one traversal serves both
 stages.
 
@@ -60,7 +60,7 @@ stages.
 - End-to-end vs v1.6.5 (interleaved same-box A/B, identical prebuilt
   indexes, 3 datasets × nbits 4/2/1 per platform): **1.2–1.5× geomean
   with float stage-2** (this PR alone); **5.6–7.1× geomean with
-  `residual_asym` on** (this PR + #ASYM_PR), 6.3× on native M4.
+  `residual_asym` on** (this PR + #169), 6.3× on native M4.
 - The biggest per-phase ratio (probe, 9.5×) is deliberately not the
   headline: phase speedups compose by time share, and the flood + GEMM
   dominated. Per-phase tables and the full exploration ledger (including

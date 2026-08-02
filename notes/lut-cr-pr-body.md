@@ -1,6 +1,7 @@
 # Upstream PR body — READY (rebased on v1.6.5, 2026-08-01)
 
 Branch: `joe32140:feat/asymmetric-residual-lut` → `lightonai:main`.
+OPENED 2026-08-01: https://github.com/lightonai/next-plaid/pull/169
 #155 squash-merged as dd3ab5c; the CR is rebased onto origin/main
 76092e1 (Release 1.6.5) with zero conflicts. Gates re-run on the rebased
 tree 2026-08-01: clippy native ✓ (0), clippy x86_64-apple-darwin ✓ (0),

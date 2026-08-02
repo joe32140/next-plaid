@@ -1,10 +1,12 @@
-# Upstream PR body — READY (rebased on main 2026-07-23)
+# Upstream PR body — READY (rebased on v1.6.5, 2026-08-01)
 
 Branch: `joe32140:feat/asymmetric-residual-lut` → `lightonai:main`.
 #155 squash-merged as dd3ab5c; the CR is rebased onto origin/main
-(post-1.6.4, post-#159) with zero conflicts. Gates re-run on the rebased
-tree 2026-07-23: fmt ✓, clippy native ✓, clippy x86_64-apple-darwin ✓,
-`RUSTDOCFLAGS="-D warnings" cargo doc` ✓, 200 tests ✓.
+76092e1 (Release 1.6.5) with zero conflicts. Gates re-run on the rebased
+tree 2026-08-01: clippy native ✓ (0), clippy x86_64-apple-darwin ✓ (0),
+`RUSTDOCFLAGS="-D warnings" cargo doc` ✓, full test suite ✓ (146 lib +
+integration, arm64 native). Stage-1 perf follow-up is stacked as
+`perf/stage1-pipeline` (opens as draft referencing this PR).
 
 Open with (the PR body is everything below the `---`):
 
@@ -74,13 +76,26 @@ dense path).
 - **Quality**: |ΔNDCG@10| ≤ 0.002 vs the float path on identical codes —
   3 ColBERT checkpoints × 3 BEIR corpora × nbits 4/2/1, incl. long-query
   ArguAna. The int8 error lands only on the residual correction; the
-  dominant centroid term stays float.
+  dominant centroid term stays float. Spot-checked again on real GTE
+  embeddings at deployed settings (seed-42 builds, float vs asym on
+  identical indexes):
+
+  | dataset | r=4 | r=2 | r=1 |
+  |---|---|---|---|
+  | NFCorpus | 0.3809 / 0.3811 | 0.3779 / 0.3779 | 0.3701 / 0.3705 |
+  | SciFact | 0.7609 / 0.7607 | 0.7507 / 0.7507 | 0.7427 / 0.7427 |
+
+  Max |Δ| across the six cells: 0.0004.
 - **Latency** (exact-scoring stage, 1024-doc shortlists, real corpus
   shapes, x86 AVX2 / Neoverse / Apple M4): 4.7–8.4× vs decompress+GEMM
   at the kernel level; 1.4–5.2× end-to-end depending on corpus size
   (Stage-1 dominates at scale). Decompression is 48–84% of the float
   exact path (platform-dependent) — the fused kernels win by skipping
-  it, not by out-multiplying GEMM.
+  it, not by out-multiplying GEMM. Combined with the stacked stage-1
+  follow-up PR, the same interleaved A/B against v1.6.5 measures
+  5.6–7.1× end-to-end geomean (9 dataset×nbits cells per platform) on
+  x86 AVX2, Neoverse, and macOS arm64 CI, and 6.3× on a native M4 —
+  that combined number belongs to the pair, not to this PR alone.
 - **AVX-512 honesty note**: the VNNI kernel is written, feature-gated,
   and covered by the parity suite *on VNNI hardware*, but GitHub's
   standard runners don't have VNNI — correctness-validated, no perf

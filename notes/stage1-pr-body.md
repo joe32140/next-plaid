@@ -1,9 +1,10 @@
 # Draft PR body — stage-1 pipeline (stacked on the asym-LUT PR)
 
 Branch: `joe32140:perf/stage1-pipeline` → `lightonai:main`, opened as
-**draft**. Replace `#169` with the real PR number before opening.
+**draft**. OPENED 2026-08-01: https://github.com/lightonai/next-plaid/pull/170
+(references #169).
 
-Title: `perf: rework the stage-1 shortlist pipeline; per-doc parallel exact scoring`
+Title: `perf: rework the stage-1 shortlist pipeline — 4–12× faster stage 1, 5.6–7.1× e2e with #169`
 
 ---
 
@@ -53,7 +54,7 @@ stages.
 ## Measured
 
 - Stage 1, Apple M4 native, fiqa 52k docs / 7M tokens: **6.70 → 1.66 ms**
-  per query (4.0×). Replicated on GitHub CI: stage-1 sums drop 6–12× on
+  per query (4.0×). Replicated on GitHub CI: stage-1 sums drop 4.5–12× on
   x86 AVX2, Neoverse, and macOS arm64 — server parts pay more for the
   scatter this removes than Apple's L2 does, so the M4 number is the
   conservative one.

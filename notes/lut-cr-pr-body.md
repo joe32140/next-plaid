@@ -12,7 +12,7 @@ integration, arm64 native). Stage-1 perf follow-up is stacked as
 Open with (the PR body is everything below the `---`):
 
 ```bash
-gh pr create --repo lightonai/next-plaid --base main --head joe32140:feat/asymmetric-residual-lut --title "feat: asymmetric residual scoring — int8 query × fused LUT with SIMD MaxSim kernels" --body-file <(sed '1,/^---$/d' /Users/joe/next-plaid-lut/notes/lut-cr-pr-body.md)
+gh pr create --repo lightonai/next-plaid --base main --head joe32140:feat/asymmetric-residual-lut --title "feat: asymmetric residual scoring — int8 query × fused LUT MaxSim, 5–8× faster rescoring, identical NDCG@10" --body-file <(sed '1,/^---$/d' /Users/joe/next-plaid-lut/notes/lut-cr-pr-body.md)
 ```
 
 ---
@@ -26,7 +26,8 @@ plus the centroid term Stage-1 already computed — instead of
 decompressing every candidate token to f32 and running a BLAS MaxSim.
 Compute-only: same index, same storage, so the two modes can be A/B'd
 per search. The residual-codec counterpart of #155's int8 × binary
-scoring.
+scoring. The stage-1 half of the same campaign is stacked on top of this
+PR as #170.
 
 ## How
 
@@ -74,7 +75,8 @@ dense path).
 
 ## Measured
 
-- **Quality**: |ΔNDCG@10| ≤ 0.002 vs the float path on identical codes —
+- **Quality — NDCG@10 is unchanged**: |Δ| ≤ 0.002 vs the float path on
+  identical codes, and identical to three decimals at deployed settings —
   3 ColBERT checkpoints × 3 BEIR corpora × nbits 4/2/1, incl. long-query
   ArguAna. The int8 error lands only on the residual correction; the
   dominant centroid term stays float. Spot-checked again on real GTE
@@ -87,16 +89,32 @@ dense path).
   | SciFact | 0.7609 / 0.7607 | 0.7507 / 0.7507 | 0.7427 / 0.7427 |
 
   Max |Δ| across the six cells: 0.0004.
-- **Latency** (exact-scoring stage, 1024-doc shortlists, real corpus
-  shapes, x86 AVX2 / Neoverse / Apple M4): 4.7–8.4× vs decompress+GEMM
-  at the kernel level; 1.4–5.2× end-to-end depending on corpus size
-  (Stage-1 dominates at scale). Decompression is 48–84% of the float
-  exact path (platform-dependent) — the fused kernels win by skipping
-  it, not by out-multiplying GEMM. Combined with the stacked stage-1
-  follow-up PR, the same interleaved A/B against v1.6.5 measures
-  5.6–7.1× end-to-end geomean (9 dataset×nbits cells per platform) on
-  x86 AVX2, Neoverse, and macOS arm64 CI, and 6.3× on a native M4 —
-  that combined number belongs to the pair, not to this PR alone.
+- **Latency** — the rescore stage (exact scoring of ~1024-doc
+  shortlists, real corpus shapes), fused asym vs the float
+  decompress+GEMM path on identical indexes. The CI rows come from one
+  interleaved run of the same tree with `residual_asym` off vs on —
+  same stage-1, same shortlists, so the ratio isolates this PR's
+  scheme change. 9 cells per platform (3 datasets × nbits 4/2/1);
+  geomean, with the per-cell range in parentheses:
+
+  | platform | fused vs float rescore | decompress share of the float rescore |
+  |---|---|---|
+  | x86 AVX2 (GitHub CI) | **6.1×** (5.2–7.8×) | 74–83% |
+  | Neoverse (GitHub CI) | **6.3×** (5.3–8.2×) | 67–76% |
+  | macOS arm64 (GitHub CI) | **5.1×** (4.3–5.7×) | 71–80% |
+  | Apple M4 (native, 0.5–7M-token corpus ladder) | **5.2×** (4.7–5.8×) | 48–72% |
+
+  The right column is the mechanism: the fused kernels win by skipping
+  decompression, not by out-multiplying GEMM — and it also bounds the
+  win by whatever share decompression holds in a given deployment (the
+  share falls as corpora grow: 72% → 48% across the M4 ladder).
+- **End-to-end**: this PR alone moves whole-query latency 1.4–5.2×
+  depending on corpus size — stage-1 dominates at scale, and that is
+  the stacked follow-up's job. Combined with the stage-1 rework
+  (#170), the same interleaved A/B against v1.6.5 measures **5.6–7.1×
+  end-to-end geomean** (same 9 cells per platform) on x86 AVX2,
+  Neoverse, and macOS arm64 CI, and **6.3×** on a native M4 — the
+  combined number belongs to the pair, not to this PR alone.
 - **AVX-512 honesty note**: the VNNI kernel is written, feature-gated,
   and covered by the parity suite *on VNNI hardware*, but GitHub's
   standard runners don't have VNNI — correctness-validated, no perf

@@ -23,11 +23,6 @@ type ProbePartial = (
 /// will need it, and the pruned exact-scoring shortlist.
 type Stage1Shortlist = (Array2<f32>, Option<Array2<f32>>, Vec<i64>);
 
-/// Maximum number of documents to decompress concurrently during exact scoring.
-/// This limits peak memory usage from parallel decompression.
-/// With 128 docs × ~300KB per doc = ~40MB max concurrent decompression memory.
-const DECOMPRESS_CHUNK_SIZE: usize = 128;
-
 /// Search parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchParameters {
@@ -732,18 +727,17 @@ pub fn search_one_mmap(
     } else {
         None
     };
-    // Chunked processing limits concurrent memory from parallel decompression.
+    // Per-doc parallelism: rayon splits adaptively, so all cores stay fed
+    // and variable doc lengths balance. The fixed 128-doc chunking this
+    // replaces served a decompression-memory rationale that no longer holds:
+    // in-flight decompressed docs are bounded by the thread count either
+    // way, and the chunk count (8 at n_decompress = 1024) underfilled and
+    // straggled the pool — measured 6.1 effective threads on a 10-core M4.
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
-        .par_chunks(DECOMPRESS_CHUNK_SIZE)
-        .flat_map(|chunk| {
-            chunk
-                .iter()
-                .filter_map(|&doc_id| {
-                    let score =
-                        exact_doc_score(index, &exact_query, cdot_t.as_ref(), doc_id as usize)?;
-                    Some((doc_id, score))
-                })
-                .collect::<Vec<_>>()
+        .par_iter()
+        .filter_map(|&doc_id| {
+            let score = exact_doc_score(index, &exact_query, cdot_t.as_ref(), doc_id as usize)?;
+            Some((doc_id, score))
         })
         .collect();
 
@@ -1150,29 +1144,28 @@ fn search_one_mmap_batched(
     } else {
         None
     };
+    // Per-doc parallelism, same rationale as the dense path: adaptive
+    // splitting feeds every core; in-flight decompressed docs are bounded by
+    // the thread count, so the old fixed 128-doc chunking bought no memory
+    // safety — only pool underfill.
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
-        .par_chunks(DECOMPRESS_CHUNK_SIZE)
-        .flat_map(|chunk| {
-            chunk
-                .iter()
-                .filter_map(|&doc_id| {
-                    let score = match (&exact_query, &asym_compact) {
-                        (ScoreQuery::ResidualLut { q8, lut, planes }, Some((cd, remap))) => {
-                            exact_doc_score_asym_compact(
-                                index,
-                                q8,
-                                lut,
-                                planes.as_ref(),
-                                cd,
-                                remap,
-                                doc_id as usize,
-                            )
-                        }
-                        _ => exact_doc_score(index, &exact_query, None, doc_id as usize),
-                    }?;
-                    Some((doc_id, score))
-                })
-                .collect::<Vec<_>>()
+        .par_iter()
+        .filter_map(|&doc_id| {
+            let score = match (&exact_query, &asym_compact) {
+                (ScoreQuery::ResidualLut { q8, lut, planes }, Some((cd, remap))) => {
+                    exact_doc_score_asym_compact(
+                        index,
+                        q8,
+                        lut,
+                        planes.as_ref(),
+                        cd,
+                        remap,
+                        doc_id as usize,
+                    )
+                }
+                _ => exact_doc_score(index, &exact_query, None, doc_id as usize),
+            }?;
+            Some((doc_id, score))
         })
         .collect();
 

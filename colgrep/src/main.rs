@@ -320,9 +320,6 @@ fn main() -> Result<()> {
             remove_force_include,
             clear_ignore,
             clear_force_include,
-            add_cover,
-            remove_cover,
-            clear_cover,
         }) => cmd_config(
             default_k,
             default_n,
@@ -350,9 +347,6 @@ fn main() -> Result<()> {
             remove_force_include,
             clear_ignore,
             clear_force_include,
-            add_cover,
-            remove_cover,
-            clear_cover,
         ),
         None => {
             // Default: run search if query is provided

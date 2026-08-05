@@ -1331,7 +1331,7 @@ fn search_single_path(
                         subdir,
                         &config.extra_ignore,
                         &config.force_include,
-                        &config.covered_subdirs_for(&effective_root),
+                        &config.force_include_dirs_for(&effective_root),
                     ) {
                         eprintln!(
                             "This directory is excluded by the project's ignore rules; index it with: colgrep init {}",

@@ -59,14 +59,14 @@ pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
     // If the adopting project's walk rules exclude `path` — most often a
     // .gitignore entry: dataset corpora, build outputs — updating the parent
     // would report success having indexed none of the requested files. Running
-    // init on such a directory is an explicit ask, so register it as a covered
-    // subtree of the parent first. Registrations live in the config, which
+    // init on such a directory is an explicit ask, so force-include it for the
+    // parent first. Registrations live in the config, which
     // every scan consults: coverage survives incremental updates, full rebuilds
     // (including index-format bumps on upgrade) and `colgrep clear`. A
     // directory the walk simply hasn't seen yet (e.g. just created) is already
     // reachable and needs no registration — the parent update below picks it up.
     if let Some(info) = &parent_info {
-        let covered = config.covered_subdirs_for(&info.project_path);
+        let covered = config.force_include_dirs_for(&info.project_path);
         if !scan_reaches_subdir(
             &info.project_path,
             &info.relative_subdir,
@@ -74,17 +74,17 @@ pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
             &config.force_include,
             &covered,
         ) {
-            config.add_covered_subdir(&info.project_path, &info.relative_subdir);
+            config.add_force_include_dir(&info.project_path, &info.relative_subdir);
             config
                 .save()
-                .context("Failed to persist covered subdirectory registration")?;
+                .context("Failed to persist force-included directory registration")?;
             eprintln!(
-                "📌 {} is excluded by {}'s ignore rules — registered it as covered so this and every future rebuild index it.",
+                "📌 {} is excluded by {}'s ignore rules — force-included it so this and every future rebuild index it.",
                 info.relative_subdir.display(),
                 info.project_path.display(),
             );
             eprintln!(
-                "   Undo with: colgrep settings --no-cover {}",
+                "   Undo with: colgrep settings --no-force-include {}",
                 path.display()
             );
         }

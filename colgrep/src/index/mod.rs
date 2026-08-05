@@ -2814,7 +2814,7 @@ impl IndexBuilder {
             languages,
             &config.extra_ignore,
             &config.force_include,
-            &config.covered_subdirs_for(&self.project_root),
+            &config.force_include_dirs_for(&self.project_root),
         ))
     }
 }
@@ -2832,7 +2832,7 @@ fn scan_project_files(
     languages: Option<&[Language]>,
     extra_ignore: &[String],
     force_include: &[String],
-    covered_subdirs: &[PathBuf],
+    force_include_dirs: &[PathBuf],
 ) -> (Vec<PathBuf>, usize) {
     let mut files = Vec::new();
     let mut skipped = 0;
@@ -2857,7 +2857,7 @@ fn scan_project_files(
         .build();
     collect_scanned_files(project_root, walker, languages, &mut files, &mut skipped);
 
-    for covered in covered_subdirs {
+    for covered in force_include_dirs {
         let sub_root = project_root.join(covered);
         if !sub_root.is_dir() {
             continue;
@@ -2865,7 +2865,7 @@ fn scan_project_files(
         let root = sub_root.clone();
         let extra = extra_ignore.to_vec();
         let force = force_include.to_vec();
-        let mut builder = covered_subtree_walk_builder(&sub_root);
+        let mut builder = force_include_dir_walk_builder(&sub_root);
         builder.filter_entry(move |entry| match entry.path().strip_prefix(&root) {
             Ok(rel) if rel.as_os_str().is_empty() => true,
             Ok(rel) => !should_ignore(rel, &extra, &force),
@@ -2929,13 +2929,13 @@ fn collect_scanned_files(
     }
 }
 
-/// Walker over an explicitly covered subtree.
+/// Walker over a force-included directory's subtree.
 ///
-/// The subtree is covered precisely because the enclosing project's rules
+/// The directory is registered precisely because the enclosing project's rules
 /// exclude it, so ancestor ignore files must not apply: `parents(false)`.
 /// Ignore files *inside* the subtree still do, even though any `.git` sits
 /// above the subtree root: `require_git(false)`.
-fn covered_subtree_walk_builder(sub_root: &Path) -> WalkBuilder {
+fn force_include_dir_walk_builder(sub_root: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(sub_root);
     builder
         .hidden(false)
@@ -2960,7 +2960,7 @@ pub fn scan_reaches_subdir(
     subdir: &Path,
     extra_ignore: &[String],
     force_include: &[String],
-    covered_subdirs: &[PathBuf],
+    force_include_dirs: &[PathBuf],
 ) -> bool {
     if subdir.as_os_str().is_empty() {
         return true;
@@ -2973,14 +2973,14 @@ pub fn scan_reaches_subdir(
         return true;
     }
 
-    for covered in covered_subdirs {
+    for covered in force_include_dirs {
         if subdir == covered.as_path() {
             return true;
         }
         if let Ok(rest) = subdir.strip_prefix(covered) {
             let sub_root = project_root.join(covered);
             if walk_yields(
-                covered_subtree_walk_builder(&sub_root),
+                force_include_dir_walk_builder(&sub_root),
                 &sub_root,
                 rest,
                 extra_ignore,
@@ -6272,7 +6272,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_reaches_covered_subdir_and_descendants() {
+    fn test_scan_reaches_force_included_dir_and_descendants() {
         let (_dir, root) = project_with_gitignored_corpus();
         let covered = [PathBuf::from("corpus")];
 
@@ -6293,7 +6293,7 @@ mod tests {
     }
 
     #[test]
-    fn test_covered_subtree_still_applies_inner_rules() {
+    fn test_force_included_dir_still_applies_inner_rules() {
         // Coverage overrides the PARENT's exclusion only: ignore rules inside
         // the covered subtree (its own .gitignore, default ignored dirs) hold.
         let (_dir, root) = project_with_gitignored_corpus();
@@ -6319,7 +6319,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_project_files_merges_covered_subtree() {
+    fn test_scan_project_files_merges_force_included_dir() {
         let (_dir, root) = project_with_gitignored_corpus();
 
         let (without, _) = scan_project_files(&root, None, &[], &[], &[]);
@@ -6338,7 +6338,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_project_files_covered_subtree_inner_gitignore() {
+    fn test_scan_project_files_force_included_dir_inner_gitignore() {
         let (_dir, root) = project_with_gitignored_corpus();
         std::fs::write(root.join("corpus/.gitignore"), "nested/\n").unwrap();
 
@@ -6352,7 +6352,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_project_files_dedupes_reachable_covered_subtree() {
+    fn test_scan_project_files_dedupes_reachable_force_included_dir() {
         // Coverage outlives the exclusion that motivated it: once the
         // .gitignore entry is dropped, both walks yield the corpus files and
         // each must be indexed exactly once.

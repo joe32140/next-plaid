@@ -2808,61 +2808,224 @@ impl IndexBuilder {
     fn scan_files(&self, languages: Option<&[Language]>) -> Result<(Vec<PathBuf>, usize)> {
         // Load user-configured ignore/include overrides from persistent config
         let config = crate::config::Config::load().unwrap_or_default();
-        let extra_ignore = config.extra_ignore.clone();
-        let force_include = config.force_include.clone();
 
-        let project_root = self.project_root.clone();
-        let walker = WalkBuilder::new(&self.project_root)
-            .hidden(false) // Handle hidden files manually in should_ignore (with .github exception)
-            .git_ignore(true)
-            .follow_links(false) // Explicitly prevent symlink traversal outside project
-            .filter_entry(move |entry| {
-                // Only apply ignore rules to path components relative to the project root.
-                // The project root itself is always trusted (the user explicitly chose it),
-                // so hidden-directory filtering must not reject ancestor path components.
-                match entry.path().strip_prefix(&project_root) {
-                    Ok(rel) if rel.as_os_str().is_empty() => true, // root entry itself
-                    Ok(rel) => !should_ignore(rel, &extra_ignore, &force_include),
-                    Err(_) => !should_ignore(entry.path(), &extra_ignore, &force_include), // fallback (shouldn't happen)
-                }
-            })
-            .build();
+        Ok(scan_project_files(
+            &self.project_root,
+            languages,
+            &config.extra_ignore,
+            &config.force_include,
+            &config.covered_subdirs_for(&self.project_root),
+        ))
+    }
+}
 
-        let mut files = Vec::new();
-        let mut skipped = 0;
+/// Scan `project_root` for indexable files, returning root-relative paths and
+/// the number of skipped files.
+///
+/// Covered subtrees (`colgrep init` on a directory the main walk's rules
+/// exclude) are scanned with their own walk and merged in. Because every scan
+/// consults the registrations, coverage survives incremental updates and full
+/// rebuilds alike — including the rebuilds an index-format bump or a
+/// `colgrep clear` forces.
+fn scan_project_files(
+    project_root: &Path,
+    languages: Option<&[Language]>,
+    extra_ignore: &[String],
+    force_include: &[String],
+    covered_subdirs: &[PathBuf],
+) -> (Vec<PathBuf>, usize) {
+    let mut files = Vec::new();
+    let mut skipped = 0;
 
-        for entry in walker.filter_map(|e| e.ok()) {
-            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                continue;
+    let root = project_root.to_path_buf();
+    let extra = extra_ignore.to_vec();
+    let force = force_include.to_vec();
+    let walker = WalkBuilder::new(project_root)
+        .hidden(false) // Handle hidden files manually in should_ignore (with .github exception)
+        .git_ignore(true)
+        .follow_links(false) // Explicitly prevent symlink traversal outside project
+        .filter_entry(move |entry| {
+            // Only apply ignore rules to path components relative to the project root.
+            // The project root itself is always trusted (the user explicitly chose it),
+            // so hidden-directory filtering must not reject ancestor path components.
+            match entry.path().strip_prefix(&root) {
+                Ok(rel) if rel.as_os_str().is_empty() => true, // root entry itself
+                Ok(rel) => !should_ignore(rel, &extra, &force),
+                Err(_) => !should_ignore(entry.path(), &extra, &force), // fallback (shouldn't happen)
             }
+        })
+        .build();
+    collect_scanned_files(project_root, walker, languages, &mut files, &mut skipped);
 
-            let path = entry.path();
+    for covered in covered_subdirs {
+        let sub_root = project_root.join(covered);
+        if !sub_root.is_dir() {
+            continue;
+        }
+        let root = sub_root.clone();
+        let extra = extra_ignore.to_vec();
+        let force = force_include.to_vec();
+        let mut builder = covered_subtree_walk_builder(&sub_root);
+        builder.filter_entry(move |entry| match entry.path().strip_prefix(&root) {
+            Ok(rel) if rel.as_os_str().is_empty() => true,
+            Ok(rel) => !should_ignore(rel, &extra, &force),
+            Err(_) => false,
+        });
+        collect_scanned_files(
+            project_root,
+            builder.build(),
+            languages,
+            &mut files,
+            &mut skipped,
+        );
+    }
 
-            // Skip files that are too large
-            if is_file_too_large(path) {
-                skipped += 1;
-                continue;
-            }
+    // A covered subtree the main walk later reaches again (e.g. its .gitignore
+    // entry was removed) would otherwise be collected twice.
+    let mut seen = HashSet::new();
+    files.retain(|f| seen.insert(f.clone()));
 
-            let lang = match detect_language(path) {
-                Some(l) => l,
-                None => continue,
-            };
+    (files, skipped)
+}
 
-            if languages.map(|ls| ls.contains(&lang)).unwrap_or(true) {
-                if let Ok(rel_path) = path.strip_prefix(&self.project_root) {
-                    // Verify the file is truly within the project root (handles symlink escapes)
-                    if is_within_project_root(&self.project_root, rel_path) {
-                        files.push(rel_path.to_path_buf());
-                    } else {
-                        skipped += 1;
-                    }
+/// Collect indexable files yielded by `walker` into `files` as paths relative
+/// to `project_root` (which for covered-subtree walks is an ancestor of the
+/// walker's own root).
+fn collect_scanned_files(
+    project_root: &Path,
+    walker: ignore::Walk,
+    languages: Option<&[Language]>,
+    files: &mut Vec<PathBuf>,
+    skipped: &mut usize,
+) {
+    for entry in walker.filter_map(|e| e.ok()) {
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+
+        let path = entry.path();
+
+        // Skip files that are too large
+        if is_file_too_large(path) {
+            *skipped += 1;
+            continue;
+        }
+
+        let lang = match detect_language(path) {
+            Some(l) => l,
+            None => continue,
+        };
+
+        if languages.map(|ls| ls.contains(&lang)).unwrap_or(true) {
+            if let Ok(rel_path) = path.strip_prefix(project_root) {
+                // Verify the file is truly within the project root (handles symlink escapes)
+                if is_within_project_root(project_root, rel_path) {
+                    files.push(rel_path.to_path_buf());
+                } else {
+                    *skipped += 1;
                 }
             }
         }
-
-        Ok((files, skipped))
     }
+}
+
+/// Walker over an explicitly covered subtree.
+///
+/// The subtree is covered precisely because the enclosing project's rules
+/// exclude it, so ancestor ignore files must not apply: `parents(false)`.
+/// Ignore files *inside* the subtree still do, even though any `.git` sits
+/// above the subtree root: `require_git(false)`.
+fn covered_subtree_walk_builder(sub_root: &Path) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(sub_root);
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .parents(false)
+        .require_git(false)
+        .follow_links(false);
+    builder
+}
+
+/// Whether the project's file scan can reach `subdir` (relative to
+/// `project_root`): either the main walk's rules admit every step from the
+/// root, or a covered subtree contains it and the subtree walk admits the
+/// remaining steps.
+///
+/// This asks "would scanning index files under this directory?" — it
+/// deliberately ignores what any existing index currently holds, so a
+/// directory the walk simply hasn't seen yet (e.g. just created) counts as
+/// reachable.
+pub fn scan_reaches_subdir(
+    project_root: &Path,
+    subdir: &Path,
+    extra_ignore: &[String],
+    force_include: &[String],
+    covered_subdirs: &[PathBuf],
+) -> bool {
+    if subdir.as_os_str().is_empty() {
+        return true;
+    }
+
+    // Main walk, same settings as the real scan.
+    let mut builder = WalkBuilder::new(project_root);
+    builder.hidden(false).git_ignore(true).follow_links(false);
+    if walk_yields(builder, project_root, subdir, extra_ignore, force_include) {
+        return true;
+    }
+
+    for covered in covered_subdirs {
+        if subdir == covered.as_path() {
+            return true;
+        }
+        if let Ok(rest) = subdir.strip_prefix(covered) {
+            let sub_root = project_root.join(covered);
+            if walk_yields(
+                covered_subtree_walk_builder(&sub_root),
+                &sub_root,
+                rest,
+                extra_ignore,
+                force_include,
+            ) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Whether walking from `root` with `builder`'s rules yields `root/target`.
+/// Descends only along `target`'s ancestor chain, applying the same
+/// `should_ignore` filter as the real scan — cheap: it enumerates just the
+/// directories on that chain.
+fn walk_yields(
+    mut builder: WalkBuilder,
+    root: &Path,
+    target: &Path,
+    extra_ignore: &[String],
+    force_include: &[String],
+) -> bool {
+    let absolute_target = root.join(target);
+    let chain_target = absolute_target.clone();
+    let root = root.to_path_buf();
+    let extra = extra_ignore.to_vec();
+    let force = force_include.to_vec();
+    builder
+        .max_depth(Some(target.components().count()))
+        .filter_entry(move |entry| {
+            if !chain_target.starts_with(entry.path()) {
+                return false; // off the ancestor chain — don't descend
+            }
+            match entry.path().strip_prefix(&root) {
+                Ok(rel) if rel.as_os_str().is_empty() => true,
+                Ok(rel) => !should_ignore(rel, &extra, &force),
+                Err(_) => false,
+            }
+        });
+    builder
+        .build()
+        .filter_map(|e| e.ok())
+        .any(|entry| entry.path() == absolute_target)
 }
 
 /// Check if a file exceeds the maximum size limit
@@ -6006,5 +6169,209 @@ mod tests {
             "state must be reconstructed from the DB"
         );
         assert_eq!(state.index_format_version, INDEX_FORMAT_VERSION);
+    }
+
+    /// Run git isolated from host config/hooks and from any surrounding
+    /// `git commit` environment (same pattern as worktree.rs tests).
+    fn git(args: &[&str], cwd: &Path) {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null");
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_PREFIX",
+        ] {
+            cmd.env_remove(var);
+        }
+        let out = cmd.output().expect("git available");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Git project with a tracked file and a gitignored `corpus/` holding docs.
+    fn project_with_gitignored_corpus() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        git(&["init", "-q"], &root);
+        std::fs::write(root.join(".gitignore"), "corpus/\n").unwrap();
+        std::fs::write(root.join("tracked.md"), "# tracked\n").unwrap();
+        std::fs::create_dir_all(root.join("corpus/nested")).unwrap();
+        std::fs::write(root.join("corpus/d1.md"), "# doc\n").unwrap();
+        std::fs::write(root.join("corpus/nested/n1.md"), "# nested doc\n").unwrap();
+        (dir, root)
+    }
+
+    #[test]
+    fn test_scan_reaches_subdir_not_yet_indexed() {
+        // A directory the walk rules admit is reachable even though no index has
+        // ever seen it — a freshly created folder must NOT be treated like an
+        // excluded one (that misclassification forked a separate index).
+        let (_dir, root) = project_with_gitignored_corpus();
+        std::fs::create_dir(root.join("newfeature")).unwrap();
+
+        assert!(scan_reaches_subdir(
+            &root,
+            Path::new("newfeature"),
+            &[],
+            &[],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_scan_does_not_reach_gitignored_subdir() {
+        let (_dir, root) = project_with_gitignored_corpus();
+
+        assert!(!scan_reaches_subdir(
+            &root,
+            Path::new("corpus"),
+            &[],
+            &[],
+            &[]
+        ));
+        assert!(!scan_reaches_subdir(
+            &root,
+            Path::new("corpus/nested"),
+            &[],
+            &[],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_scan_reaches_sibling_sharing_excluded_prefix() {
+        // `corpus-extra` shares a string prefix with the gitignored `corpus`
+        // but is a distinct, non-ignored directory.
+        let (_dir, root) = project_with_gitignored_corpus();
+        std::fs::create_dir(root.join("corpus-extra")).unwrap();
+
+        assert!(scan_reaches_subdir(
+            &root,
+            Path::new("corpus-extra"),
+            &[],
+            &[],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_scan_reaches_covered_subdir_and_descendants() {
+        let (_dir, root) = project_with_gitignored_corpus();
+        let covered = [PathBuf::from("corpus")];
+
+        assert!(scan_reaches_subdir(
+            &root,
+            Path::new("corpus"),
+            &[],
+            &[],
+            &covered
+        ));
+        assert!(scan_reaches_subdir(
+            &root,
+            Path::new("corpus/nested"),
+            &[],
+            &[],
+            &covered
+        ));
+    }
+
+    #[test]
+    fn test_covered_subtree_still_applies_inner_rules() {
+        // Coverage overrides the PARENT's exclusion only: ignore rules inside
+        // the covered subtree (its own .gitignore, default ignored dirs) hold.
+        let (_dir, root) = project_with_gitignored_corpus();
+        std::fs::write(root.join("corpus/.gitignore"), "private/\n").unwrap();
+        std::fs::create_dir(root.join("corpus/private")).unwrap();
+        std::fs::create_dir(root.join("corpus/node_modules")).unwrap();
+        let covered = [PathBuf::from("corpus")];
+
+        assert!(!scan_reaches_subdir(
+            &root,
+            Path::new("corpus/private"),
+            &[],
+            &[],
+            &covered
+        ));
+        assert!(!scan_reaches_subdir(
+            &root,
+            Path::new("corpus/node_modules"),
+            &[],
+            &[],
+            &covered
+        ));
+    }
+
+    #[test]
+    fn test_scan_project_files_merges_covered_subtree() {
+        let (_dir, root) = project_with_gitignored_corpus();
+
+        let (without, _) = scan_project_files(&root, None, &[], &[], &[]);
+        assert_eq!(without, vec![PathBuf::from("tracked.md")]);
+
+        let (mut with, _) = scan_project_files(&root, None, &[], &[], &[PathBuf::from("corpus")]);
+        with.sort();
+        assert_eq!(
+            with,
+            vec![
+                PathBuf::from("corpus/d1.md"),
+                PathBuf::from("corpus/nested/n1.md"),
+                PathBuf::from("tracked.md"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_scan_project_files_covered_subtree_inner_gitignore() {
+        let (_dir, root) = project_with_gitignored_corpus();
+        std::fs::write(root.join("corpus/.gitignore"), "nested/\n").unwrap();
+
+        let (mut files, _) = scan_project_files(&root, None, &[], &[], &[PathBuf::from("corpus")]);
+        files.sort();
+        assert_eq!(
+            files,
+            vec![PathBuf::from("corpus/d1.md"), PathBuf::from("tracked.md")],
+            "the covered subtree's own .gitignore must still exclude nested/"
+        );
+    }
+
+    #[test]
+    fn test_scan_project_files_dedupes_reachable_covered_subtree() {
+        // Coverage outlives the exclusion that motivated it: once the
+        // .gitignore entry is dropped, both walks yield the corpus files and
+        // each must be indexed exactly once.
+        let (_dir, root) = project_with_gitignored_corpus();
+        std::fs::write(root.join(".gitignore"), "").unwrap();
+
+        let (files, _) = scan_project_files(&root, None, &[], &[], &[PathBuf::from("corpus")]);
+        let unique: HashSet<_> = files.iter().collect();
+        assert_eq!(files.len(), unique.len(), "no duplicate scan entries");
+        assert!(files.contains(&PathBuf::from("corpus/d1.md")));
+        assert!(files.contains(&PathBuf::from("tracked.md")));
+    }
+
+    #[test]
+    fn test_scan_reaches_missing_subdir_is_false() {
+        let (_dir, root) = project_with_gitignored_corpus();
+
+        assert!(!scan_reaches_subdir(
+            &root,
+            Path::new("does-not-exist"),
+            &[],
+            &[],
+            &[]
+        ));
     }
 }

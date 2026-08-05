@@ -23,10 +23,11 @@ pub use index::paths::{
     acquire_index_lock, find_parent_index, get_colgrep_data_dir, get_index_dir_for_project,
     get_vector_index_path, ParentIndexInfo, ProjectMetadata,
 };
-pub use index::state::{FileInfo, IndexState};
+pub use index::state::IndexState;
 pub use index::{
-    bre_to_ere, escape_literal_braces, index_exists, path_contains_ignored_dir, IndexBuilder,
-    SearchResult, Searcher, UpdatePlan, UpdateStats, CONFIRMATION_THRESHOLD,
+    bre_to_ere, escape_literal_braces, index_exists, path_contains_ignored_dir,
+    scan_reaches_subdir, IndexBuilder, SearchResult, Searcher, UpdatePlan, UpdateStats,
+    CONFIRMATION_THRESHOLD,
 };
 pub use model::{ensure_model, resolve_quantized, DEFAULT_MODEL};
 pub use onnx_runtime::{ensure_onnx_runtime, is_cudnn_available};

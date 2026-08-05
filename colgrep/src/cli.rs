@@ -250,6 +250,16 @@ EXAMPLES:
     # Clear all force-include patterns
     colgrep settings --clear-force-include
 
+    # Index a directory the project's ignore rules exclude (e.g. a gitignored
+    # corpus); equivalent to running `colgrep init ./corpus`
+    colgrep settings --cover ./corpus
+
+    # Stop indexing a covered subdirectory
+    colgrep settings --no-cover ./corpus
+
+    # Clear all covered-subdirectory registrations (all projects)
+    colgrep settings --clear-cover
+
     # Show absolute paths in search output
     colgrep settings --no-relative-paths
 
@@ -765,5 +775,22 @@ pub enum Commands {
         /// Clear all force-include patterns
         #[arg(long = "clear-force-include")]
         clear_force_include: bool,
+
+        /// Register a covered subdirectory: index it as part of its enclosing
+        /// indexed project even though that project's ignore rules exclude it
+        /// (same effect as running `colgrep init` on the directory). Can be repeated.
+        #[arg(long = "cover", value_name = "PATH")]
+        add_cover: Vec<String>,
+
+        /// Stop indexing a covered subdirectory (registered with --cover or by
+        /// `colgrep init` on a directory the project's ignore rules exclude). Takes
+        /// the directory path; its files leave the parent index on its next update.
+        /// Can be repeated.
+        #[arg(long = "no-cover", value_name = "PATH")]
+        remove_cover: Vec<String>,
+
+        /// Clear all covered-subdirectory registrations (all projects)
+        #[arg(long = "clear-cover")]
+        clear_cover: bool,
     },
 }

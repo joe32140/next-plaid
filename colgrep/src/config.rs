@@ -2,8 +2,9 @@
 //!
 //! Stores user preferences (like default model) in the colgrep data directory.
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -189,6 +190,16 @@ pub struct Config {
     /// e.g., [".vscode", "build/generated", "vendor/internal"]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub force_include: Vec<String>,
+
+    /// Subdirectories indexed as part of a parent project even though the
+    /// project's walk rules exclude them (most often a .gitignore entry —
+    /// dataset corpora, build outputs). Keyed by the canonical project root;
+    /// values are root-relative directory paths. Registered by `colgrep init`
+    /// on an excluded directory and consulted on every scan, so coverage
+    /// survives incremental updates, full rebuilds (including index-format
+    /// bumps on upgrade) and `colgrep clear`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub covered_subdirs: BTreeMap<String, Vec<String>>,
 }
 
 impl Config {
@@ -524,6 +535,50 @@ impl Config {
     /// Clear all force-include patterns
     pub fn clear_force_include(&mut self) {
         self.force_include.clear();
+    }
+
+    /// Root-relative subdirectories registered as covered for `project_root`.
+    pub fn covered_subdirs_for(&self, project_root: &Path) -> Vec<PathBuf> {
+        self.covered_subdirs
+            .get(project_root.to_string_lossy().as_ref())
+            .map(|subs| subs.iter().map(PathBuf::from).collect())
+            .unwrap_or_default()
+    }
+
+    /// Register `subdir` (relative to `project_root`) as a covered subdirectory.
+    /// Returns false if an equal or ancestor entry already covers it; entries the
+    /// new one subsumes are pruned.
+    pub fn add_covered_subdir(&mut self, project_root: &Path, subdir: &Path) -> bool {
+        let key = project_root.to_string_lossy().into_owned();
+        let entry = self.covered_subdirs.entry(key).or_default();
+        if entry.iter().any(|c| subdir.starts_with(Path::new(c))) {
+            return false;
+        }
+        entry.retain(|c| !Path::new(c).starts_with(subdir));
+        entry.push(subdir.to_string_lossy().into_owned());
+        entry.sort();
+        true
+    }
+
+    /// Remove the covered-subdirectory registration for `subdir` under
+    /// `project_root`. Returns true if an entry was removed.
+    pub fn remove_covered_subdir(&mut self, project_root: &Path, subdir: &Path) -> bool {
+        let key = project_root.to_string_lossy().into_owned();
+        let Some(entry) = self.covered_subdirs.get_mut(&key) else {
+            return false;
+        };
+        let len = entry.len();
+        entry.retain(|c| Path::new(c) != subdir);
+        let removed = entry.len() < len;
+        if entry.is_empty() {
+            self.covered_subdirs.remove(&key);
+        }
+        removed
+    }
+
+    /// Clear all covered-subdirectory registrations, across all projects.
+    pub fn clear_covered_subdirs(&mut self) {
+        self.covered_subdirs.clear();
     }
 }
 
@@ -1013,6 +1068,94 @@ mod tests {
         assert_eq!(
             restored.coreml_cache_dir(),
             Some("/private/tmp/colgrep-coreml")
+        );
+    }
+
+    #[test]
+    fn test_add_covered_subdir() {
+        let mut config = Config::default();
+        let root = Path::new("/project");
+
+        assert!(config.add_covered_subdir(root, Path::new("corpus")));
+        assert_eq!(
+            config.covered_subdirs_for(root),
+            vec![PathBuf::from("corpus")]
+        );
+        // Other projects are unaffected.
+        assert!(config.covered_subdirs_for(Path::new("/other")).is_empty());
+    }
+
+    #[test]
+    fn test_add_covered_subdir_already_covered() {
+        let mut config = Config::default();
+        let root = Path::new("/project");
+        config.add_covered_subdir(root, Path::new("corpus"));
+
+        // An exact duplicate or a descendant of an existing entry adds nothing.
+        assert!(!config.add_covered_subdir(root, Path::new("corpus")));
+        assert!(!config.add_covered_subdir(root, Path::new("corpus/nested")));
+        assert_eq!(
+            config.covered_subdirs_for(root),
+            vec![PathBuf::from("corpus")]
+        );
+    }
+
+    #[test]
+    fn test_add_covered_subdir_prunes_subsumed_entries() {
+        let mut config = Config::default();
+        let root = Path::new("/project");
+        config.add_covered_subdir(root, Path::new("artifacts/traces"));
+
+        // Covering the ancestor subsumes the finer-grained entry.
+        assert!(config.add_covered_subdir(root, Path::new("artifacts")));
+        assert_eq!(
+            config.covered_subdirs_for(root),
+            vec![PathBuf::from("artifacts")]
+        );
+    }
+
+    #[test]
+    fn test_add_covered_subdir_component_boundary() {
+        let mut config = Config::default();
+        let root = Path::new("/project");
+        config.add_covered_subdir(root, Path::new("corpus"));
+
+        // `corpus-extra` shares a string prefix with `corpus` but is a distinct
+        // directory: it is neither covered by nor subsumed into that entry.
+        assert!(config.add_covered_subdir(root, Path::new("corpus-extra")));
+        assert_eq!(
+            config.covered_subdirs_for(root),
+            vec![PathBuf::from("corpus"), PathBuf::from("corpus-extra")]
+        );
+    }
+
+    #[test]
+    fn test_remove_covered_subdir() {
+        let mut config = Config::default();
+        let root = Path::new("/project");
+        config.add_covered_subdir(root, Path::new("corpus"));
+
+        assert!(config.remove_covered_subdir(root, Path::new("corpus")));
+        assert!(config.covered_subdirs_for(root).is_empty());
+        // The now-empty project key is dropped from the map entirely.
+        assert!(config.covered_subdirs.is_empty());
+        assert!(!config.remove_covered_subdir(root, Path::new("corpus")));
+    }
+
+    #[test]
+    fn test_covered_subdirs_serialization_roundtrip() {
+        let mut config = Config::default();
+        // Absent from JSON when empty, so existing configs stay untouched.
+        assert!(!serde_json::to_string(&config)
+            .unwrap()
+            .contains("covered_subdirs"));
+
+        config.add_covered_subdir(Path::new("/project"), Path::new("corpus"));
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.covered_subdirs_for(Path::new("/project")),
+            vec![PathBuf::from("corpus")]
         );
     }
 }

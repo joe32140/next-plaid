@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use anyhow::Result;
 
 use colgrep::{
@@ -123,6 +125,9 @@ pub fn cmd_config(
     remove_force_include: Vec<String>,
     clear_ignore: bool,
     clear_force_include: bool,
+    add_cover: Vec<String>,
+    remove_cover: Vec<String>,
+    clear_cover: bool,
 ) -> Result<()> {
     let mut config = Config::load()?;
 
@@ -131,7 +136,10 @@ pub fn cmd_config(
         || !add_force_include.is_empty()
         || !remove_force_include.is_empty()
         || clear_ignore
-        || clear_force_include;
+        || clear_force_include
+        || !add_cover.is_empty()
+        || !remove_cover.is_empty()
+        || clear_cover;
 
     // If no options provided, show current config
     if default_k.is_none()
@@ -271,6 +279,18 @@ pub fn cmd_config(
             println!("  force-incl:  {}", fi.join(", "));
         }
 
+        // Covered subdirectories (registered by `colgrep init` on excluded dirs)
+        if config.covered_subdirs.is_empty() {
+            println!("  covered:     (none)");
+        } else {
+            println!("  covered:");
+            for (root, subs) in &config.covered_subdirs {
+                for sub in subs {
+                    println!("               {}", Path::new(root).join(sub).display());
+                }
+            }
+        }
+
         println!();
         println!("Use --k or --n to set values. Use 0 to reset to default.");
         println!("Use --fp32 or --int8 to change model precision.");
@@ -288,6 +308,7 @@ pub fn cmd_config(
         );
         println!("Use --ignore/--no-ignore to add/remove extra ignore patterns. --clear-ignore to reset.");
         println!("Use --force-include/--no-force-include to add/remove force-include patterns. --clear-force-include to reset.");
+        println!("Use --cover/--no-cover to add/remove covered subdirectories (indexed despite the project's ignore rules; `colgrep init <dir>` also registers). --clear-cover to reset.");
         return Ok(());
     }
 
@@ -503,11 +524,120 @@ pub fn cmd_config(
         changed = true;
     }
 
+    // Handle covered subdirectories
+    if clear_cover {
+        config.clear_covered_subdirs();
+        println!("✅ Cleared all covered-subdirectory registrations");
+        changed = true;
+    }
+    for raw in &add_cover {
+        let abs = resolve_cover_path(raw);
+        if !abs.is_dir() {
+            println!("⚠️  Not a directory: {}", abs.display());
+            continue;
+        }
+        match find_enclosing_project(&abs) {
+            Some((root, rel)) => {
+                if config.add_covered_subdir(&root, &rel) {
+                    println!(
+                        "✅ Covering {} under project {}",
+                        rel.display(),
+                        root.display()
+                    );
+                    println!(
+                        "   Its files are indexed on the project's next update (e.g. colgrep init {}).",
+                        root.display()
+                    );
+                } else {
+                    println!("✅ Already covered: {}", abs.display());
+                }
+                changed = true;
+            }
+            None => {
+                println!(
+                    "⚠️  No indexed project contains {}; index the project first with colgrep init",
+                    abs.display()
+                );
+            }
+        }
+    }
+    for raw in &remove_cover {
+        let abs = resolve_cover_path(raw);
+        if remove_covered_path(&mut config, &abs) {
+            println!("✅ Stopped covering: {}", abs.display());
+            println!("   Its files leave the parent index on its next update.");
+        } else {
+            println!(
+                "⚠️  No covered subdirectory registered for: {}",
+                abs.display()
+            );
+        }
+        changed = true;
+    }
+
     if changed {
         config.save()?;
     }
 
     Ok(())
+}
+
+/// Absolutize a `--no-cover` argument. Prefer canonicalization so the path
+/// matches the canonical roots coverage is keyed by; a directory that no
+/// longer exists falls back to a lexical join with the working directory.
+fn resolve_cover_path(raw: &str) -> PathBuf {
+    std::fs::canonicalize(raw).unwrap_or_else(|_| {
+        let path = Path::new(raw);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
+}
+
+/// Resolve a `--cover` argument to (project root, root-relative subdir) against
+/// every indexed project, preferring the deepest containing root. Deliberately
+/// model-agnostic: coverage is a property of the project, not of one model's
+/// index, so every model's scan honors it.
+fn find_enclosing_project(abs: &Path) -> Option<(PathBuf, PathBuf)> {
+    let data_dir = colgrep::get_colgrep_data_dir().ok()?;
+    let mut best: Option<(PathBuf, PathBuf)> = None;
+    let mut best_depth = 0;
+    for entry in std::fs::read_dir(&data_dir).ok()?.filter_map(|e| e.ok()) {
+        let index_dir = entry.path();
+        if !index_dir.is_dir() {
+            continue;
+        }
+        if let Ok(meta) = colgrep::ProjectMetadata::load(&index_dir) {
+            if abs == meta.project_path {
+                continue; // the project root itself needs no coverage
+            }
+            if let Ok(rel) = abs.strip_prefix(&meta.project_path) {
+                let depth = meta.project_path.components().count();
+                if depth > best_depth {
+                    best_depth = depth;
+                    best = Some((meta.project_path, rel.to_path_buf()));
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Remove the coverage registration `abs` points into, matching it against
+/// every registered project root.
+fn remove_covered_path(config: &mut Config, abs: &Path) -> bool {
+    let roots: Vec<String> = config.covered_subdirs.keys().cloned().collect();
+    let mut removed = false;
+    for root in roots {
+        if let Ok(rel) = abs.strip_prefix(Path::new(&root)) {
+            removed |= config.remove_covered_subdir(Path::new(&root), rel);
+        }
+    }
+    removed
 }
 
 #[cfg(test)]

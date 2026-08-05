@@ -1323,6 +1323,21 @@ fn search_single_path(
                         "No indexed code units in subdirectory: {}",
                         subdir.display()
                     );
+                    // Empty because the project's walk rules exclude this directory
+                    // (e.g. a .gitignore entry), not because it holds no code: tell
+                    // the user how to bring it under coverage.
+                    if !colgrep::scan_reaches_subdir(
+                        &effective_root,
+                        subdir,
+                        &config.extra_ignore,
+                        &config.force_include,
+                        &config.force_include_dirs_for(&effective_root),
+                    ) {
+                        eprintln!(
+                            "This directory is excluded by the project's ignore rules; index it with: colgrep init {}",
+                            search_path.display()
+                        );
+                    }
                 }
                 return Ok(vec![]);
             }

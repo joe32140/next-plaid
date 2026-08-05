@@ -2,8 +2,9 @@
 //!
 //! Stores user preferences (like default model) in the colgrep data directory.
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -189,6 +190,18 @@ pub struct Config {
     /// e.g., [".vscode", "build/generated", "vendor/internal"]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub force_include: Vec<String>,
+
+    /// Per-project force-included directories: indexed as part of the project
+    /// even though its walk rules exclude them (most often a .gitignore entry —
+    /// dataset corpora, build outputs). The directory counterpart of the
+    /// `force_include` patterns above, and the only form that overrides
+    /// gitignore. Keyed by the canonical project root; values are root-relative
+    /// directory paths. Registered by `colgrep init` on an excluded directory
+    /// or `colgrep settings --force-include <dir>`, and consulted on every
+    /// scan, so registrations survive incremental updates, full rebuilds
+    /// (including index-format bumps on upgrade) and `colgrep clear`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub force_include_dirs: BTreeMap<String, Vec<String>>,
 }
 
 impl Config {
@@ -524,6 +537,50 @@ impl Config {
     /// Clear all force-include patterns
     pub fn clear_force_include(&mut self) {
         self.force_include.clear();
+    }
+
+    /// Root-relative force-included directories registered for `project_root`.
+    pub fn force_include_dirs_for(&self, project_root: &Path) -> Vec<PathBuf> {
+        self.force_include_dirs
+            .get(project_root.to_string_lossy().as_ref())
+            .map(|subs| subs.iter().map(PathBuf::from).collect())
+            .unwrap_or_default()
+    }
+
+    /// Register `subdir` (relative to `project_root`) as a force-included
+    /// directory. Returns false if an equal or ancestor entry already covers
+    /// it; entries the new one subsumes are pruned.
+    pub fn add_force_include_dir(&mut self, project_root: &Path, subdir: &Path) -> bool {
+        let key = project_root.to_string_lossy().into_owned();
+        let entry = self.force_include_dirs.entry(key).or_default();
+        if entry.iter().any(|c| subdir.starts_with(Path::new(c))) {
+            return false;
+        }
+        entry.retain(|c| !Path::new(c).starts_with(subdir));
+        entry.push(subdir.to_string_lossy().into_owned());
+        entry.sort();
+        true
+    }
+
+    /// Remove the force-included directory registration for `subdir` under
+    /// `project_root`. Returns true if an entry was removed.
+    pub fn remove_force_include_dir(&mut self, project_root: &Path, subdir: &Path) -> bool {
+        let key = project_root.to_string_lossy().into_owned();
+        let Some(entry) = self.force_include_dirs.get_mut(&key) else {
+            return false;
+        };
+        let len = entry.len();
+        entry.retain(|c| Path::new(c) != subdir);
+        let removed = entry.len() < len;
+        if entry.is_empty() {
+            self.force_include_dirs.remove(&key);
+        }
+        removed
+    }
+
+    /// Clear all force-included directory registrations, across all projects.
+    pub fn clear_force_include_dirs(&mut self) {
+        self.force_include_dirs.clear();
     }
 }
 
@@ -1013,6 +1070,96 @@ mod tests {
         assert_eq!(
             restored.coreml_cache_dir(),
             Some("/private/tmp/colgrep-coreml")
+        );
+    }
+
+    #[test]
+    fn test_add_force_include_dir() {
+        let mut config = Config::default();
+        let root = Path::new("/project");
+
+        assert!(config.add_force_include_dir(root, Path::new("corpus")));
+        assert_eq!(
+            config.force_include_dirs_for(root),
+            vec![PathBuf::from("corpus")]
+        );
+        // Other projects are unaffected.
+        assert!(config
+            .force_include_dirs_for(Path::new("/other"))
+            .is_empty());
+    }
+
+    #[test]
+    fn test_add_force_include_dir_already_covered() {
+        let mut config = Config::default();
+        let root = Path::new("/project");
+        config.add_force_include_dir(root, Path::new("corpus"));
+
+        // An exact duplicate or a descendant of an existing entry adds nothing.
+        assert!(!config.add_force_include_dir(root, Path::new("corpus")));
+        assert!(!config.add_force_include_dir(root, Path::new("corpus/nested")));
+        assert_eq!(
+            config.force_include_dirs_for(root),
+            vec![PathBuf::from("corpus")]
+        );
+    }
+
+    #[test]
+    fn test_add_force_include_dir_prunes_subsumed_entries() {
+        let mut config = Config::default();
+        let root = Path::new("/project");
+        config.add_force_include_dir(root, Path::new("artifacts/traces"));
+
+        // Covering the ancestor subsumes the finer-grained entry.
+        assert!(config.add_force_include_dir(root, Path::new("artifacts")));
+        assert_eq!(
+            config.force_include_dirs_for(root),
+            vec![PathBuf::from("artifacts")]
+        );
+    }
+
+    #[test]
+    fn test_add_force_include_dir_component_boundary() {
+        let mut config = Config::default();
+        let root = Path::new("/project");
+        config.add_force_include_dir(root, Path::new("corpus"));
+
+        // `corpus-extra` shares a string prefix with `corpus` but is a distinct
+        // directory: it is neither covered by nor subsumed into that entry.
+        assert!(config.add_force_include_dir(root, Path::new("corpus-extra")));
+        assert_eq!(
+            config.force_include_dirs_for(root),
+            vec![PathBuf::from("corpus"), PathBuf::from("corpus-extra")]
+        );
+    }
+
+    #[test]
+    fn test_remove_force_include_dir() {
+        let mut config = Config::default();
+        let root = Path::new("/project");
+        config.add_force_include_dir(root, Path::new("corpus"));
+
+        assert!(config.remove_force_include_dir(root, Path::new("corpus")));
+        assert!(config.force_include_dirs_for(root).is_empty());
+        // The now-empty project key is dropped from the map entirely.
+        assert!(config.force_include_dirs.is_empty());
+        assert!(!config.remove_force_include_dir(root, Path::new("corpus")));
+    }
+
+    #[test]
+    fn test_force_include_dirs_serialization_roundtrip() {
+        let mut config = Config::default();
+        // Absent from JSON when empty, so existing configs stay untouched.
+        assert!(!serde_json::to_string(&config)
+            .unwrap()
+            .contains("force_include_dirs"));
+
+        config.add_force_include_dir(Path::new("/project"), Path::new("corpus"));
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.force_include_dirs_for(Path::new("/project")),
+            vec![PathBuf::from("corpus")]
         );
     }
 }

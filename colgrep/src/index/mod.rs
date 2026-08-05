@@ -4028,12 +4028,13 @@ impl Searcher {
         })
     }
 
-    /// Filter results to files within a subdirectory prefix.
-    /// Returns document IDs where file path starts with the given prefix.
+    /// Filter results to files within a subdirectory.
+    /// Returns document IDs where the file path has the given directory prefix.
     pub fn filter_by_path_prefix(&self, prefix: &Path) -> Result<Vec<i64>> {
         let prefix_str = prefix.to_string_lossy();
-        // Use SQL LIKE with the prefix followed by %
-        let like_pattern = format!("{}%", prefix_str);
+        // Match on a whole path component: a bare `{prefix}%` would also pull in
+        // sibling directories sharing the string prefix (`corpus` ⊃ `corpus-extra/`).
+        let like_pattern = format!("{}/%", prefix_str.trim_end_matches('/'));
         let subset = filtering::where_condition(
             &self.index_path,
             "file LIKE ?",

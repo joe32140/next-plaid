@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use crate::commands::search::{resolve_model, resolve_pool_factor};
-use colgrep::{ensure_model, find_parent_index, index_exists, Config, IndexBuilder};
+use colgrep::{
+    ensure_model, find_parent_index, index_exists, Config, IndexBuilder, IndexState,
+    ParentIndexInfo,
+};
 
 pub struct InitOptions<'a> {
     pub cli_model: Option<&'a str>,
@@ -28,6 +31,20 @@ fn resolve_index_runtime_overrides(
     )
 }
 
+/// Whether a parent index holds at least one file under the subdirectory being indexed.
+///
+/// Reads the parent's state rather than its vectors, so this costs a JSON load and no model.
+fn parent_covers_subdir(info: &ParentIndexInfo) -> bool {
+    match IndexState::load(&info.index_dir) {
+        Ok(state) => state
+            .files
+            .keys()
+            .any(|file| file.starts_with(&info.relative_subdir)),
+        // An unreadable parent state is not evidence of coverage: index `path` itself.
+        Err(_) => false,
+    }
+}
+
 pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
     let path = std::fs::canonicalize(path)
         .map_err(|_| anyhow::anyhow!("Path does not exist: {}", path.display()))?;
@@ -44,8 +61,12 @@ pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
     let (parallel_sessions, batch_size) =
         resolve_index_runtime_overrides(&config, options.batch_size);
 
-    // Check if path is inside an already-indexed parent project
-    let parent_info = find_parent_index(&path, &model)?;
+    // Check if path is inside an already-indexed parent project, and reuse that index only
+    // if it actually holds files under `path`. A directory the parent's walk skips — most
+    // often one its .gitignore excludes — is a subdirectory of the parent without being
+    // covered by it, and reusing the parent there would report success having indexed none
+    // of the requested files.
+    let parent_info = find_parent_index(&path, &model)?.filter(parent_covers_subdir);
     let effective_root = match &parent_info {
         Some(info) => info.project_path.clone(),
         None => path.clone(),
@@ -151,5 +172,55 @@ mod tests {
 
         assert_eq!(parallel_sessions, Some(1));
         assert_eq!(batch_size, Some(1));
+    }
+
+    fn parent_with_files(files: &[&str]) -> (tempfile::TempDir, ParentIndexInfo) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = IndexState::default();
+        for file in files {
+            state.files.insert(
+                PathBuf::from(file),
+                colgrep::FileInfo {
+                    content_hash: 0,
+                    mtime: 0,
+                    size: 0,
+                },
+            );
+        }
+        state.save(dir.path()).unwrap();
+        let info = ParentIndexInfo {
+            index_dir: dir.path().to_path_buf(),
+            project_path: PathBuf::from("/project"),
+            relative_subdir: PathBuf::from("corpus"),
+        };
+        (dir, info)
+    }
+
+    #[test]
+    fn test_parent_covers_subdir_when_it_holds_files_there() {
+        let (_dir, info) = parent_with_files(&["src/main.rs", "corpus/doc1.md"]);
+
+        assert!(parent_covers_subdir(&info));
+    }
+
+    #[test]
+    fn test_parent_does_not_cover_subdir_it_skipped() {
+        // The parent walk skipped `corpus/` — e.g. .gitignore excludes it — so an index of
+        // the parent holds none of the files `init corpus/` was asked to index.
+        let (_dir, info) = parent_with_files(&["src/main.rs", "README.md"]);
+
+        assert!(!parent_covers_subdir(&info));
+    }
+
+    #[test]
+    fn test_parent_does_not_cover_subdir_when_state_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = ParentIndexInfo {
+            index_dir: dir.path().join("missing"),
+            project_path: PathBuf::from("/project"),
+            relative_subdir: PathBuf::from("corpus"),
+        };
+
+        assert!(!parent_covers_subdir(&info));
     }
 }

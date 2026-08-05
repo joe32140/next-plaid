@@ -46,17 +46,25 @@ pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
     let (parallel_sessions, batch_size) =
         resolve_index_runtime_overrides(&config, options.batch_size);
 
-    // An enclosing indexed project adopts this init. But if the project's walk
-    // rules exclude `path` — most often a .gitignore entry: dataset corpora,
-    // build outputs — updating the parent would report success having indexed
-    // none of the requested files. Running init on such a directory is an
-    // explicit ask, so register it as a covered subtree of the parent first.
-    // Registrations live in the config, which every scan consults: coverage
-    // survives incremental updates, full rebuilds (including index-format
-    // bumps on upgrade) and `colgrep clear`. A directory the walk simply
-    // hasn't seen yet (e.g. just created) is already reachable and needs no
-    // registration — the parent update below picks it up.
-    let parent_info = find_parent_index(&path, &model)?;
+    // A path with its own index updates that index — the resolution search,
+    // clear and status already use. Only otherwise does an enclosing indexed
+    // project adopt this init; without the guard, `init` on a nested project's
+    // root would update the OUTER project instead, and coverage registered
+    // under the nested root would never apply.
+    let parent_info = if index_exists(&path, &model) {
+        None
+    } else {
+        find_parent_index(&path, &model)?
+    };
+    // If the adopting project's walk rules exclude `path` — most often a
+    // .gitignore entry: dataset corpora, build outputs — updating the parent
+    // would report success having indexed none of the requested files. Running
+    // init on such a directory is an explicit ask, so register it as a covered
+    // subtree of the parent first. Registrations live in the config, which
+    // every scan consults: coverage survives incremental updates, full rebuilds
+    // (including index-format bumps on upgrade) and `colgrep clear`. A
+    // directory the walk simply hasn't seen yet (e.g. just created) is already
+    // reachable and needs no registration — the parent update below picks it up.
     if let Some(info) = &parent_info {
         let covered = config.covered_subdirs_for(&info.project_path);
         if !scan_reaches_subdir(

@@ -4034,7 +4034,10 @@ impl Searcher {
         let prefix_str = prefix.to_string_lossy();
         // Match on a whole path component: a bare `{prefix}%` would also pull in
         // sibling directories sharing the string prefix (`corpus` ⊃ `corpus-extra/`).
-        let like_pattern = format!("{}/%", prefix_str.trim_end_matches('/'));
+        // Stored paths use native separators (serde serializes the unit's PathBuf),
+        // so the component boundary must too.
+        let sep = std::path::MAIN_SEPARATOR;
+        let like_pattern = format!("{}{}%", prefix_str.trim_end_matches(sep), sep);
         let subset = filtering::where_condition(
             &self.index_path,
             "file LIKE ?",

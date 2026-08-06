@@ -1062,6 +1062,12 @@ pub struct MmapIndex {
     pub mmap_codes: crate::mmap::MmapNpyArray1I64,
     /// Memory-mapped residuals array (public for search access)
     pub mmap_residuals: crate::mmap::MmapNpyArray2U8,
+    /// Lazily-built u32 copy of the token codes for the stage-1 candidate
+    /// flood: the mmap stores i64 (8 B/token), so a flood pass over millions
+    /// of candidate tokens reads 4x more code bytes than the values need
+    /// (num_centroids always fits u32). RAM cost is 4 B/token, paid on first
+    /// search only, and freed with the index.
+    codes_u32: std::sync::OnceLock<Vec<u32>>,
 }
 
 impl MmapIndex {
@@ -1183,24 +1189,55 @@ impl MmapIndex {
             doc_lengths,
             doc_offsets,
             mmap_codes,
+            codes_u32: std::sync::OnceLock::new(),
             mmap_residuals,
         })
     }
 
-    /// Get candidate documents from IVF for given centroid indices.
-    pub fn get_candidates(&self, centroid_indices: &[usize]) -> Vec<i64> {
-        let mut candidates: Vec<i64> = Vec::new();
+    /// Token codes as u32, built once on first use (one sequential pass over
+    /// the code mmap). Indexed by the same `doc_offsets` as `mmap_codes`.
+    pub fn codes_u32(&self) -> &[u32] {
+        self.codes_u32.get_or_init(|| {
+            let n = self.doc_offsets.last().copied().unwrap_or(0);
+            self.mmap_codes
+                .slice(0, n)
+                .iter()
+                .map(|&c| c as u32)
+                .collect()
+        })
+    }
 
+    /// Get candidate documents from IVF for given centroid indices.
+    ///
+    /// Doc ids are dense in `0..num_docs`, so a word bitmap dedups in
+    /// O(postings) and scanning its set bits emits the same sorted, deduped
+    /// list a `sort_unstable` + `dedup` of the concatenated postings would —
+    /// without the O(n log n) sort (measured 4–5x on this phase at 52k docs).
+    pub fn get_candidates(&self, centroid_indices: &[usize]) -> Vec<i64> {
+        let num_docs = self.doc_lengths.len();
+        let mut words = vec![0u64; num_docs.div_ceil(64)];
+        let mut count = 0usize;
         for &idx in centroid_indices {
             if idx < self.ivf_lengths.len() {
                 let start = self.ivf_offsets[idx] as usize;
                 let len = self.ivf_lengths[idx] as usize;
-                candidates.extend(self.ivf.slice(s![start..start + len]).iter());
+                for &d in self.ivf.slice(s![start..start + len]).iter() {
+                    let d = d as usize;
+                    let w = &mut words[d / 64];
+                    let bit = 1u64 << (d % 64);
+                    count += usize::from(*w & bit == 0);
+                    *w |= bit;
+                }
             }
         }
-
-        candidates.sort_unstable();
-        candidates.dedup();
+        let mut candidates: Vec<i64> = Vec::with_capacity(count);
+        for (wi, &word) in words.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                candidates.push((wi * 64 + w.trailing_zeros() as usize) as i64);
+                w &= w - 1;
+            }
+        }
         candidates
     }
 

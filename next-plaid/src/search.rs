@@ -18,11 +18,6 @@ type ProbePartial = (
     HashMap<usize, f32>,
 );
 
-/// Maximum number of documents to decompress concurrently during exact scoring.
-/// This limits peak memory usage from parallel decompression.
-/// With 128 docs × ~300KB per doc = ~40MB max concurrent decompression memory.
-const DECOMPRESS_CHUNK_SIZE: usize = 128;
-
 /// Search parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchParameters {
@@ -544,17 +539,17 @@ pub fn search_one_mmap(
     // Compute exact scores. Binary indexes score against an int8 query; the
     // full-precision query is used for the float (residual) path.
     let exact_query = prepare_score_query(index, query);
-    // Chunked processing limits concurrent memory from parallel decompression.
+    // Per-doc parallelism: rayon splits adaptively, so all cores stay fed
+    // and variable doc lengths balance. The fixed 128-doc chunking this
+    // replaces served a decompression-memory rationale that no longer holds:
+    // in-flight decompressed docs are bounded by the thread count either
+    // way, and the chunk count (8 at n_decompress = 1024) underfilled and
+    // straggled the pool — measured 6.1 effective threads on a 10-core M4.
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
-        .par_chunks(DECOMPRESS_CHUNK_SIZE)
-        .flat_map(|chunk| {
-            chunk
-                .iter()
-                .filter_map(|&doc_id| {
-                    let score = exact_doc_score(index, &exact_query, doc_id as usize)?;
-                    Some((doc_id, score))
-                })
-                .collect::<Vec<_>>()
+        .par_iter()
+        .filter_map(|&doc_id| {
+            let score = exact_doc_score(index, &exact_query, doc_id as usize)?;
+            Some((doc_id, score))
         })
         .collect();
 
@@ -929,16 +924,17 @@ fn search_one_mmap_batched(
     // full-precision query is used for the float (residual) path.
     // Chunked processing limits concurrent memory from parallel decompression.
     let exact_query = prepare_score_query(index, query);
+    // Per-doc parallelism: rayon splits adaptively, so all cores stay fed
+    // and variable doc lengths balance. The fixed 128-doc chunking this
+    // replaces served a decompression-memory rationale that no longer holds:
+    // in-flight decompressed docs are bounded by the thread count either
+    // way, and the chunk count (8 at n_decompress = 1024) underfilled and
+    // straggled the pool — measured 6.1 effective threads on a 10-core M4.
     let mut exact_scores: Vec<(i64, f32)> = to_decompress
-        .par_chunks(DECOMPRESS_CHUNK_SIZE)
-        .flat_map(|chunk| {
-            chunk
-                .iter()
-                .filter_map(|&doc_id| {
-                    let score = exact_doc_score(index, &exact_query, doc_id as usize)?;
-                    Some((doc_id, score))
-                })
-                .collect::<Vec<_>>()
+        .par_iter()
+        .filter_map(|&doc_id| {
+            let score = exact_doc_score(index, &exact_query, doc_id as usize)?;
+            Some((doc_id, score))
         })
         .collect();
 

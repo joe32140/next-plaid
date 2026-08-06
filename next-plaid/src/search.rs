@@ -526,7 +526,13 @@ pub fn search_one_mmap(
         return search_one_mmap_batched(index, query, params, subset);
     }
 
+    // MEASUREMENT PATCH (profiling branch only): same span as the mainline
+    // phase-timer patch's t_all -> t_s1, so the two are comparable.
+    let __s1_t0 = std::time::Instant::now();
     let to_decompress = stage1_shortlist(index, query, params, subset)?;
+    if std::env::var("NP_S1_PHASES").is_ok() {
+        eprintln!("S1TOTAL total={}", __s1_t0.elapsed().as_micros());
+    }
 
     if to_decompress.is_empty() {
         return Ok(QueryResult {

@@ -294,6 +294,13 @@ pub struct SearchParamsRequest {
     #[serde(default)]
     #[schema(example = 0.4)]
     pub centroid_score_threshold: Option<Option<f32>>,
+    /// Score residual candidates asymmetrically (int8 query x int8 LUT over the
+    /// stored codes) instead of decompressing to float first. Compute-only:
+    /// same index, same storage, so it can be toggled per request. Ignored for
+    /// binary indexes and for dims the fused kernels do not support.
+    #[serde(default)]
+    #[schema(example = false)]
+    pub residual_asym: Option<bool>,
 }
 
 /// Single query result.

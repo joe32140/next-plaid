@@ -24,6 +24,7 @@ pub mod index;
 pub mod kmeans;
 pub mod maxsim;
 pub mod mmap;
+pub mod residual_lut;
 pub mod search;
 pub mod text_search;
 pub mod update;

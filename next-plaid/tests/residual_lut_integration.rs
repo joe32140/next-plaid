@@ -230,3 +230,67 @@ fn batched_path_asym_matches_dense_path() {
         }
     }
 }
+
+/// The parallel batch path must not deadlock on a **cold** index.
+///
+/// `search_many_mmap(parallel = true)` fans queries across rayon workers, and
+/// with `residual_asym` on, every one of them races into the lazily-built
+/// inverse-norm cache at once. An initializer that blocks the calling worker
+/// in any way that leaves the outer pool free to schedule onto it — a
+/// global-pool `par_iter`, or `ThreadPool::install`, which keeps the caller
+/// available for its own pool's stealing while it waits — self-deadlocks:
+/// the worker steals a sibling query, that query re-enters the initializer on
+/// the same thread, and nothing ever completes. This is the first-request
+/// shape of a batch-serving deployment, so it must hold from cold.
+///
+/// The watchdog exists because the failure mode is a hang, not a panic: it
+/// turns a stalled CI job into a fast, unambiguous failure.
+#[test]
+fn parallel_batch_on_cold_index_does_not_deadlock() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let docs = random_docs(400, 32, 64);
+    let dir = TempDir::new().unwrap();
+    let config = IndexConfig {
+        nbits: 4,
+        batch_size: 64,
+        seed: Some(42),
+        ..Default::default()
+    };
+    let index =
+        MmapIndex::create_with_kmeans(&docs, dir.path().to_str().unwrap(), &config).unwrap();
+
+    let finished = Arc::new(AtomicBool::new(false));
+    {
+        let finished = Arc::clone(&finished);
+        std::thread::spawn(move || {
+            for _ in 0..600 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if finished.load(Ordering::SeqCst) {
+                    return;
+                }
+            }
+            eprintln!(
+                "DEADLOCK: search_many_mmap(parallel=true) with residual_asym did not \
+                 finish within 60s on a cold index"
+            );
+            std::process::exit(101);
+        });
+    }
+
+    // Cold: no search has run, so the inverse-norm cache is unbuilt and every
+    // worker will reach for it simultaneously.
+    let queries: Vec<Array2<f32>> = docs.iter().take(128).cloned().collect();
+    let results =
+        next_plaid::search::search_many_mmap(&index, &queries, &params(true), true, None).unwrap();
+    finished.store(true, Ordering::SeqCst);
+
+    assert_eq!(results.len(), queries.len());
+    for (i, r) in results.iter().enumerate() {
+        assert_eq!(
+            r.passage_ids[0], i as i64,
+            "query {i} did not self-retrieve"
+        );
+    }
+}

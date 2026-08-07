@@ -412,6 +412,31 @@ pub fn active_kernel_name(dim: usize, nibble_ok: bool) -> &'static str {
     "scalar"
 }
 
+/// Will the fused SIMD kernel actually run for this shape on this CPU?
+///
+/// Mirrors the dispatch in [`maxsim_residual_lut_i8`], so callers can report
+/// the outcome without re-deriving — and re-deriving it wrongly — the
+/// condition. Every way of answering `false` here is silent and still returns
+/// correct scores; the only symptom is that the rescore speedup collapses to
+/// roughly the scalar kernel's margin over float.
+pub fn simd_dispatch_available(dim: usize, nibble_ok: bool) -> bool {
+    if !nibble_ok || !dim.is_multiple_of(8) || dim > MAX_DIM {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        has_avx512_vnni() || is_x86_feature_detected!("avx2")
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("dotprod")
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
 // Per-thread kernel scratch (best, accs), reused across the ~1024
 // per-candidate kernel calls of a search. Each rayon worker gets its own
 // copy, and the kernels size-and-initialize it on entry, so no state

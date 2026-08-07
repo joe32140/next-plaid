@@ -124,6 +124,54 @@ enum ScoreQuery<'a> {
     },
 }
 
+/// What a `residual_asym` request actually resolved to for this index/CPU.
+enum AsymDispatch {
+    /// The fused SIMD kernel — the path the flag exists for.
+    Simd,
+    /// Correct, but only marginally faster than float rescoring.
+    Scalar,
+    /// The arm never engaged; this index scores in float regardless.
+    NotEngaged,
+}
+
+/// Report, once per process, what `residual_asym` actually got.
+///
+/// Every fallback below is silent and still returns correct scores, so the
+/// only symptom of landing on one is that a rescore advertised at ~5x
+/// measures ~1.2x — which reads as "the optimization does not work" rather
+/// than "the optimization did not run". Warn when the caller asked for the
+/// fused kernel and will not get it. `NEXT_PLAID_REPORT_KERNEL=1` also
+/// reports the success case, so a benchmark can record which kernel produced
+/// its numbers.
+fn report_asym_dispatch(index: &crate::index::MmapIndex, got: AsymDispatch) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dim = index.codec.embedding_dim();
+        match got {
+            AsymDispatch::Simd => {
+                if std::env::var_os("NEXT_PLAID_REPORT_KERNEL").is_some() {
+                    eprintln!(
+                        "[next-plaid] residual_asym: {} kernel (dim={dim})",
+                        crate::residual_lut::active_kernel_name(dim, true)
+                    );
+                }
+            }
+            AsymDispatch::Scalar => eprintln!(
+                "[next-plaid] residual_asym: no SIMD dispatch (dim={dim}) — running the \
+                 scalar kernel. Scores are correct, but only marginally faster than float \
+                 rescoring. An x86_64 build under Rosetta, an x86_64 container on Apple \
+                 Silicon, or an ARM CPU without `dotprod` lands here."
+            ),
+            AsymDispatch::NotEngaged => eprintln!(
+                "[next-plaid] residual_asym requested but not applicable to this index \
+                 (binary={}, dim={dim}, max supported {}) — scoring in float.",
+                index.metadata.binary,
+                crate::residual_lut::MAX_DIM,
+            ),
+        }
+    });
+}
+
 /// Prepare the query for the index's Stage-2 scoring path, once per search.
 fn prepare_score_query<'a>(
     index: &crate::index::MmapIndex,
@@ -131,6 +179,9 @@ fn prepare_score_query<'a>(
     residual_asym: bool,
 ) -> ScoreQuery<'a> {
     if index.metadata.binary {
+        if residual_asym {
+            report_asym_dispatch(index, AsymDispatch::NotEngaged);
+        }
         return ScoreQuery::Binary(crate::binary::quantize_query_i8(&query.view()));
     }
     if residual_asym && index.codec.embedding_dim() <= crate::residual_lut::MAX_DIM {
@@ -140,12 +191,23 @@ fn prepare_score_query<'a>(
             let planes = dim
                 .is_multiple_of(8)
                 .then(|| crate::residual_lut::build_query_planes(&q8, &lut, dim));
+            report_asym_dispatch(
+                index,
+                if crate::residual_lut::simd_dispatch_available(dim, lut.nibble.is_some()) {
+                    AsymDispatch::Simd
+                } else {
+                    AsymDispatch::Scalar
+                },
+            );
             return ScoreQuery::ResidualLut {
                 q8,
                 lut: Box::new(lut),
                 planes,
             };
         }
+    }
+    if residual_asym {
+        report_asym_dispatch(index, AsymDispatch::NotEngaged);
     }
     ScoreQuery::Float(query)
 }

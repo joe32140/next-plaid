@@ -141,12 +141,18 @@ class SearchParams:
         centroid_score_threshold: Centroid score threshold for centroid pruning (default: 0.4).
             Centroids with max score below this threshold are filtered out.
             Set to None to disable pruning for more accurate but slower search.
+        residual_asym: Score residual candidates with the fused int8 x LUT kernel
+            over the stored codes instead of decompressing them to float first.
+            Compute-only: same index, same storage, so it can be toggled per
+            request. Ignored for binary indexes and for dims the fused kernels
+            do not support. Leave as None to use the server's default.
     """
 
     top_k: int = 10
     n_ivf_probe: int = 8
     n_full_scores: int = 4096
     centroid_score_threshold: Optional[float] = 0.4
+    residual_asym: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -159,6 +165,11 @@ class SearchParams:
             result["centroid_score_threshold"] = self.centroid_score_threshold
         else:
             result["centroid_score_threshold"] = None
+        # Omitted rather than sent as false: None means "whatever the server
+        # defaults to", so a future change to that default reaches clients that
+        # never asked for a specific value.
+        if self.residual_asym is not None:
+            result["residual_asym"] = self.residual_asym
         return result
 
 

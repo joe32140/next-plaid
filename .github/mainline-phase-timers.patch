@@ -1,0 +1,154 @@
+diff --git a/next-plaid/src/search.rs b/next-plaid/src/search.rs
+index 7bdc3ed..c608269 100644
+--- a/next-plaid/src/search.rs
++++ b/next-plaid/src/search.rs
+@@ -136,12 +136,34 @@ fn exact_doc_score(
+             ))
+         }
+         ScoreQuery::Float(q) => {
++            // MEASUREMENT PATCH (worktree only): split decompress vs MaxSim
++            // compute CPU time when NP_S2_PHASES is set.
++            if std::env::var("NP_S2_PHASES").is_ok() {
++                let t0 = std::time::Instant::now();
++                let doc = index.get_document_embeddings(doc_id).ok()?;
++                S2_DEC_NS.fetch_add(
++                    t0.elapsed().as_nanos() as u64,
++                    std::sync::atomic::Ordering::Relaxed,
++                );
++                let t1 = std::time::Instant::now();
++                let s = colbert_score(&q.view(), &doc.view());
++                S2_COMP_NS.fetch_add(
++                    t1.elapsed().as_nanos() as u64,
++                    std::sync::atomic::Ordering::Relaxed,
++                );
++                return Some(s);
++            }
+             let doc = index.get_document_embeddings(doc_id).ok()?;
+             Some(colbert_score(&q.view(), &doc.view()))
+         }
+     }
+ }
+ 
++// MEASUREMENT PATCH (worktree only): pooled CPU nanos for the float path's
++// decompress and compute halves.
++static S2_DEC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static S2_COMP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
+ /// Wrapper for f32 to use with BinaryHeap (implements Ord)
+ #[derive(Clone, Copy, PartialEq)]
+ struct OrdF32(f32);
+@@ -394,8 +416,16 @@ pub fn search_one_mmap(
+         return search_one_mmap_batched(index, query, params, subset);
+     }
+ 
++    // MEASUREMENT PATCH (worktree only): NP_S1_PHASES / NP_S2_PHASES print
++    // per-query phase walls at the same seams as the research branch, so one
++    // parser reads both sides of the A/B.
++    let s1_phases = std::env::var("NP_S1_PHASES").is_ok();
++    let s2_phases = std::env::var("NP_S2_PHASES").is_ok();
++    let t_all = std::time::Instant::now();
++
+     // Standard path: compute full query-centroid scores upfront
+     let query_centroid_scores = query.dot(&index.codec.centroids_view().t());
++    let t_cdot = t_all.elapsed();
+ 
+     // When subset is provided, pre-compute eligible centroids: only those containing
+     // at least one embedding from a subset document. Centroids without subset docs
+@@ -479,9 +509,11 @@ pub fn search_one_mmap(
+ 
+         selected_centroids.into_iter().collect()
+     };
++    let t_probe = t_all.elapsed();
+ 
+     // Get candidate documents from IVF
+     let mut candidates = index.get_candidates(&cells_to_probe);
++    let t_gather = t_all.elapsed();
+ 
+     // Filter by subset if provided
+     if let Some(subset_docs) = subset {
+@@ -508,6 +540,16 @@ pub fn search_one_mmap(
+             (doc_id, score)
+         })
+         .collect();
++    let t_approx = t_all.elapsed();
++    let n_flood = approx_scores.len();
++    let flood_tokens: usize = if s1_phases {
++        candidates
++            .iter()
++            .map(|&d| index.doc_offsets[d as usize + 1] - index.doc_offsets[d as usize])
++            .sum()
++    } else {
++        0
++    };
+ 
+     // Sort by approximate score and take top candidates
+     approx_scores.sort_by(|a, b| cmp_score_descending(a.1, b.1));
+@@ -521,6 +563,23 @@ pub fn search_one_mmap(
+     let n_decompress = (params.n_full_scores / 4).max(params.top_k);
+     let to_decompress: Vec<i64> = top_candidates.into_iter().take(n_decompress).collect();
+ 
++    let t_s1 = t_all.elapsed();
++    if s1_phases {
++        eprintln!(
++            "S1PHASE cdot={} probe={} gather={} approx={} sort={} total={} ncells={} nflood={} floodtok={} tq={}",
++            t_cdot.as_micros(),
++            (t_probe - t_cdot).as_micros(),
++            (t_gather - t_probe).as_micros(),
++            (t_approx - t_gather).as_micros(),
++            (t_s1 - t_approx).as_micros(),
++            t_s1.as_micros(),
++            cells_to_probe.len(),
++            n_flood,
++            flood_tokens,
++            0,
++        );
++    }
++
+     if to_decompress.is_empty() {
+         return Ok(QueryResult {
+             query_id: 0,
+@@ -532,7 +591,12 @@ pub fn search_one_mmap(
+     // Compute exact scores. Binary indexes score against an int8 query; the
+     // full-precision query is used for the float (residual) path.
+     // Chunked processing limits concurrent memory from parallel decompression.
++    if s2_phases {
++        S2_DEC_NS.store(0, std::sync::atomic::Ordering::Relaxed);
++        S2_COMP_NS.store(0, std::sync::atomic::Ordering::Relaxed);
++    }
+     let exact_query = prepare_score_query(index, query);
++    let t_prep = t_all.elapsed();
+     let mut exact_scores: Vec<(i64, f32)> = to_decompress
+         .par_chunks(DECOMPRESS_CHUNK_SIZE)
+         .flat_map(|chunk| {
+@@ -545,6 +609,7 @@ pub fn search_one_mmap(
+                 .collect::<Vec<_>>()
+         })
+         .collect();
++    let t_score = t_all.elapsed();
+ 
+     // Sort by exact score
+     exact_scores.sort_by(|a, b| cmp_score_descending(a.1, b.1));
+@@ -562,6 +627,23 @@ pub fn search_one_mmap(
+         .map(|(_, s)| *s)
+         .collect();
+ 
++    if s2_phases {
++        let t_end = t_all.elapsed();
++        eprintln!(
++            "S2PHASE s1={} prep={} score={} sortemit={} total={} ndocs={} kern_cpu={} load_cpu={} dec_cpu={} comp_cpu={}",
++            t_s1.as_micros(),
++            (t_prep - t_s1).as_micros(),
++            (t_score - t_prep).as_micros(),
++            (t_end - t_score).as_micros(),
++            t_end.as_micros(),
++            to_decompress.len(),
++            0,
++            0,
++            S2_DEC_NS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
++            S2_COMP_NS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
++        );
++    }
++
+     Ok(QueryResult {
+         query_id: 0,
+         passage_ids,

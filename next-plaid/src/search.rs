@@ -704,8 +704,12 @@ pub fn search_one_mmap(
         return search_one_mmap_batched(index, query, params, subset);
     }
 
+    let __s1_t0 = std::time::Instant::now();
     let (query_centroid_scores, cdot_t_shared, to_decompress) =
         stage1_shortlist(index, query, params, subset)?;
+    if std::env::var("NP_S1_PHASES").is_ok() {
+        eprintln!("S1TOTAL total={}", __s1_t0.elapsed().as_micros());
+    }
 
     if to_decompress.is_empty() {
         return Ok(QueryResult {

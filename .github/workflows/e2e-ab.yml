@@ -1,0 +1,113 @@
+name: e2e-ab
+
+# Mainline-vs-branch end-to-end A/B on all three CI platforms, through the
+# public search API on identical prebuilt indexes (restored from the
+# maxsim-bench stage2-idx caches; residual tags only).
+#
+# Both sides run the SAME e2e_bench source: the branch tree as-is, and a
+# mainline checkout pinned to the fork's main (= upstream v1.6.5) with the
+# bench example grafted in plus the NP_S1_PHASES/NP_S2_PHASES timer patch
+# (.github/mainline-phase-timers.patch — pure instrumentation, applied only
+# when the env vars are set at runtime it prints to stderr; scoring math is
+# untouched). Runs are interleaved main/ours per cell so shared-VM thermal
+# and noisy-neighbor drift hits both variants alike. Shared-VM absolutes are
+# noise — the per-platform main/ours RATIOS are the verdict.
+#
+# Manual dispatch only: this workflow exists to be run once per question,
+# not on every push.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-indexes:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cell: nfcorpus, shapes: nfcorpus, cap: "" }
+          - { cell: scifact,  shapes: scifact,  cap: "" }
+    name: build-${{ matrix.cell }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build profiler
+        run: cargo build --release --example stage2_profile -p next-plaid
+      # Same key as maxsim-bench: on a hit the builder sees the completion
+      # markers and exits in seconds; on a miss it rebuilds r4/r2/r1 here.
+      - uses: actions/cache/restore@v4
+        with:
+          path: indexes
+          key: stage2-idx-v1-${{ matrix.cell }}-${{ hashFiles(format('next-plaid/examples/shapes/{0}/*', matrix.shapes)) }}
+      - name: build residual indexes (cache-hit fast path)
+        run: |
+          for t in r4 r2 r1; do
+            BUILD_ONLY=1 INDEX_TAGS=$t INDEX_ROOT=indexes \
+              ./target/release/examples/stage2_profile shapes next-plaid/examples/shapes/${{ matrix.shapes }} ${{ matrix.cap }}
+          done
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: indexes
+          key: stage2-idx-v1-${{ matrix.cell }}-${{ hashFiles(format('next-plaid/examples/shapes/{0}/*', matrix.shapes)) }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ab-indexes-${{ matrix.cell }}
+          path: indexes
+          retention-days: 3
+
+  ab:
+    needs: build-indexes
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: 76092e1cb0cc13ab46394ee5bffa010fcbb43a9a
+          path: mainline
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: graft bench example + phase timers onto mainline
+        run: |
+          mkdir -p mainline/next-plaid/examples
+          cp next-plaid/examples/e2e_bench.rs mainline/next-plaid/examples/e2e_bench.rs
+          git -C mainline apply --check ../.github/mainline-phase-timers.patch
+          git -C mainline apply ../.github/mainline-phase-timers.patch
+      - name: build branch e2e_bench
+        run: cargo build --release --example e2e_bench -p next-plaid
+      - name: build mainline e2e_bench
+        working-directory: mainline
+        run: cargo build --release --example e2e_bench -p next-plaid
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ab-indexes-*
+          path: indexes
+          merge-multiple: true
+      - name: interleaved A/B (per-phase timers on)
+        run: |
+          MAIN=mainline/target/release/examples/e2e_bench
+          OURS=target/release/examples/e2e_bench
+          for r in r4 r2 r1; do
+            for idx in indexes/shapes-*_${r}; do
+              [ -d "$idx" ] || { echo "SKIP pattern $r"; continue; }
+              ds=$(basename "$idx"); ds=${ds#shapes-}; ds=${ds%%-*}
+              lens=next-plaid/examples/shapes/$ds/query_lens.npy
+              for rep in 1 2; do
+                echo "===== idx=$idx rep=$rep variant=main"
+                NP_S1_PHASES=1 NP_S2_PHASES=1 "$MAIN" "$idx" "$lens" '{}'
+                echo "===== idx=$idx rep=$rep variant=ours"
+                NP_S1_PHASES=1 NP_S2_PHASES=1 "$OURS" "$idx" "$lens" '{}'
+                echo "===== idx=$idx rep=$rep variant=asym"
+                NP_S1_PHASES=1 NP_S2_PHASES=1 "$OURS" "$idx" "$lens" '{"residual_asym": true}'
+              done
+            done
+          done

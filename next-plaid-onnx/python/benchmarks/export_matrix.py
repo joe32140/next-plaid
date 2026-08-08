@@ -233,8 +233,11 @@ def main() -> int:
         for tag, path in list(built):
             q = out / f"{tag}-int8.onnx"
             try:
+                # Mirror colbert_export.quantize.quantize_model exactly, so the
+                # gated arms measure what we actually ship. Plain QInt8 is kept
+                # below as a labelled diagnostic.
                 quantize_dynamic(model_input=str(path), model_output=str(q),
-                                 weight_type=QuantType.QInt8)
+                                 weight_type=QuantType.QInt8, reduce_range=True)
                 built.append((f"{tag}-int8", q))
             except Exception as exc:
                 print(f"  quantize {tag} FAILED: {str(exc)[:80]}")
@@ -243,9 +246,12 @@ def main() -> int:
         # QUInt8 weights (the u8s8 path) and reduce_range on pre-VNNI x86;
         # on ARM the signed path is the fast one. This is exactly the knob
         # expected to invert between architectures.
+        # Diagnostics that justify the shipped default. `plain` is the old
+        # default and is expected to fail the cosine floor on x86 (0.911) --
+        # that is the evidence for reduce_range, not a regression.
         schemes = [
+            ("plain", dict(weight_type=QuantType.QInt8)),
             ("u8", dict(weight_type=QuantType.QUInt8)),
-            ("s8rr", dict(weight_type=QuantType.QInt8, reduce_range=True)),
             ("s8pc", dict(weight_type=QuantType.QInt8, per_channel=True)),
         ]
         baseline = out / "op14.onnx"

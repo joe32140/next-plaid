@@ -15,7 +15,7 @@ INT8_COS_MIN = 0.99
 
 # Scheme-sweep arms exist to justify the shipped default, not to be shipped.
 # They are reported but not gated, or CI would sit red on a diagnostic.
-DIAGNOSTIC_SUFFIXES = ("-u8", "-s8pc")
+DIAGNOSTIC_SUFFIXES = ("-plain", "-u8", "-s8pc")
 
 
 def load(paths):

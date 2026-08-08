@@ -121,6 +121,18 @@ def main() -> int:
 
     from pylate import models as pylate_models
 
+    # Fail with something actionable rather than a bare TypeError deep in the
+    # constructor: pip can resolve a very old pylate on platforms with thin
+    # wheel coverage, and the exporter depends on this kwarg.
+    import inspect
+
+    if "do_query_expansion" not in inspect.signature(pylate_models.ColBERT.__init__).parameters:
+        raise SystemExit(
+            "Installed pylate is too old: ColBERT.__init__ has no "
+            "`do_query_expansion` (needs >=1.3.3, verified on 1.6.0). "
+            "Pin it explicitly -- pip backtracks to 1.2.0 on some platforms."
+        )
+
     pylate_model = pylate_models.ColBERT(model_name_or_path=args.model, device="cpu",
                                          do_query_expansion=False)
     arch = detect_model_architecture(pylate_model)

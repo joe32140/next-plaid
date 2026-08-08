@@ -21,6 +21,23 @@ import torch.nn as nn
 from pylate import models as pylate_models
 
 
+def _legacy_exporter_kwargs() -> dict:
+    """`dynamo=False` where supported, nothing where it is not.
+
+    torch>=2.9 defaults `torch.onnx.export` to the dynamo exporter, which needs
+    the optional `onnxscript` package and emits a different graph. But the
+    `dynamo` keyword only exists from torch 2.6, and pyproject allows
+    torch>=2.0, so passing it unconditionally raises TypeError on 2.0-2.5.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(torch.onnx.export).parameters
+    except (TypeError, ValueError):  # C-implemented signature
+        return {}
+    return {"dynamo": False} if "dynamo" in params else {}
+
+
 def get_model_short_name(model_name: str) -> str:
     """Get the short name for a model (used for directory naming)."""
     return model_name.split("/")[-1]
@@ -114,6 +131,7 @@ def export_model(
     quantize: bool = False,
     verbose: bool = True,
     force: bool = False,
+    attn_implementation: Optional[str] = None,
 ) -> Path:
     """Export a ColBERT model from HuggingFace to ONNX format.
 
@@ -185,6 +203,16 @@ def export_model(
         print(f"Uses token_type_ids: {arch_info['uses_token_type_ids']}")
         print(f"Hidden size: {arch_info['hidden_size']}")
         print(f"Output dimension: {arch_info['output_dim']}")
+
+    # The attention implementation active at TRACE time changes the exported
+    # graph: sdpa decomposes differently than eager, and the two optimise
+    # differently in ORT. Benchmark both with
+    # `next-plaid-onnx/python/benchmarks/export_matrix.py` before changing the
+    # default -- the winner is architecture-dependent.
+    if attn_implementation is not None:
+        pylate_model[0].auto_model.config._attn_implementation = attn_implementation
+        if verbose:
+            print(f"Tracing with attn_implementation={attn_implementation}")
 
     # Create ONNX wrapper using pylate's model
     model = ColBERTForONNX(pylate_model, uses_token_type_ids=arch_info["uses_token_type_ids"])
@@ -298,6 +326,7 @@ def export_model(
             dynamic_axes=dynamic_axes,
             opset_version=14,
             do_constant_folding=True,
+            **_legacy_exporter_kwargs(),
         )
 
     if verbose:

@@ -36,10 +36,15 @@ def quantize_model(model_dir: Path) -> Path:
     print(f"  Input size: {input_path.stat().st_size / 1e6:.1f} MB")
 
     # Apply dynamic INT8 quantization
+    # reduce_range=True: without it, x86 (pre-VNNI) saturates on the u8s8
+    # MatMulInteger path and embedding cosine vs torch drops to 0.911, while
+    # arm64 stays at 0.9998 from the SAME file. Costs no throughput. Keep this
+    # in sync with src/colbert_export/quantize.py.
     quantize_dynamic(
         model_input=str(input_path),
         model_output=str(output_path),
         weight_type=QuantType.QInt8,
+        reduce_range=True,
     )
 
     print(f"  Output size: {output_path.stat().st_size / 1e6:.1f} MB")

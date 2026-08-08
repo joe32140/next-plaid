@@ -74,6 +74,18 @@ Supported models:
     )
 
     parser.add_argument(
+        "--attn-implementation",
+        type=str,
+        default=None,
+        choices=["eager", "sdpa"],
+        help=(
+            "Attention implementation to trace under. Changes the exported graph "
+            "and therefore its speed; the faster choice is CPU-architecture "
+            "dependent (see benchmarks/export_matrix.py). Default: the model's own."
+        ),
+    )
+
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress progress messages",
@@ -99,6 +111,7 @@ Supported models:
             quantize=not args.no_quantize,
             verbose=not args.quiet,
             force=args.force,
+            attn_implementation=args.attn_implementation,
         )
 
         # Push to Hub if requested
@@ -125,6 +138,18 @@ def quantize_main():
         "model_dir",
         type=str,
         help="Directory containing model.onnx",
+    )
+
+    parser.add_argument(
+        "--attn-implementation",
+        type=str,
+        default=None,
+        choices=["eager", "sdpa"],
+        help=(
+            "Attention implementation to trace under. Changes the exported graph "
+            "and therefore its speed; the faster choice is CPU-architecture "
+            "dependent (see benchmarks/export_matrix.py). Default: the model's own."
+        ),
     )
 
     parser.add_argument(

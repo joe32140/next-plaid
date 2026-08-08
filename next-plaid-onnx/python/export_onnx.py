@@ -42,6 +42,23 @@ SUPPORTED_MODELS = {
 }
 
 
+def _legacy_exporter_kwargs() -> dict:
+    """`dynamo=False` where supported, nothing where it is not.
+
+    torch>=2.9 defaults `torch.onnx.export` to the dynamo exporter, which needs
+    the optional `onnxscript` package and emits a different graph. But the
+    `dynamo` keyword only exists from torch 2.6, and pyproject allows
+    torch>=2.0, so passing it unconditionally raises TypeError on 2.0-2.5.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(torch.onnx.export).parameters
+    except (TypeError, ValueError):  # C-implemented signature
+        return {}
+    return {"dynamo": False} if "dynamo" in params else {}
+
+
 def get_model_short_name(model_name: str) -> str:
     """Get the short name for a model (used for directory naming)."""
     if model_name in SUPPORTED_MODELS:
@@ -248,6 +265,7 @@ def export_to_onnx(model_name: str, output_dir: Path) -> None:
             dynamic_axes=dynamic_axes,
             opset_version=14,
             do_constant_folding=True,
+            **_legacy_exporter_kwargs(),
         )
 
     print(f"ONNX model exported successfully to: {onnx_output_path}")

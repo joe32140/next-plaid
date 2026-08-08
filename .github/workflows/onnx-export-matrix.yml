@@ -1,0 +1,116 @@
+name: ONNX export matrix
+
+# Benchmarks ColBERT ONNX export variants across CPU architectures.
+#
+# Every export "optimisation" measured on a single machine so far has been
+# architecture-specific: ORT dispatches to different MLAS kernels on x86
+# (AVX2/AVX-512/VNNI) than on ARM (NEON/i8mm), and int8 in particular can invert
+# between them. This runs the same matrix on four distinct ISAs so a change is
+# never adopted on one machine's numbers.
+#
+# Manual/scheduled only: it downloads torch and takes several minutes per host,
+# so it is not a PR gate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        # No default on purpose: `inputs.model || matrix.model` would otherwise
+        # pin every matrix row to this one model on manual dispatch.
+        description: Override the model for all rows (blank = use the matrix)
+        default: ""
+        required: false
+      docs:
+        description: Corpus size (units)
+        default: "300"
+        required: false
+  # TEMPORARY: workflow_dispatch only fires for workflows already on the
+  # default branch, so this push trigger is what lets the matrix run while the
+  # workflow itself is still being iterated on. REMOVE before merging.
+  push:
+    branches: ["exp/onnx-**"]
+  schedule:
+    - cron: "0 6 * * 1" # Mondays, to catch ORT/torch regressions
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    name: ${{ matrix.label }} / ${{ matrix.size }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # Cross product written out explicitly: `include` entries that do not
+      # overwrite a base matrix key get merged into EVERY combination, which
+      # would silently collapse the os axis. Model size is a real dimension --
+      # int8 measured 0.87x on arm64 for the 17M model but 1.22x for the 150M
+      # one on the same host, so one model cannot justify a default.
+      matrix:
+        include:
+          - { os: ubuntu-latest,    label: linux-x86_64,  size: small, model: mixedbread-ai/mxbai-edge-colbert-v0-17m }
+          - { os: ubuntu-latest,    label: linux-x86_64,  size: base,  model: lightonai/GTE-ModernColBERT-v1 }
+          - { os: ubuntu-24.04-arm, label: linux-aarch64, size: small, model: mixedbread-ai/mxbai-edge-colbert-v0-17m }
+          - { os: ubuntu-24.04-arm, label: linux-aarch64, size: base,  model: lightonai/GTE-ModernColBERT-v1 }
+          - { os: macos-15,         label: macos-arm64,   size: small, model: mixedbread-ai/mxbai-edge-colbert-v0-17m }
+          - { os: macos-15,         label: macos-arm64,   size: base,  model: lightonai/GTE-ModernColBERT-v1 }
+          # No macos-13 (Intel) row: PyTorch has shipped no macOS x86_64 wheel
+          # since 2.2.2, so the job cannot install a torch new enough to export
+          # comparably. x86_64 coverage comes from ubuntu-latest instead.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: next-plaid-onnx/python
+        run: |
+          python -m pip install --upgrade pip
+          pip install pylate onnx onnxruntime numpy tokenizers
+
+      - name: Report host
+        run: |
+          python -c "import platform,sys; print(platform.platform(), platform.machine())"
+
+      - name: Run export matrix
+        working-directory: next-plaid-onnx/python/benchmarks
+        env:
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: |
+          python export_matrix.py \
+            --model "${{ inputs.model || matrix.model }}" \
+            --docs "${{ inputs.docs || '300' }}" \
+            --json "matrix-${{ matrix.label }}-${{ matrix.size }}.json" \
+            --outdir "$RUNNER_TEMP/mx"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: matrix-${{ matrix.label }}-${{ matrix.size }}
+          path: next-plaid-onnx/python/benchmarks/matrix-${{ matrix.label }}-${{ matrix.size }}.json
+          if-no-files-found: error
+
+  summary:
+    name: Cross-CPU summary
+    needs: matrix
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: results
+          pattern: matrix-*
+          merge-multiple: true
+
+      - name: Build summary
+        run: |
+          python next-plaid-onnx/python/benchmarks/summarize_matrix.py results/*.json \
+            | tee -a "$GITHUB_STEP_SUMMARY"

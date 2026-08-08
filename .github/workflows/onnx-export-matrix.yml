@@ -70,21 +70,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install onnx onnxruntime numpy tokenizers
-          # Pin the pylate floor: unpinned, pip backtracked to pylate 1.2.0 on
-          # linux-aarch64, which predates the `do_query_expansion` kwarg the
-          # exporter passes. The cause is that `fast-plaid` (a pylate dependency)
-          # publishes NO linux-aarch64 wheels, so pylate cannot resolve there at
-          # all. Export only touches pylate.models.ColBERT, which never imports
-          # fast-plaid, so fall back to --no-deps plus its real runtime deps.
-          # Other platforms still install the full dependency set.
-          pip install "pylate>=1.6.0" || {
-            echo "::warning::pylate deps unresolvable on $(python -c 'import platform;print(platform.machine())'); installing without fast-plaid"
-            pip install sentence-transformers scipy datasets
-            pip install --no-deps "pylate>=1.6.0"
-          }
-          python -c "from pylate import models; import inspect; \
-            assert 'do_query_expansion' in inspect.signature(models.ColBERT.__init__).parameters; \
-            print('pylate import OK')"
+          # `fast-plaid` (a pylate dependency) has no linux-aarch64 wheels, so a
+          # plain install cannot resolve there and unpinned pip silently
+          # backtracks to a pylate too old for the exporter. install_deps.py
+          # pins the floor and falls back to pylate's own declared requirements
+          # minus fast-plaid, which export never imports.
+          python benchmarks/install_deps.py --pylate ">=1.6.0"
 
       - name: Report host and resolved versions
         run: |

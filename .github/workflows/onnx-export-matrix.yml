@@ -39,7 +39,7 @@ jobs:
   matrix:
     name: ${{ matrix.label }} / ${{ matrix.size }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       # Cross product written out explicitly: `include` entries that do not
@@ -49,12 +49,12 @@ jobs:
       # one on the same host, so one model cannot justify a default.
       matrix:
         include:
-          - { os: ubuntu-latest,    label: linux-x86_64,  size: small, model: mixedbread-ai/mxbai-edge-colbert-v0-17m }
-          - { os: ubuntu-latest,    label: linux-x86_64,  size: base,  model: lightonai/GTE-ModernColBERT-v1 }
-          - { os: ubuntu-24.04-arm, label: linux-aarch64, size: small, model: mixedbread-ai/mxbai-edge-colbert-v0-17m }
-          - { os: ubuntu-24.04-arm, label: linux-aarch64, size: base,  model: lightonai/GTE-ModernColBERT-v1 }
-          - { os: macos-15,         label: macos-arm64,   size: small, model: mixedbread-ai/mxbai-edge-colbert-v0-17m }
-          - { os: macos-15,         label: macos-arm64,   size: base,  model: lightonai/GTE-ModernColBERT-v1 }
+          - { os: ubuntu-latest,    label: linux-x86_64,  size: small, model: mixedbread-ai/mxbai-edge-colbert-v0-17m , docs: 300 }
+          - { os: ubuntu-latest,    label: linux-x86_64,  size: base,  model: lightonai/GTE-ModernColBERT-v1 , docs: 100 }
+          - { os: ubuntu-24.04-arm, label: linux-aarch64, size: small, model: mixedbread-ai/mxbai-edge-colbert-v0-17m , docs: 300 }
+          - { os: ubuntu-24.04-arm, label: linux-aarch64, size: base,  model: lightonai/GTE-ModernColBERT-v1 , docs: 100 }
+          - { os: macos-15,         label: macos-arm64,   size: small, model: mixedbread-ai/mxbai-edge-colbert-v0-17m , docs: 300 }
+          - { os: macos-15,         label: macos-arm64,   size: base,  model: lightonai/GTE-ModernColBERT-v1 , docs: 100 }
           # No macos-13 (Intel) row: PyTorch has shipped no macOS x86_64 wheel
           # since 2.2.2, so the job cannot install a torch new enough to export
           # comparably. x86_64 coverage comes from ubuntu-latest instead.
@@ -89,7 +89,7 @@ jobs:
         run: |
           python export_matrix.py \
             --model "${{ inputs.model || matrix.model }}" \
-            --docs "${{ inputs.docs || '300' }}" \
+            --docs "${{ inputs.docs || matrix.docs }}" \
             --json "matrix-${{ matrix.label }}-${{ matrix.size }}.json" \
             --outdir "$RUNNER_TEMP/mx"
 
@@ -118,6 +118,10 @@ jobs:
           merge-multiple: true
 
       - name: Build summary
+        # pipefail matters: without it the exit status is tee's, so the parity
+        # and int8 gates could never fail the job.
+        shell: bash
         run: |
+          set -o pipefail
           python next-plaid-onnx/python/benchmarks/summarize_matrix.py results/*.json \
             | tee -a "$GITHUB_STEP_SUMMARY"

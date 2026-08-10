@@ -125,6 +125,7 @@ enum ScoreQuery<'a> {
 }
 
 /// What a `residual_asym` request actually resolved to for this index/CPU.
+#[derive(Clone, Copy)]
 enum AsymDispatch {
     /// The fused SIMD kernel — the path the flag exists for.
     Simd,
@@ -132,6 +133,10 @@ enum AsymDispatch {
     Scalar,
     /// The arm never engaged; this index scores in float regardless.
     NotEngaged,
+}
+
+fn should_report_asym_dispatch(got: AsymDispatch, report_success: bool) -> bool {
+    report_success || !matches!(got, AsymDispatch::Simd)
 }
 
 /// Report, once per process, what `residual_asym` actually got.
@@ -144,18 +149,21 @@ enum AsymDispatch {
 /// reports the success case, so a benchmark can record which kernel produced
 /// its numbers.
 fn report_asym_dispatch(index: &crate::index::MmapIndex, got: AsymDispatch) {
+    let report_success = std::env::var_os("NEXT_PLAID_REPORT_KERNEL").is_some();
+    // A normal SIMD success is silent by default. Do not spend the process-wide
+    // warning slot on that no-op: a later request may hit a real fallback on a
+    // different index or shape and must still be reported.
+    if !should_report_asym_dispatch(got, report_success) {
+        return;
+    }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let dim = index.codec.embedding_dim();
         match got {
-            AsymDispatch::Simd => {
-                if std::env::var_os("NEXT_PLAID_REPORT_KERNEL").is_some() {
-                    eprintln!(
-                        "[next-plaid] residual_asym: {} kernel (dim={dim})",
-                        crate::residual_lut::active_kernel_name(dim, true)
-                    );
-                }
-            }
+            AsymDispatch::Simd => eprintln!(
+                "[next-plaid] residual_asym: {} kernel (dim={dim})",
+                crate::residual_lut::active_kernel_name(dim, true)
+            ),
             AsymDispatch::Scalar => eprintln!(
                 "[next-plaid] residual_asym: no SIMD dispatch (dim={dim}) — running the \
                  scalar kernel. Scores are correct, but only marginally faster than float \
@@ -1420,6 +1428,14 @@ mod tests {
         assert_eq!(max_score(1.0, f32::NAN), 1.0);
         assert_eq!(max_score(f32::INFINITY, 1.0), 1.0);
         assert_eq!(max_score(1.0, f32::INFINITY), 1.0);
+    }
+
+    #[test]
+    fn silent_simd_success_does_not_take_the_reporting_slot() {
+        assert!(!should_report_asym_dispatch(AsymDispatch::Simd, false));
+        assert!(should_report_asym_dispatch(AsymDispatch::Simd, true));
+        assert!(should_report_asym_dispatch(AsymDispatch::Scalar, false));
+        assert!(should_report_asym_dispatch(AsymDispatch::NotEngaged, false));
     }
 }
 

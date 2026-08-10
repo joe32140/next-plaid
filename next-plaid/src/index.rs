@@ -1204,11 +1204,7 @@ impl MmapIndex {
     pub fn codes_u32(&self) -> &[u32] {
         self.codes_u32.get_or_init(|| {
             let n = self.doc_offsets.last().copied().unwrap_or(0);
-            self.mmap_codes
-                .slice(0, n)
-                .iter()
-                .map(|&c| c as u32)
-                .collect()
+            (0..n).map(|i| self.mmap_codes.get(i) as u32).collect()
         })
     }
 

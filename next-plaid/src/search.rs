@@ -404,8 +404,10 @@ struct QuantCdotT {
 }
 
 /// One fused pass: blocked transpose + u8 quantization of the `[nq, K]`
-/// score matrix.
-fn transpose_quantize_cdot(cdot: &Array2<f32>) -> QuantCdotT {
+/// score matrix. Returns `None` when any score is non-finite so the caller can
+/// preserve the previous f32 flood's finite-first ordering instead of letting
+/// one infinity collapse the global quantization scale.
+fn transpose_quantize_cdot(cdot: &Array2<f32>) -> Option<QuantCdotT> {
     const BLK: usize = 64;
     let (nq, k) = (cdot.nrows(), cdot.ncols());
     let src = cdot.as_standard_layout();
@@ -413,20 +415,25 @@ fn transpose_quantize_cdot(cdot: &Array2<f32>) -> QuantCdotT {
     // Parallel min/max prepass — chunk-local reductions are exact, and
     // min/max is order-independent, so lo/hi are bit-identical to a
     // sequential scan.
-    let (lo, hi) = src
+    let (lo, hi, all_finite) = src
         .par_chunks(1 << 16)
         .map(|c| {
             let (mut l, mut h) = (f32::INFINITY, f32::NEG_INFINITY);
+            let mut finite = true;
             for &v in c {
+                finite &= v.is_finite();
                 l = l.min(v);
                 h = h.max(v);
             }
-            (l, h)
+            (l, h, finite)
         })
         .reduce(
-            || (f32::INFINITY, f32::NEG_INFINITY),
-            |a, b| (a.0.min(b.0), a.1.max(b.1)),
+            || (f32::INFINITY, f32::NEG_INFINITY, true),
+            |a, b| (a.0.min(b.0), a.1.max(b.1), a.2 && b.2),
         );
+    if !all_finite {
+        return None;
+    }
     let scale = if hi > lo { (hi - lo) / 255.0 } else { 1.0 };
     let inv = 1.0 / scale;
     let stride = nq.div_ceil(16) * 16;
@@ -449,12 +456,12 @@ fn transpose_quantize_cdot(cdot: &Array2<f32>) -> QuantCdotT {
                 }
             }
         });
-    QuantCdotT {
+    Some(QuantCdotT {
         q,
         stride,
         lo_sum: nq as f32 * lo,
         scale,
-    }
+    })
 }
 
 /// u8 flood scorer over the quantized centroid-major matrix.
@@ -487,7 +494,6 @@ fn approximate_score_flood_q8(qt: &QuantCdotT, doc_codes: &[u32]) -> f32 {
 ///
 /// The row-major scorer the quantized flood replaced; retained as the
 /// reference implementation for the flood's bit-identity test.
-#[cfg(test)]
 fn approximate_score_mmap(query_centroid_scores: &Array2<f32>, doc_codes: &[i64]) -> f32 {
     let mut score = 0.0;
 
@@ -610,7 +616,7 @@ fn par_cdot(query: &Array2<f32>, centroids: &ArrayView2<f32>) -> Array2<f32> {
 fn argmin_f32(vals: &[f32]) -> usize {
     let mut w = 0;
     for i in 1..vals.len() {
-        if vals[i] < vals[w] {
+        if cmp_score_ascending(vals[i], vals[w]).is_lt() {
             w = i;
         }
     }
@@ -621,21 +627,24 @@ fn argmin_f32(vals: &[f32]) -> usize {
 /// Per 64-wide chunk the max is a plain reduction (autovectorizes on every
 /// platform); the chunk is skipped unless its max beats the current n-th
 /// best, so the scalar rescan almost never runs. Same top-k set by value as
-/// `select_nth_unstable`; tie choice is arbitrary in both. NaN never wins a
-/// `v > thr` comparison, matching `cmp_score_descending`'s NaN-last order.
+/// `select_nth_unstable`; tie choice is arbitrary in both. All non-finite
+/// values rank below finite scores, matching `cmp_score_descending`.
 fn probe_top_k_scan(row: &[f32], n: usize, top_idx: &mut Vec<u32>, top_val: &mut Vec<f32>) {
     const PROBE_CHUNK: usize = 64;
     top_idx.clear();
     top_val.clear();
     let n = n.min(row.len());
+    if n == 0 {
+        return;
+    }
     let mut thr = f32::NEG_INFINITY;
     let mut worst = 0usize;
     for (ci, chunk) in row.chunks(PROBE_CHUNK).enumerate() {
         let mut m = f32::NEG_INFINITY;
         for &v in chunk {
-            m = m.max(v);
+            m = max_score(m, v);
         }
-        if top_val.len() == n && m <= thr {
+        if top_val.len() == n && !is_score_better(m, thr) {
             continue;
         }
         let base = (ci * PROBE_CHUNK) as u32;
@@ -647,7 +656,7 @@ fn probe_top_k_scan(row: &[f32], n: usize, top_idx: &mut Vec<u32>, top_val: &mut
                     worst = argmin_f32(top_val);
                     thr = top_val[worst];
                 }
-            } else if v > thr {
+            } else if is_score_better(v, thr) {
                 top_idx[worst] = base + j as u32;
                 top_val[worst] = v;
                 worst = argmin_f32(top_val);
@@ -797,21 +806,40 @@ fn stage1_shortlist(
         return Ok(vec![]);
     }
 
-    // Compute approximate scores: the quantized centroid-major flood.
-    let qt = transpose_quantize_cdot(&query_centroid_scores);
-    // u32 code side-array: 4 B/token reads instead of the mmap's 8.
-    let codes_all = index.codes_u32();
-    let mut approx_scores: Vec<(i64, f32)> = candidates
-        .par_iter()
-        .map(|&doc_id| {
-            let start = index.doc_offsets[doc_id as usize];
-            let end = index.doc_offsets[doc_id as usize + 1];
-            (
-                doc_id,
-                approximate_score_flood_q8(&qt, &codes_all[start..end]),
-            )
-        })
-        .collect();
+    // Compute approximate scores. Non-finite centroid scores are rare (for
+    // example, an otherwise finite but extreme caller-provided query can
+    // overflow the GEMM), but one infinity would make the global u8 scale
+    // infinite and collapse every quantized value. Preserve the previous f32
+    // flood's finite-first behavior for that matrix instead.
+    let mut approx_scores: Vec<(i64, f32)> =
+        if let Some(qt) = transpose_quantize_cdot(&query_centroid_scores) {
+            // u32 code side-array: 4 B/token reads instead of the mmap's 8.
+            let codes_all = index.codes_u32();
+            candidates
+                .par_iter()
+                .map(|&doc_id| {
+                    let start = index.doc_offsets[doc_id as usize];
+                    let end = index.doc_offsets[doc_id as usize + 1];
+                    (
+                        doc_id,
+                        approximate_score_flood_q8(&qt, &codes_all[start..end]),
+                    )
+                })
+                .collect()
+        } else {
+            candidates
+                .par_iter()
+                .map(|&doc_id| {
+                    let start = index.doc_offsets[doc_id as usize];
+                    let end = index.doc_offsets[doc_id as usize + 1];
+                    let codes = index.mmap_codes.slice(start, end);
+                    (
+                        doc_id,
+                        approximate_score_mmap(&query_centroid_scores, &codes),
+                    )
+                })
+                .collect()
+        };
 
     // Partial-select the top n_full_scores, then sort only that prefix —
     // the flood is ~5x larger than what survives, and O(n) select + O(m log m)
@@ -1066,6 +1094,25 @@ mod tests {
     }
 
     #[test]
+    fn probe_scan_demotes_non_finite_scores() {
+        let row = [
+            f32::NAN,
+            f32::INFINITY,
+            4.0,
+            f32::NEG_INFINITY,
+            1.0,
+            3.0,
+            2.0,
+        ];
+        let (mut top_idx, mut top_val) = (Vec::new(), Vec::new());
+        probe_top_k_scan(&row, 3, &mut top_idx, &mut top_val);
+
+        top_val.sort_by(|a, b| a.total_cmp(b));
+        assert_eq!(top_val, vec![2.0, 3.0, 4.0]);
+        assert!(top_idx.iter().all(|&i| row[i as usize].is_finite()));
+    }
+
+    #[test]
     fn test_colbert_score() {
         // Query with 2 tokens, dim 4
         let query =
@@ -1165,7 +1212,7 @@ mod transpose_tests {
 
             // q8 rung: monotone quantization keeps per-lane maxes; the
             // dequantized score is within nq * scale/2 of exact.
-            let qt = transpose_quantize_cdot(&cdot);
+            let qt = transpose_quantize_cdot(&cdot).expect("finite cdot");
             let codes32: Vec<u32> = codes.iter().map(|&c| c as u32).collect();
             let got8 = approximate_score_flood_q8(&qt, &codes32);
             let tol = nq as f32 * qt.scale + 1e-4; // floor quant: err < 1 LSB per lane
@@ -1174,6 +1221,14 @@ mod transpose_tests {
                 "q8 off by {} > tol {tol} (nq={nq} k={k} ntok={ntok})",
                 (got8 - want).abs()
             );
+        }
+    }
+
+    #[test]
+    fn quantized_flood_rejects_non_finite_scores() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let cdot = Array2::from_shape_vec((1, 3), vec![0.5, bad, -0.5]).unwrap();
+            assert!(transpose_quantize_cdot(&cdot).is_none());
         }
     }
 }

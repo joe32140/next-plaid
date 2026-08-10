@@ -183,14 +183,36 @@ pub fn compute_inv_norms(
     codes: &[i64],
     packed: &ArrayView2<u8>,
 ) -> Option<Vec<f32>> {
+    compute_inv_norms_with(codec, codes.len(), |t| codes[t], packed)
+}
+
+/// Mmap-backed variant used by the index cache initializer. Reading each code
+/// through `get` avoids first materializing an 8-byte-per-token `Vec<i64>`
+/// alongside the retained 4-byte-per-token inverse-norm cache.
+pub(crate) fn compute_inv_norms_mmap(
+    codec: &ResidualCodec,
+    codes: &crate::mmap::MmapNpyArray1I64,
+    len: usize,
+    packed: &ArrayView2<u8>,
+) -> Option<Vec<f32>> {
+    assert!(len <= codes.len(), "code prefix exceeds mmap length");
+    compute_inv_norms_with(codec, len, |t| codes.get(t), packed)
+}
+
+fn compute_inv_norms_with(
+    codec: &ResidualCodec,
+    len: usize,
+    code_at: impl Fn(usize) -> i64 + Sync,
+    packed: &ArrayView2<u8>,
+) -> Option<Vec<f32>> {
     let weights = codec.bucket_weights.as_ref()?;
     let lookup = codec.bucket_weight_indices_lookup.as_ref()?;
     let dim = codec.embedding_dim();
     Some(
-        (0..codes.len())
+        (0..len)
             .into_par_iter()
             .map(|t| {
-                let centroid = codec.centroids.row(codes[t] as usize);
+                let centroid = codec.centroids.row(code_at(t) as usize);
                 let mut sq = 0.0f32;
                 let mut d = 0usize;
                 'row: for &byte in packed.row(t).iter() {

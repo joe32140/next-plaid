@@ -1386,7 +1386,6 @@ impl MmapIndex {
                     return None;
                 }
                 let n = *self.doc_offsets.last()?;
-                let codes = self.mmap_codes.slice(0, n);
                 let packed = self.mmap_residuals.slice_rows(0, n);
                 // This initializer is reached from inside rayon workers
                 // (search_many_mmap par_iter -> search -> here), so it must
@@ -1418,7 +1417,12 @@ impl MmapIndex {
                     scope
                         .spawn(|| {
                             pool.install(|| {
-                                crate::residual_lut::compute_inv_norms(&self.codec, &codes, &packed)
+                                crate::residual_lut::compute_inv_norms_mmap(
+                                    &self.codec,
+                                    &self.mmap_codes,
+                                    n,
+                                    &packed,
+                                )
                             })
                         })
                         .join()

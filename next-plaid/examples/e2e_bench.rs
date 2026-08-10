@@ -31,7 +31,9 @@ fn lcg_unit_rows(s: &mut u64, n: usize, dim: usize) -> Array2<f32> {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let index_dir = args.next().expect("usage: e2e_bench <index_dir> <query_lens.npy> [params_json]");
+    let index_dir = args
+        .next()
+        .expect("usage: e2e_bench <index_dir> <query_lens.npy> [params_json]");
     let lens_path = args.next().expect("need query_lens.npy");
     let params_json = args.next().unwrap_or_else(|| "{}".to_string());
 
@@ -79,7 +81,10 @@ fn main() {
         }
     }
     let hex: Vec<String> = digests.iter().map(|h| format!("{h:016x}")).collect();
-    println!("RESULTS_DIGEST index={index_dir} params={params_json} q={}", hex.join(","));
+    println!(
+        "RESULTS_DIGEST index={index_dir} params={params_json} q={}",
+        hex.join(",")
+    );
     times_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mean = times_ms.iter().sum::<f64>() / times_ms.len() as f64;
     let p50 = times_ms[times_ms.len() / 2];

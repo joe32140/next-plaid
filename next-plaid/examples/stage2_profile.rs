@@ -352,6 +352,5 @@ fn main() {
         // (fsplit / ablation) absent from the shipped PRs. CI runs BUILD_ONLY=1.
         let _ = build_only;
         println!("BUILD_ONLY: built {tag}");
-
     }
 }

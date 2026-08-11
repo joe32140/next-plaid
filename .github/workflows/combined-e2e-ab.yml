@@ -1,7 +1,8 @@
 name: combined-e2e-ab
 
-# Measurement-only workflow for the historical and final PR #169 + #170
-# stacks. It compares both combined trees directly with the PRs' common base
+# Measurement-only workflow for the historical, bounded-memory, and mmap
+# inverse-norm PR #169 + #170 stacks. It compares the historical combined
+# tree and current combined tree directly with the PRs' common base
 # using the same benchmark source, prebuilt indexes, deterministic queries,
 # and public search API. Each cell uses a three-order rotation so every
 # variant runs first, middle, and last exactly once.
@@ -30,7 +31,7 @@ jobs:
       - uses: actions/cache/restore@v4
         with:
           path: indexes
-          key: stage2-idx-v1-${{ matrix.cell }}-${{ hashFiles(format('next-plaid/examples/shapes/{0}/*', matrix.shapes)) }}
+          key: stage2-idx-v2-invnorm-${{ matrix.cell }}-${{ hashFiles(format('next-plaid/examples/shapes/{0}/*', matrix.shapes)) }}
       - name: restore or build residual indexes
         run: |
           for tag in r4 r2 r1; do
@@ -42,7 +43,7 @@ jobs:
         if: always()
         with:
           path: indexes
-          key: stage2-idx-v1-${{ matrix.cell }}-${{ hashFiles(format('next-plaid/examples/shapes/{0}/*', matrix.shapes)) }}
+          key: stage2-idx-v2-invnorm-${{ matrix.cell }}-${{ hashFiles(format('next-plaid/examples/shapes/{0}/*', matrix.shapes)) }}
       - uses: actions/upload-artifact@v4
         with:
           name: combined-indexes-${{ matrix.cell }}
@@ -94,6 +95,13 @@ jobs:
           pattern: combined-indexes-*
           path: indexes
           merge-multiple: true
+      - name: verify mmap inverse-norm sidecars
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=$(find indexes -name '*.inv_norms.npy' -type f | wc -l | tr -d ' ')
+          test "$count" -gt 0
+          echo "inverse-norm sidecars: $count"
       - name: rotated three-way end-to-end latency and peak RSS
         shell: bash
         run: |
@@ -158,7 +166,7 @@ jobs:
 
           cat "$results"
           {
-            echo '### Historical versus final PR #169 + #170 versus common base'
+            echo '### Historical versus mmap-sidecar PR #169 + #170 versus common base'
             echo
             echo '```tsv'
             cat "$results"

@@ -1,9 +1,10 @@
 name: combined-e2e-ab
 
-# Measurement-only workflow for the final PR #169 + #170 heads. It compares
-# their resolved combined tree directly with the PRs' common base using the
-# same benchmark source, prebuilt indexes, deterministic queries, and public
-# search API. Each cell runs in both orders to reduce thermal/order bias.
+# Measurement-only workflow for the historical and final PR #169 + #170
+# stacks. It compares both combined trees directly with the PRs' common base
+# using the same benchmark source, prebuilt indexes, deterministic queries,
+# and public search API. Each cell uses a three-order rotation so every
+# variant runs first, middle, and last exactly once.
 
 on:
   workflow_call:
@@ -55,23 +56,36 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
           ref: aeaa64cf3b2cde97cb9290f4cdc36779edb6940f
           path: mainline
+      - uses: actions/checkout@v4
+        with:
+          # Exact tree used by the earlier v1.6.5 combined benchmark. The
+          # final commit only formats its measurement harness, so its search
+          # binary is the historical pre-memory-fix implementation.
+          ref: f67c45cb6cd4a6595dce9de51c9bc4fd62d92cb1
+          path: old-combined
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: graft identical driver into mainline
+      - name: graft identical driver into historical and baseline trees
         run: |
           mkdir -p mainline/next-plaid/examples
+          mkdir -p old-combined/next-plaid/examples
           cp next-plaid/examples/combined_e2e_bench.rs \
             mainline/next-plaid/examples/combined_e2e_bench.rs
-      - name: build both variants
+          cp next-plaid/examples/combined_e2e_bench.rs \
+            old-combined/next-plaid/examples/combined_e2e_bench.rs
+      - name: build all three variants
         run: |
           cargo build --release --example combined_e2e_bench -p next-plaid
+          CARGO_TARGET_DIR=target-old cargo build --release \
+            --manifest-path old-combined/Cargo.toml \
+            --example combined_e2e_bench -p next-plaid
           CARGO_TARGET_DIR=target-mainline cargo build --release \
             --manifest-path mainline/Cargo.toml \
             --example combined_e2e_bench -p next-plaid
@@ -80,13 +94,14 @@ jobs:
           pattern: combined-indexes-*
           path: indexes
           merge-multiple: true
-      - name: interleaved end-to-end latency and peak RSS
+      - name: rotated three-way end-to-end latency and peak RSS
         shell: bash
         run: |
           set -euo pipefail
           baseline=target-mainline/release/examples/combined_e2e_bench
-          combined=target/release/examples/combined_e2e_bench
-          results="combined-${RUNNER_OS}-${RUNNER_ARCH}.tsv"
+          old=target-old/release/examples/combined_e2e_bench
+          final=target/release/examples/combined_e2e_bench
+          results="threeway-${RUNNER_OS}-${RUNNER_ARCH}.tsv"
           printf 'runner\tarch\tdataset\tnbits\trep\torder\tvariant\trss_kib\trss_mib\tmean_ms\tp50_ms\tp95_ms\n' > "$results"
 
           run_one() {
@@ -127,16 +142,23 @@ jobs:
               dataset=${dataset%%-*}
               lens="next-plaid/examples/shapes/$dataset/query_lens.npy"
 
-              run_one "$dataset" "$nbits" 1 baseline-first baseline "$baseline" '{}' "$index" "$lens"
-              run_one "$dataset" "$nbits" 1 baseline-first combined "$combined" '{"residual_asym":true}' "$index" "$lens"
-              run_one "$dataset" "$nbits" 2 combined-first combined "$combined" '{"residual_asym":true}' "$index" "$lens"
-              run_one "$dataset" "$nbits" 2 combined-first baseline "$baseline" '{}' "$index" "$lens"
+              run_one "$dataset" "$nbits" 1 baseline-old-final baseline "$baseline" '{}' "$index" "$lens"
+              run_one "$dataset" "$nbits" 1 baseline-old-final old "$old" '{"residual_asym":true}' "$index" "$lens"
+              run_one "$dataset" "$nbits" 1 baseline-old-final final "$final" '{"residual_asym":true}' "$index" "$lens"
+
+              run_one "$dataset" "$nbits" 2 old-final-baseline old "$old" '{"residual_asym":true}' "$index" "$lens"
+              run_one "$dataset" "$nbits" 2 old-final-baseline final "$final" '{"residual_asym":true}' "$index" "$lens"
+              run_one "$dataset" "$nbits" 2 old-final-baseline baseline "$baseline" '{}' "$index" "$lens"
+
+              run_one "$dataset" "$nbits" 3 final-baseline-old final "$final" '{"residual_asym":true}' "$index" "$lens"
+              run_one "$dataset" "$nbits" 3 final-baseline-old baseline "$baseline" '{}' "$index" "$lens"
+              run_one "$dataset" "$nbits" 3 final-baseline-old old "$old" '{"residual_asym":true}' "$index" "$lens"
             done
           done
 
           cat "$results"
           {
-            echo '### Final PR #169 + #170 versus common base'
+            echo '### Historical versus final PR #169 + #170 versus common base'
             echo
             echo '```tsv'
             cat "$results"
@@ -144,6 +166,6 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
-          name: combined-results-${{ matrix.os }}
-          path: combined-*.tsv
+          name: threeway-results-${{ matrix.os }}
+          path: threeway-*.tsv
           retention-days: 14

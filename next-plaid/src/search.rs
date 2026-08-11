@@ -491,8 +491,8 @@ fn approximate_score_flood_q8(qt: &QuantCdotT, doc_codes: &[i64]) -> f32 {
 }
 
 /// Score one document directly from the file-backed code mapping. Normal NPY
-/// files take the zero-copy branch; the owned fallback keeps unusual unaligned
-/// or big-endian mappings correct without retaining an index-sized cache.
+/// files take the zero-copy branch. Unaligned maps decode each code directly
+/// from the mmap rather than allocating an owned per-document fallback.
 fn approximate_score_flood_q8_mmap(
     qt: &QuantCdotT,
     codes: &crate::mmap::MmapNpyArray1I64,
@@ -502,7 +502,21 @@ fn approximate_score_flood_q8_mmap(
     if let Some(all_codes) = codes.as_slice() {
         approximate_score_flood_q8(qt, &all_codes[start..end])
     } else {
-        approximate_score_flood_q8(qt, &codes.slice(start, end))
+        let stride = qt.stride;
+        let q = qt.q.as_slice();
+        let mut sum: u32 = 0;
+        for c0 in (0..stride).step_by(16) {
+            let mut m = [0u8; 16];
+            for idx in start..end {
+                let code = codes.get(idx) as usize;
+                let row = &q[code * stride + c0..code * stride + c0 + 16];
+                for i in 0..16 {
+                    m[i] = m[i].max(row[i]);
+                }
+            }
+            sum += m.iter().map(|&x| x as u32).sum::<u32>();
+        }
+        qt.lo_sum + qt.scale * sum as f32
     }
 }
 

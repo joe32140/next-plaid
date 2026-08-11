@@ -1897,6 +1897,21 @@ mod tests {
     }
 
     #[test]
+    fn test_mmap_npy_array1_i64_unaligned_header_uses_safe_fallback() {
+        let mut file = NamedTempFile::new().unwrap();
+        let header_size = write_npy_header_1d(&mut file, 4, "<i8").unwrap();
+        assert_ne!(header_size % std::mem::align_of::<i64>(), 0);
+        for value in [10i64, 20, 30, 40] {
+            file.write_all(&value.to_le_bytes()).unwrap();
+        }
+        file.flush().unwrap();
+
+        let mmap = MmapNpyArray1I64::from_npy_file(file.path()).unwrap();
+        assert!(mmap.as_slice().is_none());
+        assert_eq!(mmap.slice(1, 3), vec![20, 30]);
+    }
+
+    #[test]
     fn test_write_read_roundtrip() {
         let file = NamedTempFile::new().unwrap();
         let path = file.path();

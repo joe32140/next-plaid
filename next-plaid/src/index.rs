@@ -1085,7 +1085,9 @@ pub fn create_index_with_kmeans_files(
 /// ```ignore
 /// use next_plaid::MmapIndex;
 ///
-/// let index = MmapIndex::load("/path/to/index")?;
+/// let mut index = MmapIndex::load("/path/to/index")?;
+/// // One-time, bounded-memory upgrade for indexes created before the LUT sidecar.
+/// index.prewarm_residual_lut_sidecar()?;
 /// let results = index.search(&query, &params, None)?;
 /// ```
 pub struct MmapIndex {
@@ -1262,6 +1264,75 @@ impl MmapIndex {
         self.mmap_inv_norms
             .as_ref()
             .map(|inv_norms| inv_norms.slice(start, end))
+    }
+
+    /// Build and memory-map the inverse-norm sidecar for a legacy residual
+    /// index.
+    ///
+    /// New indexes persist this data while indexing. For an older index this
+    /// method streams its existing code and residual chunks one at a time,
+    /// atomically writes the missing sidecar chunks, then maps the merged
+    /// result. No embeddings are required and no full-index heap allocation is
+    /// made. Call this during provisioning to avoid the legacy per-query norm
+    /// recomputation fallback on the first asymmetric residual search.
+    ///
+    /// Returns `true` when a legacy index was upgraded, and `false` for binary
+    /// indexes or indexes whose sidecar is already mapped.
+    pub fn prewarm_residual_lut_sidecar(&mut self) -> Result<bool> {
+        use ndarray_npy::ReadNpyExt;
+
+        if self.metadata.binary || self.mmap_inv_norms.is_some() {
+            return Ok(false);
+        }
+
+        let index_dir = Path::new(&self.path);
+        for chunk_idx in 0..self.metadata.num_chunks {
+            let codes_path = index_dir.join(format!("{}.codes.npy", chunk_idx));
+            let codes: Array1<i64> = Array1::read_npy(File::open(&codes_path)?)?;
+            let inv_norms_path = index_dir.join(format!("{}.inv_norms.npy", chunk_idx));
+            let sidecar_is_current = if inv_norms_path.exists() {
+                let existing: Array1<f32> = Array1::read_npy(File::open(&inv_norms_path)?)?;
+                existing.len() == codes.len()
+            } else {
+                false
+            };
+
+            if !sidecar_is_current {
+                let residuals_path = index_dir.join(format!("{}.residuals.npy", chunk_idx));
+                let residuals: Array2<u8> = Array2::read_npy(File::open(&residuals_path)?)?;
+                if residuals.nrows() != codes.len() {
+                    return Err(Error::IndexLoad(format!(
+                        "chunk {} has {} codes but {} residual rows",
+                        chunk_idx,
+                        codes.len(),
+                        residuals.nrows()
+                    )));
+                }
+                write_inv_norms_chunk(index_dir, chunk_idx, &self.codec, &codes, &residuals)?;
+            }
+        }
+
+        let max_len = self.doc_lengths.iter().copied().max().unwrap_or(0) as usize;
+        let last_len = self.doc_lengths.last().copied().unwrap_or(0) as usize;
+        let padding_needed = max_len.saturating_sub(last_len);
+        let merged_path = crate::mmap::merge_inv_norm_chunks(
+            index_dir,
+            self.metadata.num_chunks,
+            padding_needed,
+        )?
+        .ok_or_else(|| {
+            Error::IndexLoad("inverse-norm sidecar is incomplete after prewarm".into())
+        })?;
+        let inv_norms = crate::mmap::MmapNpyArray1F32::from_npy_file(&merged_path)?;
+        if inv_norms.len() != self.mmap_codes.len() {
+            return Err(Error::IndexLoad(format!(
+                "inverse norm row count {} does not match codes row count {}",
+                inv_norms.len(),
+                self.mmap_codes.len()
+            )));
+        }
+        self.mmap_inv_norms = Some(inv_norms);
+        Ok(true)
     }
 
     /// Get candidate documents from IVF for given centroid indices.
@@ -2282,12 +2353,28 @@ mod tests {
                 .unwrap();
         }
         crate::mmap::clear_merged_files(temp_dir.path()).unwrap();
-        let legacy = MmapIndex::load(index_path).unwrap();
+        let mut legacy = MmapIndex::load(index_path).unwrap();
         assert!(legacy.mmap_inv_norms.is_none());
         let fallback = legacy.search(&embeddings[0], &params, None).unwrap();
         assert_eq!(with_sidecar.passage_ids, fallback.passage_ids);
         assert_eq!(with_sidecar.scores.len(), fallback.scores.len());
         for (&actual, &want) in with_sidecar.scores.iter().zip(fallback.scores.iter()) {
+            assert!((actual - want).abs() <= 1e-6, "{actual} != {want}");
+        }
+
+        assert!(legacy.prewarm_residual_lut_sidecar().unwrap());
+        assert!(legacy.mmap_inv_norms.is_some());
+        assert!(!legacy.prewarm_residual_lut_sidecar().unwrap());
+        for chunk_idx in 0..num_chunks {
+            assert!(temp_dir
+                .path()
+                .join(format!("{}.inv_norms.npy", chunk_idx))
+                .exists());
+        }
+        let prewarmed = legacy.search(&embeddings[0], &params, None).unwrap();
+        assert_eq!(with_sidecar.passage_ids, prewarmed.passage_ids);
+        assert_eq!(with_sidecar.scores.len(), prewarmed.scores.len());
+        for (&actual, &want) in with_sidecar.scores.iter().zip(prewarmed.scores.iter()) {
             assert!((actual - want).abs() <= 1e-6, "{actual} != {want}");
         }
     }

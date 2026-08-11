@@ -1,0 +1,11 @@
+name: e2e-ab
+
+# Registered dispatch entrypoint on the fork. The measurement implementation
+# stays in its own reusable workflow so this branch does not alter production
+# CI behavior.
+on:
+  workflow_dispatch:
+
+jobs:
+  combined-final:
+    uses: ./.github/workflows/combined-e2e-ab.yml

@@ -1,0 +1,149 @@
+name: combined-e2e-ab
+
+# Measurement-only workflow for the final PR #169 + #170 heads. It compares
+# their resolved combined tree directly with the PRs' common base using the
+# same benchmark source, prebuilt indexes, deterministic queries, and public
+# search API. Each cell runs in both orders to reduce thermal/order bias.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  build-indexes:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cell: nfcorpus, shapes: nfcorpus }
+          - { cell: scifact, shapes: scifact }
+    name: build-${{ matrix.cell }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build index generator
+        run: cargo build --release --example stage2_profile -p next-plaid
+      - uses: actions/cache/restore@v4
+        with:
+          path: indexes
+          key: stage2-idx-v1-${{ matrix.cell }}-${{ hashFiles(format('next-plaid/examples/shapes/{0}/*', matrix.shapes)) }}
+      - name: restore or build residual indexes
+        run: |
+          for tag in r4 r2 r1; do
+            BUILD_ONLY=1 INDEX_TAGS="$tag" INDEX_ROOT=indexes \
+              ./target/release/examples/stage2_profile \
+              shapes next-plaid/examples/shapes/${{ matrix.shapes }}
+          done
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: indexes
+          key: stage2-idx-v1-${{ matrix.cell }}-${{ hashFiles(format('next-plaid/examples/shapes/{0}/*', matrix.shapes)) }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: combined-indexes-${{ matrix.cell }}
+          path: indexes
+          retention-days: 3
+
+  measure:
+    needs: build-indexes
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: aeaa64cf3b2cde97cb9290f4cdc36779edb6940f
+          path: mainline
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: graft identical driver into mainline
+        run: |
+          mkdir -p mainline/next-plaid/examples
+          cp next-plaid/examples/combined_e2e_bench.rs \
+            mainline/next-plaid/examples/combined_e2e_bench.rs
+      - name: build both variants
+        run: |
+          cargo build --release --example combined_e2e_bench -p next-plaid
+          CARGO_TARGET_DIR=target-mainline cargo build --release \
+            --manifest-path mainline/Cargo.toml \
+            --example combined_e2e_bench -p next-plaid
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: combined-indexes-*
+          path: indexes
+          merge-multiple: true
+      - name: interleaved end-to-end latency and peak RSS
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline=target-mainline/release/examples/combined_e2e_bench
+          combined=target/release/examples/combined_e2e_bench
+          results="combined-${RUNNER_OS}-${RUNNER_ARCH}.tsv"
+          printf 'runner\tarch\tdataset\tnbits\trep\torder\tvariant\trss_kib\trss_mib\tmean_ms\tp50_ms\tp95_ms\n' > "$results"
+
+          run_one() {
+            local dataset="$1" nbits="$2" rep="$3" order="$4"
+            local variant="$5" binary="$6" params="$7" index="$8" lens="$9"
+            local timing bench_out rss_kib rss_bytes mean_ms p50_ms p95_ms
+            timing=$(mktemp)
+            if [[ "$RUNNER_OS" == "Linux" ]]; then
+              bench_out=$(/usr/bin/time -v env NEXT_PLAID_REPORT_KERNEL=1 \
+                "$binary" "$index" "$lens" "$params" 2>"$timing")
+              rss_kib=$(awk -F: '/Maximum resident set size/ {gsub(/[[:space:]]/, "", $2); print $2}' "$timing")
+            else
+              bench_out=$(/usr/bin/time -l env NEXT_PLAID_REPORT_KERNEL=1 \
+                "$binary" "$index" "$lens" "$params" 2>"$timing")
+              rss_bytes=$(awk '/maximum resident set size/ {print $1; exit}' "$timing")
+              rss_kib=$(( (rss_bytes + 1023) / 1024 ))
+            fi
+            echo "===== dataset=$dataset nbits=$nbits rep=$rep order=$order variant=$variant"
+            grep '\[next-plaid\] residual_asym:' "$timing" || true
+            echo "$bench_out"
+            mean_ms=$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^mean_ms=/) {split($i,a,"="); print a[2]}}' <<<"$bench_out")
+            p50_ms=$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^p50_ms=/) {split($i,a,"="); print a[2]}}' <<<"$bench_out")
+            p95_ms=$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^p95_ms=/) {split($i,a,"="); print a[2]}}' <<<"$bench_out")
+            awk -v runner="$RUNNER_OS" -v arch="$RUNNER_ARCH" \
+              -v dataset="$dataset" -v nbits="$nbits" -v rep="$rep" \
+              -v order="$order" -v variant="$variant" -v rss="$rss_kib" \
+              -v mean="$mean_ms" -v p50="$p50_ms" -v p95="$p95_ms" \
+              'BEGIN {printf "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%d\t%.2f\t%.3f\t%.3f\t%.3f\n", runner, arch, dataset, nbits, rep, order, variant, rss, rss/1024, mean, p50, p95}' \
+              >> "$results"
+            rm -f "$timing"
+          }
+
+          for nbits in r4 r2 r1; do
+            for index in indexes/shapes-*_${nbits}; do
+              [[ -d "$index" ]] || continue
+              dataset=$(basename "$index")
+              dataset=${dataset#shapes-}
+              dataset=${dataset%%-*}
+              lens="next-plaid/examples/shapes/$dataset/query_lens.npy"
+
+              run_one "$dataset" "$nbits" 1 baseline-first baseline "$baseline" '{}' "$index" "$lens"
+              run_one "$dataset" "$nbits" 1 baseline-first combined "$combined" '{"residual_asym":true}' "$index" "$lens"
+              run_one "$dataset" "$nbits" 2 combined-first combined "$combined" '{"residual_asym":true}' "$index" "$lens"
+              run_one "$dataset" "$nbits" 2 combined-first baseline "$baseline" '{}' "$index" "$lens"
+            done
+          done
+
+          cat "$results"
+          {
+            echo '### Final PR #169 + #170 versus common base'
+            echo
+            echo '```tsv'
+            cat "$results"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: combined-results-${{ matrix.os }}
+          path: combined-*.tsv
+          retention-days: 14

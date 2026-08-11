@@ -1062,12 +1062,6 @@ pub struct MmapIndex {
     pub mmap_codes: crate::mmap::MmapNpyArray1I64,
     /// Memory-mapped residuals array (public for search access)
     pub mmap_residuals: crate::mmap::MmapNpyArray2U8,
-    /// Lazily-built u32 copy of the token codes for the stage-1 candidate
-    /// flood: the mmap stores i64 (8 B/token), so a flood pass over millions
-    /// of candidate tokens reads 4x more code bytes than the values need
-    /// (num_centroids always fits u32). RAM cost is 4 B/token, paid on first
-    /// search only, and freed with the index.
-    codes_u32: std::sync::OnceLock<Vec<u32>>,
 }
 
 impl MmapIndex {
@@ -1189,17 +1183,7 @@ impl MmapIndex {
             doc_lengths,
             doc_offsets,
             mmap_codes,
-            codes_u32: std::sync::OnceLock::new(),
             mmap_residuals,
-        })
-    }
-
-    /// Token codes as u32, built once on first use (one sequential pass over
-    /// the code mmap). Indexed by the same `doc_offsets` as `mmap_codes`.
-    pub fn codes_u32(&self) -> &[u32] {
-        self.codes_u32.get_or_init(|| {
-            let n = self.doc_offsets.last().copied().unwrap_or(0);
-            (0..n).map(|i| self.mmap_codes.get(i) as u32).collect()
         })
     }
 

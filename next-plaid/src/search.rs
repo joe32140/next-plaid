@@ -473,7 +473,7 @@ fn transpose_quantize_cdot(cdot: &Array2<f32>) -> Option<QuantCdotT> {
 /// handling. Doc codes are re-read once per chunk (≤ 2 passes at nq ≤ 32;
 /// they are L1-hot on the second). Pad lanes hold quantized 0 everywhere,
 /// so they stay 0 through `max` and add nothing to the lane sum.
-fn approximate_score_flood_q8(qt: &QuantCdotT, doc_codes: &[u32]) -> f32 {
+fn approximate_score_flood_q8(qt: &QuantCdotT, doc_codes: &[i64]) -> f32 {
     let stride = qt.stride;
     let q = qt.q.as_slice();
     let mut sum: u32 = 0;
@@ -488,6 +488,22 @@ fn approximate_score_flood_q8(qt: &QuantCdotT, doc_codes: &[u32]) -> f32 {
         sum += m.iter().map(|&x| x as u32).sum::<u32>();
     }
     qt.lo_sum + qt.scale * sum as f32
+}
+
+/// Score one document directly from the file-backed code mapping. Normal NPY
+/// files take the zero-copy branch; the owned fallback keeps unusual unaligned
+/// or big-endian mappings correct without retaining an index-sized cache.
+fn approximate_score_flood_q8_mmap(
+    qt: &QuantCdotT,
+    codes: &crate::mmap::MmapNpyArray1I64,
+    start: usize,
+    end: usize,
+) -> f32 {
+    if let Some(all_codes) = codes.as_slice() {
+        approximate_score_flood_q8(qt, &all_codes[start..end])
+    } else {
+        approximate_score_flood_q8(qt, &codes.slice(start, end))
+    }
 }
 
 /// Compute approximate scores for mmap index using code lookups.
@@ -813,8 +829,6 @@ fn stage1_shortlist(
     // flood's finite-first behavior for that matrix instead.
     let mut approx_scores: Vec<(i64, f32)> =
         if let Some(qt) = transpose_quantize_cdot(&query_centroid_scores) {
-            // u32 code side-array: 4 B/token reads instead of the mmap's 8.
-            let codes_all = index.codes_u32();
             candidates
                 .par_iter()
                 .map(|&doc_id| {
@@ -822,7 +836,7 @@ fn stage1_shortlist(
                     let end = index.doc_offsets[doc_id as usize + 1];
                     (
                         doc_id,
-                        approximate_score_flood_q8(&qt, &codes_all[start..end]),
+                        approximate_score_flood_q8_mmap(&qt, &index.mmap_codes, start, end),
                     )
                 })
                 .collect()
@@ -1213,8 +1227,7 @@ mod transpose_tests {
             // q8 rung: monotone quantization keeps per-lane maxes; the
             // dequantized score is within nq * scale/2 of exact.
             let qt = transpose_quantize_cdot(&cdot).expect("finite cdot");
-            let codes32: Vec<u32> = codes.iter().map(|&c| c as u32).collect();
-            let got8 = approximate_score_flood_q8(&qt, &codes32);
+            let got8 = approximate_score_flood_q8(&qt, &codes);
             let tol = nq as f32 * qt.scale + 1e-4; // floor quant: err < 1 LSB per lane
             assert!(
                 (got8 - want).abs() <= tol,

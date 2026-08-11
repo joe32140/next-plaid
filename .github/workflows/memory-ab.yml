@@ -1,0 +1,173 @@
+name: memory-ab
+
+# Peak-RSS matrix for upstream v1.6.5, PR #169, PR #170, and their combined
+# stack. Each measurement is a fresh process over the same mmap index. Batch
+# sizes also set RAYON_NUM_THREADS so the larger cells expose per-query
+# transpose amplification that a sequential benchmark cannot show.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build index generator
+        run: cargo build --release --example stage2_profile -p next-plaid
+      - uses: actions/cache/restore@v4
+        with:
+          path: indexes
+          key: stage2-idx-v1-scifact-${{ hashFiles('next-plaid/examples/shapes/scifact/*') }}
+      - name: restore or build SciFact r4 index
+        run: |
+          BUILD_ONLY=1 INDEX_TAGS=r4 INDEX_ROOT=indexes \
+            ./target/release/examples/stage2_profile \
+            shapes next-plaid/examples/shapes/scifact
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: indexes
+          key: stage2-idx-v1-scifact-${{ hashFiles('next-plaid/examples/shapes/scifact/*') }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memory-index
+          path: indexes/shapes-scifact-5183docs_r4
+          retention-days: 3
+
+  measure:
+    needs: build-index
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: 76092e1cb0cc13ab46394ee5bffa010fcbb43a9a
+          path: baseline
+      - uses: actions/checkout@v4
+        with:
+          ref: c68fd1a1d02bff6e323e8a37d61aa09406861900
+          path: pr169
+      - uses: actions/checkout@v4
+        with:
+          ref: b44b7af6b82d5e73c93af0ed6382450cbab99583
+          path: pr170
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: graft identical memory driver into every ref
+        run: |
+          for tree in baseline pr169 pr170; do
+            cp next-plaid/examples/memory_bench.rs \
+              "$tree/next-plaid/examples/memory_bench.rs"
+          done
+      - name: build all variants
+        run: |
+          mkdir -p memory-bin
+          for tree in baseline pr169 pr170; do
+            CARGO_TARGET_DIR=target-memory cargo build --release \
+              --manifest-path "$tree/Cargo.toml" \
+              --example memory_bench -p next-plaid
+            cp target-memory/release/examples/memory_bench "memory-bin/$tree"
+          done
+          CARGO_TARGET_DIR=target-memory cargo build --release \
+            --example memory_bench -p next-plaid
+          cp target-memory/release/examples/memory_bench memory-bin/combined
+      - uses: actions/download-artifact@v4
+        with:
+          name: memory-index
+          path: memory-index
+      - name: measure fresh-process peak RSS
+        shell: bash
+        run: |
+          set -euo pipefail
+          index=memory-index
+          lens=next-plaid/examples/shapes/scifact/query_lens.npy
+          results="memory-${RUNNER_OS}-${RUNNER_ARCH}.tsv"
+          printf 'runner\tarch\tvariant\tbatch\trss_kib\trss_mib\ttokens\tcentroids\tpersistent_cache_mib\ttransient_extra_mib\ttranspose_f32_mib\ttranspose_q8_mib\n' > "$results"
+
+          for variant in baseline pr169 pr170 combined-default combined-asym; do
+            case "$variant" in
+              baseline)
+                binary=memory-bin/baseline
+                params='{}'
+                cache_bytes_per_token=0
+                transient_mode=none
+                ;;
+              pr169)
+                binary=memory-bin/pr169
+                params='{"residual_asym":true}'
+                cache_bytes_per_token=4
+                transient_mode=f32
+                ;;
+              pr170)
+                binary=memory-bin/pr170
+                params='{}'
+                cache_bytes_per_token=4
+                transient_mode=q8
+                ;;
+              combined-default)
+                binary=memory-bin/combined
+                params='{}'
+                cache_bytes_per_token=4
+                transient_mode=q8
+                ;;
+              combined-asym)
+                binary=memory-bin/combined
+                params='{"residual_asym":true}'
+                cache_bytes_per_token=8
+                transient_mode=both
+                ;;
+            esac
+
+            for batch in 1 4 16; do
+              timing=$(mktemp)
+              if [[ "$RUNNER_OS" == "Linux" ]]; then
+                bench_out=$(/usr/bin/time -v env RAYON_NUM_THREADS="$batch" \
+                  "$binary" "$index" "$lens" "$params" "$batch" 2>"$timing")
+                rss_kib=$(awk -F: '/Maximum resident set size/ {gsub(/[[:space:]]/, "", $2); print $2}' "$timing")
+              else
+                bench_out=$(/usr/bin/time -l env RAYON_NUM_THREADS="$batch" \
+                  "$binary" "$index" "$lens" "$params" "$batch" 2>"$timing")
+                rss_bytes=$(awk '/maximum resident set size/ {print $1; exit}' "$timing")
+                rss_kib=$(( (rss_bytes + 1023) / 1024 ))
+              fi
+              echo "$bench_out"
+
+              tokens=$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^tokens=/) {split($i,a,"="); print a[2]}}' <<<"$bench_out")
+              centroids=$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^centroids=/) {split($i,a,"="); print a[2]}}' <<<"$bench_out")
+              transpose_f32_bytes=$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^transpose_f32_bytes=/) {split($i,a,"="); print a[2]}}' <<<"$bench_out")
+              transpose_q8_bytes=$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^transpose_q8_bytes=/) {split($i,a,"="); print a[2]}}' <<<"$bench_out")
+
+              awk -v runner="$RUNNER_OS" -v arch="$RUNNER_ARCH" \
+                -v variant="$variant" -v batch="$batch" -v rss="$rss_kib" \
+                -v tokens="$tokens" -v centroids="$centroids" \
+                -v cache_bpt="$cache_bytes_per_token" \
+                -v transient_mode="$transient_mode" \
+                -v t32="$transpose_f32_bytes" -v tq8="$transpose_q8_bytes" \
+                'BEGIN {extra=(transient_mode=="f32" ? t32 : (transient_mode=="q8" ? tq8 : (transient_mode=="both" ? t32+tq8 : 0))); printf "%s\t%s\t%s\t%d\t%d\t%.2f\t%d\t%d\t%.2f\t%.2f\t%.2f\t%.2f\n", runner, arch, variant, batch, rss, rss/1024, tokens, centroids, tokens*cache_bpt/1048576, extra/1048576, t32/1048576, tq8/1048576}' \
+                >> "$results"
+              rm -f "$timing"
+            done
+          done
+
+          cat "$results"
+          {
+            echo '### Peak RSS memory A/B'
+            echo
+            echo '```tsv'
+            cat "$results"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memory-results-${{ matrix.os }}
+          path: memory-*.tsv
+          retention-days: 14

@@ -974,7 +974,7 @@ pub fn update_index(
             })?;
 
             let inv_norms = crate::residual_lut::compute_inv_norms(
-                &codec,
+                codec,
                 codes_arr.as_slice().ok_or_else(|| {
                     Error::Update("inverse norm codes must be contiguous".to_string())
                 })?,

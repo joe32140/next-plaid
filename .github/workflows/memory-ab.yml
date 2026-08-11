@@ -1,9 +1,10 @@
 name: memory-ab
 
-# Peak-RSS matrix for upstream v1.6.5, PR #169, PR #170, and their combined
-# stack. Each measurement is a fresh process over the same mmap index. Batch
-# sizes also set RAYON_NUM_THREADS so the larger cells expose per-query
-# transpose amplification that a sequential benchmark cannot show.
+# Peak-RSS matrix for upstream v1.6.5 versus PR #170. Each measurement is a
+# fresh process over the same mmap index. Batch sizes also set
+# RAYON_NUM_THREADS so the larger cells expose per-query transpose
+# amplification that a sequential benchmark cannot show. Queries use the
+# 128-token production shape documented in PR #26.
 
 on:
   workflow_call:
@@ -54,32 +55,26 @@ jobs:
           path: baseline
       - uses: actions/checkout@v4
         with:
-          ref: c68fd1a1d02bff6e323e8a37d61aa09406861900
-          path: pr169
-      - uses: actions/checkout@v4
-        with:
           ref: b44b7af6b82d5e73c93af0ed6382450cbab99583
           path: pr170
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: graft identical memory driver into every ref
         run: |
-          for tree in baseline pr169 pr170; do
+          for tree in baseline pr170; do
+            mkdir -p "$tree/next-plaid/examples"
             cp next-plaid/examples/memory_bench.rs \
               "$tree/next-plaid/examples/memory_bench.rs"
           done
       - name: build all variants
         run: |
           mkdir -p memory-bin
-          for tree in baseline pr169 pr170; do
+          for tree in baseline pr170; do
             CARGO_TARGET_DIR=target-memory cargo build --release \
               --manifest-path "$tree/Cargo.toml" \
               --example memory_bench -p next-plaid
             cp target-memory/release/examples/memory_bench "memory-bin/$tree"
           done
-          CARGO_TARGET_DIR=target-memory cargo build --release \
-            --example memory_bench -p next-plaid
-          cp target-memory/release/examples/memory_bench memory-bin/combined
       - uses: actions/download-artifact@v4
         with:
           name: memory-index
@@ -93,7 +88,7 @@ jobs:
           results="memory-${RUNNER_OS}-${RUNNER_ARCH}.tsv"
           printf 'runner\tarch\tvariant\tbatch\trss_kib\trss_mib\ttokens\tcentroids\tpersistent_cache_mib\ttransient_extra_mib\ttranspose_f32_mib\ttranspose_q8_mib\n' > "$results"
 
-          for variant in baseline pr169 pr170 combined-default combined-asym; do
+          for variant in baseline pr170; do
             case "$variant" in
               baseline)
                 binary=memory-bin/baseline
@@ -101,29 +96,11 @@ jobs:
                 cache_bytes_per_token=0
                 transient_mode=none
                 ;;
-              pr169)
-                binary=memory-bin/pr169
-                params='{"residual_asym":true}'
-                cache_bytes_per_token=4
-                transient_mode=f32
-                ;;
               pr170)
                 binary=memory-bin/pr170
                 params='{}'
                 cache_bytes_per_token=4
                 transient_mode=q8
-                ;;
-              combined-default)
-                binary=memory-bin/combined
-                params='{}'
-                cache_bytes_per_token=4
-                transient_mode=q8
-                ;;
-              combined-asym)
-                binary=memory-bin/combined
-                params='{"residual_asym":true}'
-                cache_bytes_per_token=8
-                transient_mode=both
                 ;;
             esac
 
@@ -131,11 +108,11 @@ jobs:
               timing=$(mktemp)
               if [[ "$RUNNER_OS" == "Linux" ]]; then
                 bench_out=$(/usr/bin/time -v env RAYON_NUM_THREADS="$batch" \
-                  "$binary" "$index" "$lens" "$params" "$batch" 2>"$timing")
+                  "$binary" "$index" "$lens" "$params" "$batch" 128 2>"$timing")
                 rss_kib=$(awk -F: '/Maximum resident set size/ {gsub(/[[:space:]]/, "", $2); print $2}' "$timing")
               else
                 bench_out=$(/usr/bin/time -l env RAYON_NUM_THREADS="$batch" \
-                  "$binary" "$index" "$lens" "$params" "$batch" 2>"$timing")
+                  "$binary" "$index" "$lens" "$params" "$batch" 128 2>"$timing")
                 rss_bytes=$(awk '/maximum resident set size/ {print $1; exit}' "$timing")
                 rss_kib=$(( (rss_bytes + 1023) / 1024 ))
               fi

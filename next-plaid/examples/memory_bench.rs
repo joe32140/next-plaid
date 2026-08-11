@@ -6,7 +6,7 @@
 //! mmap pages and lazy index caches, then the requested number of queries run
 //! concurrently through the public batch API.
 //!
-//! usage: memory_bench <index_dir> <query_lens.npy> [params_json] [batch]
+//! usage: memory_bench <index_dir> <query_lens.npy> [params_json] [batch] [query_rows]
 
 use std::fs::File;
 
@@ -37,9 +37,9 @@ fn lcg_unit_rows(seed: &mut u64, rows: usize, dim: usize) -> Array2<f32> {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let index_dir = args
-        .next()
-        .expect("usage: memory_bench <index_dir> <query_lens.npy> [params_json] [batch]");
+    let index_dir = args.next().expect(
+        "usage: memory_bench <index_dir> <query_lens.npy> [params_json] [batch] [query_rows]",
+    );
     let lens_path = args.next().expect("need query_lens.npy");
     let params_json = args.next().unwrap_or_else(|| "{}".to_string());
     let batch = args
@@ -47,6 +47,14 @@ fn main() {
         .map(|value| value.parse::<usize>().expect("batch must be an integer"))
         .unwrap_or(1);
     assert!(batch > 0, "batch must be positive");
+    let fixed_query_rows = args.next().map(|value| {
+        value
+            .parse::<usize>()
+            .expect("query_rows must be an integer")
+    });
+    if let Some(rows) = fixed_query_rows {
+        assert!(rows > 0, "query_rows must be positive");
+    }
 
     // Overlay branch-specific fields onto defaults. Serde ignores unknown
     // fields, so this exact source also compiles and runs against v1.6.5.
@@ -69,7 +77,8 @@ fn main() {
     let mut seed = 0x0DD5EED5_u64;
     let queries: Vec<Array2<f32>> = (0..batch)
         .map(|query_id| {
-            let rows = query_lengths[query_id % query_lengths.len()] as usize;
+            let rows =
+                fixed_query_rows.unwrap_or(query_lengths[query_id % query_lengths.len()] as usize);
             lcg_unit_rows(&mut seed, rows, dim)
         })
         .collect();

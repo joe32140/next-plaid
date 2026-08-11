@@ -162,6 +162,26 @@ fn delete_from_index_impl(doc_ids: &[i64], index_path: &str, clean_buffer: bool)
 
             new_residuals.write_npy(File::create(&residuals_path)?)?;
 
+            // Maintain the optional inverse-norm sidecar for new-format
+            // residual indexes. Legacy and binary indexes simply have no file.
+            let inv_norms_path = index_dir.join(format!("{}.inv_norms.npy", chunk_idx));
+            if inv_norms_path.exists() {
+                let inv_norms: Array1<f32> = Array1::read_npy(File::open(&inv_norms_path)?)?;
+                if inv_norms.len() != embs_to_keep_mask.len() {
+                    return Err(Error::Delete(format!(
+                        "inverse norm rows {} do not match chunk token rows {}",
+                        inv_norms.len(),
+                        embs_to_keep_mask.len()
+                    )));
+                }
+                let new_inv_norms: Array1<f32> = inv_norms
+                    .iter()
+                    .zip(embs_to_keep_mask.iter())
+                    .filter_map(|(&norm, &keep)| keep.then_some(norm))
+                    .collect();
+                new_inv_norms.write_npy(File::create(&inv_norms_path)?)?;
+            }
+
             // Update chunk metadata
             let chunk_meta_path = index_dir.join(format!("{}.metadata.json", chunk_idx));
             let mut chunk_meta: serde_json::Value = serde_json::from_reader(BufReader::new(
@@ -458,6 +478,11 @@ mod tests {
         // Reload and verify
         let index_after = MmapIndex::load(index_path).unwrap();
         assert_eq!(index_after.metadata.num_documents, 7);
+        assert!(index_after.mmap_inv_norms.is_some());
+        assert_eq!(
+            index_after.mmap_inv_norms.as_ref().unwrap().len(),
+            index_after.mmap_codes.len()
+        );
 
         // After deletion, documents are renumbered 0-6
         // Verify all IVF entries are valid document IDs in the new range

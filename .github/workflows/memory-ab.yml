@@ -6,7 +6,7 @@ name: memory-ab
 # transpose amplification that a sequential benchmark cannot show.
 
 on:
-  workflow_dispatch:
+  workflow_call:
 
 jobs:
   build-index:

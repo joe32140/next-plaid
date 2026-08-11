@@ -42,8 +42,9 @@ pub struct SearchParameters {
     pub centroid_score_threshold: Option<f32>,
     /// Score residual candidates asymmetrically — int8 query × int8 LUT over
     /// the stored codes plus the centroid term from the IVF probe matrix —
-    /// instead of decompress→f32 MaxSim. Compute-only: same index, same
-    /// storage, so the two modes can be A/B'd per search. Honored on both
+    /// instead of decompress→f32 MaxSim. New indexes memory-map a per-token
+    /// inverse-norm sidecar; legacy indexes compute those norms for shortlisted
+    /// documents. The two modes can still be A/B'd per search. Honored on both
     /// the dense and batched-centroid search paths (the batched path packs
     /// its sparse centroid scores into a compact matrix); ignored for
     /// binary indexes and for dims the fused kernels don't support
@@ -259,6 +260,18 @@ fn exact_doc_score(
             let end = index.doc_offsets[doc_id + 1];
             let packed = index.mmap_residuals.slice_rows(start, end);
             let codes = index.mmap_codes.slice(start, end);
+            if let Some(inv_norms) = index.inv_norms_slice(start, end) {
+                return Some(crate::residual_lut::maxsim_residual_lut_i8(
+                    q8,
+                    planes.as_ref(),
+                    &packed,
+                    &codes,
+                    &cdot_t.view(),
+                    lut,
+                    inv_norms,
+                    index.codec.embedding_dim(),
+                ));
+            }
             INV_NORM_SCRATCH.with(|scratch| {
                 let mut inv_norms = scratch.borrow_mut();
                 crate::residual_lut::compute_inv_norms_into(
@@ -315,6 +328,18 @@ fn exact_doc_score_asym_compact(
             "shortlist code {c} missing from centroid union"
         );
         remapped.push(*remap.get(c)?);
+    }
+    if let Some(inv_norms) = index.inv_norms_slice(start, end) {
+        return Some(crate::residual_lut::maxsim_residual_lut_i8(
+            q8,
+            planes,
+            &packed,
+            &remapped,
+            &compact_cd_t.view(),
+            lut,
+            inv_norms,
+            index.codec.embedding_dim(),
+        ));
     }
     INV_NORM_SCRATCH.with(|scratch| {
         let mut inv_norms = scratch.borrow_mut();

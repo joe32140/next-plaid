@@ -14,6 +14,35 @@ use crate::error::{Error, Result};
 use crate::kmeans::{compute_kmeans, ComputeKmeansConfig};
 use crate::utils::{atomic_write_file, quantile, quantiles};
 
+/// Persist one chunk's inverse reconstruction norms next to its compressed
+/// data. Search merges and memory-maps these optional files; legacy indexes
+/// without them retain the on-demand compatibility path.
+fn write_inv_norms_chunk(
+    index_dir: &Path,
+    chunk_idx: usize,
+    codec: &ResidualCodec,
+    codes: &Array1<i64>,
+    residuals: &Array2<u8>,
+) -> Result<()> {
+    use ndarray_npy::WriteNpyExt;
+
+    let codes = codes
+        .as_slice()
+        .ok_or_else(|| Error::IndexCreation("inverse norm codes must be contiguous".to_string()))?;
+    let inv_norms = crate::residual_lut::compute_inv_norms(codec, codes, &residuals.view())
+        .ok_or_else(|| {
+            Error::IndexCreation("residual codec is missing inverse norm tables".to_string())
+        })?;
+    let inv_norms = Array1::from_vec(inv_norms);
+    atomic_write_file(
+        &index_dir.join(format!("{}.inv_norms.npy", chunk_idx)),
+        |file| {
+            inv_norms.write_npy(file)?;
+            Ok(())
+        },
+    )
+}
+
 /// CPU implementation of fused compress_into_codes + residual computation.
 fn compress_and_residuals_cpu(
     embeddings: &Array2<f32>,
@@ -503,6 +532,15 @@ pub fn write_index_from_encoded_chunks(
                 Ok(())
             },
         )?;
+        if !config.binary {
+            write_inv_norms_chunk(
+                index_dir,
+                chunk_idx,
+                &codec_artifacts.codec,
+                &chunk.codes,
+                &chunk.residuals,
+            )?;
+        }
 
         doc_lengths.extend_from_slice(&chunk.doclens);
         all_codes.extend(chunk.codes.iter().map(|&x| x as usize));
@@ -871,6 +909,15 @@ pub fn create_index_files(
             batch_packed.write_npy(file)?;
             Ok(())
         })?;
+        if !config.binary {
+            write_inv_norms_chunk(
+                index_dir,
+                chunk_idx,
+                &codec,
+                &chunk_codes_arr,
+                &batch_packed,
+            )?;
+        }
     }
 
     // Update chunk metadata with global offsets
@@ -1062,6 +1109,9 @@ pub struct MmapIndex {
     pub mmap_codes: crate::mmap::MmapNpyArray1I64,
     /// Memory-mapped residuals array (public for search access)
     pub mmap_residuals: crate::mmap::MmapNpyArray2U8,
+    /// Optional memory-mapped inverse reconstruction norms. Absent for binary
+    /// and legacy residual indexes.
+    pub(crate) mmap_inv_norms: Option<crate::mmap::MmapNpyArray1F32>,
 }
 
 impl MmapIndex {
@@ -1167,11 +1217,29 @@ impl MmapIndex {
             crate::mmap::merge_codes_chunks(index_dir, metadata.num_chunks, padding_needed)?;
         let merged_residuals_path =
             crate::mmap::merge_residuals_chunks(index_dir, metadata.num_chunks, padding_needed)?;
+        let merged_inv_norms_path = if metadata.binary {
+            None
+        } else {
+            crate::mmap::merge_inv_norm_chunks(index_dir, metadata.num_chunks, padding_needed)?
+        };
 
         let (mmap_codes, mmap_residuals) = (
             crate::mmap::MmapNpyArray1I64::from_npy_file(&merged_codes_path)?,
             crate::mmap::MmapNpyArray2U8::from_npy_file(&merged_residuals_path)?,
         );
+        let mmap_inv_norms = merged_inv_norms_path
+            .as_deref()
+            .map(crate::mmap::MmapNpyArray1F32::from_npy_file)
+            .transpose()?;
+        if let Some(inv_norms) = mmap_inv_norms.as_ref() {
+            if inv_norms.len() != mmap_codes.len() {
+                return Err(Error::IndexLoad(format!(
+                    "inverse norm row count {} does not match codes row count {}",
+                    inv_norms.len(),
+                    mmap_codes.len()
+                )));
+            }
+        }
 
         Ok(Self {
             path: index_path.to_string(),
@@ -1184,7 +1252,16 @@ impl MmapIndex {
             doc_offsets,
             mmap_codes,
             mmap_residuals,
+            mmap_inv_norms,
         })
+    }
+
+    /// Borrow precomputed inverse norms when the index contains the optional
+    /// sidecar. Legacy indexes return `None` and search computes them lazily.
+    pub(crate) fn inv_norms_slice(&self, start: usize, end: usize) -> Option<&[f32]> {
+        self.mmap_inv_norms
+            .as_ref()
+            .map(|inv_norms| inv_norms.slice(start, end))
     }
 
     /// Get candidate documents from IVF for given centroid indices.
@@ -1398,6 +1475,7 @@ impl MmapIndex {
     fn release_mmaps(&mut self) {
         self.mmap_codes = crate::mmap::MmapNpyArray1I64::empty();
         self.mmap_residuals = crate::mmap::MmapNpyArray2U8::empty();
+        self.mmap_inv_norms = None;
         self.codec.centroids = crate::codec::CentroidStore::Owned(Array2::zeros((0, 0)));
     }
 
@@ -2150,5 +2228,84 @@ mod tests {
                 .expect("Failed to update index");
         assert_eq!(index2.metadata.num_documents, 8);
         assert_eq!(doc_ids2, vec![5, 6, 7]);
+        assert!(index2.mmap_inv_norms.is_some());
+        assert_eq!(
+            index2.mmap_inv_norms.as_ref().unwrap().len(),
+            index2.mmap_codes.len()
+        );
+    }
+
+    #[test]
+    fn test_inv_norm_sidecar_and_legacy_fallback_match() {
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let index_path = temp_dir.path().to_str().unwrap();
+        let mut embeddings = Vec::new();
+        for i in 0..6 {
+            let mut doc = Array2::<f32>::zeros((4 + i % 3, 32));
+            for ((token, dim), value) in doc.indexed_iter_mut() {
+                *value =
+                    0.02 * (i + 1) as f32 + 0.003 * (token + 1) as f32 + 0.0007 * (dim + 1) as f32;
+            }
+            for mut row in doc.rows_mut() {
+                let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+                row.iter_mut().for_each(|x| *x /= norm);
+            }
+            embeddings.push(doc);
+        }
+
+        let config = IndexConfig {
+            nbits: 2,
+            batch_size: 3,
+            seed: Some(7),
+            kmeans_niters: 2,
+            max_points_per_centroid: 256,
+            ..Default::default()
+        };
+        let index = MmapIndex::create_with_kmeans(&embeddings, index_path, &config).unwrap();
+        assert!(index.mmap_inv_norms.is_some());
+        for chunk_idx in 0..index.metadata.num_chunks {
+            assert!(temp_dir
+                .path()
+                .join(format!("{}.inv_norms.npy", chunk_idx))
+                .exists());
+        }
+
+        let total_rows = *index.doc_offsets.last().unwrap();
+        let codes = index.mmap_codes.slice(0, total_rows);
+        let packed = index.mmap_residuals.slice_rows(0, total_rows);
+        let expected = crate::residual_lut::compute_inv_norms(&index.codec, &codes, &packed)
+            .expect("residual index has norm tables");
+        let stored = index.inv_norms_slice(0, total_rows).unwrap();
+        assert_eq!(stored.len(), expected.len());
+        for (&actual, &want) in stored.iter().zip(expected.iter()) {
+            assert!((actual - want).abs() <= 1e-6, "{actual} != {want}");
+        }
+
+        let params = crate::search::SearchParameters {
+            residual_asym: true,
+            n_full_scores: embeddings.len(),
+            n_ivf_probe: index.metadata.num_partitions,
+            centroid_score_threshold: None,
+            ..Default::default()
+        };
+        let with_sidecar = index.search(&embeddings[0], &params, None).unwrap();
+        let num_chunks = index.metadata.num_chunks;
+        drop(index);
+
+        for chunk_idx in 0..num_chunks {
+            std::fs::remove_file(temp_dir.path().join(format!("{}.inv_norms.npy", chunk_idx)))
+                .unwrap();
+        }
+        crate::mmap::clear_merged_files(temp_dir.path()).unwrap();
+        let legacy = MmapIndex::load(index_path).unwrap();
+        assert!(legacy.mmap_inv_norms.is_none());
+        let fallback = legacy.search(&embeddings[0], &params, None).unwrap();
+        assert_eq!(with_sidecar.passage_ids, fallback.passage_ids);
+        assert_eq!(with_sidecar.scores.len(), fallback.scores.len());
+        for (&actual, &want) in with_sidecar.scores.iter().zip(fallback.scores.iter()) {
+            assert!((actual - want).abs() <= 1e-6, "{actual} != {want}");
+        }
     }
 }

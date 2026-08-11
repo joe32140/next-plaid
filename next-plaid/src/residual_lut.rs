@@ -17,14 +17,15 @@
 //! asymmetric path measures at < 0.002 NDCG@10 (3 ColBERT checkpoints × 3
 //! BEIR corpora × nbits 4/2/1, incl. long-query ArguAna).
 //!
-//! Storage is untouched: a residual index already persists codes, packed
-//! residuals, centroids and bucket weights. The path is selected per-search
-//! via [`crate::search::SearchParameters::residual_asym`] — the same index
-//! can be A/B'd with and without it.
+//! New residual indexes also persist one `f32` inverse reconstruction norm per
+//! token. Search memory-maps that sidecar, so it adds file-backed storage but
+//! no whole-index heap allocation. Legacy indexes without the sidecar remain
+//! supported and compute norms for shortlisted documents on demand. The path
+//! is selected per-search via
+//! [`crate::search::SearchParameters::residual_asym`].
 //!
 //! The float path L2-normalizes each decompressed token; this path applies
-//! the identical normalization via per-shortlisted-document
-//! `1/||recon||` values (`compute_inv_norms_into`) — measured as
+//! the identical normalization via `1/||recon||` values — measured as
 //! load-bearing (skipping it costs up to 0.17 NDCG@10 at nbits=1). The one
 //! remaining delta vs the float path is int8 quantization of the residual
 //! term (measured ≈ 0.001 NDCG@10).
@@ -173,10 +174,11 @@ pub fn build_query_planes(q8: &QueryI8, lut: &ResidualLut, dim: usize) -> QueryP
 /// reconstructed token (computed with the f32 bucket weights, so it
 /// normalizes by the same quantity the float path does).
 ///
-/// This is derived only for shortlisted documents. Without it the asymmetric
-/// path scores un-normalized reconstructions, whose per-token norm spread
-/// MaxSim's argmax amplifies (measured: up to -0.17 NDCG@10 at nbits=1 on
-/// long-query corpora).
+/// Index creation uses this for the mmap sidecar. Legacy indexes call the
+/// reusable-buffer variant below only for shortlisted documents. Without the
+/// normalization the asymmetric path scores un-normalized reconstructions,
+/// whose per-token norm spread MaxSim's argmax amplifies (measured: up to
+/// -0.17 NDCG@10 at nbits=1 on long-query corpora).
 pub fn compute_inv_norms(
     codec: &ResidualCodec,
     codes: &[i64],

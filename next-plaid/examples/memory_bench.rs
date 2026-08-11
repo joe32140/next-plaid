@@ -1,4 +1,4 @@
-//! Cross-version peak-RSS and latency driver for the PR #170 search path.
+//! Cross-version peak-RSS and latency driver for search-path comparisons.
 //!
 //! The driver intentionally keeps measurement policy out of the process:
 //! CI launches it under the platform's `/usr/bin/time` so every variant is a

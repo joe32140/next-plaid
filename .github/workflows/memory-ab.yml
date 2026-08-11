@@ -1,10 +1,9 @@
 name: memory-ab
 
-# Peak-RSS and latency matrix for upstream v1.6.5, PR #170, and the zero-copy
-# mmap fix. Each measurement is a fresh process over the same mmap index.
-# Batch sizes also set
-# RAYON_NUM_THREADS so the larger cells expose per-query transpose
-# amplification that a sequential benchmark cannot show. Queries use the
+# Peak-RSS and latency matrix for upstream v1.6.5 float scoring, PR #169,
+# and its bounded inverse-norm candidate. Each measurement is a fresh process
+# over the same mmap index. Batch sizes also set RAYON_NUM_THREADS so the
+# larger cells expose per-query f32-transpose amplification. Queries use the
 # 128-token production shape documented in PR #26.
 
 on:
@@ -56,17 +55,17 @@ jobs:
           path: baseline
       - uses: actions/checkout@v4
         with:
-          ref: b44b7af6b82d5e73c93af0ed6382450cbab99583
-          path: pr170
+          ref: c68fd1a1d02bff6e323e8a37d61aa09406861900
+          path: pr169
       - uses: actions/checkout@v4
         with:
-          ref: 45f1434dac366f9478e1d85ae73e06dfa39cb1cc
+          ref: 6b2c5587f505bc73a111bbd6001c830c669bfb41
           path: fix
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: graft identical memory driver into every ref
         run: |
-          for tree in baseline pr170 fix; do
+          for tree in baseline pr169 fix; do
             mkdir -p "$tree/next-plaid/examples"
             cp next-plaid/examples/memory_bench.rs \
               "$tree/next-plaid/examples/memory_bench.rs"
@@ -74,7 +73,7 @@ jobs:
       - name: build all variants
         run: |
           mkdir -p memory-bin
-          for tree in baseline pr170 fix; do
+          for tree in baseline pr169 fix; do
             CARGO_TARGET_DIR=target-memory cargo build --release \
               --manifest-path "$tree/Cargo.toml" \
               --example memory_bench -p next-plaid
@@ -93,7 +92,7 @@ jobs:
           results="memory-${RUNNER_OS}-${RUNNER_ARCH}.tsv"
           printf 'runner\tarch\tvariant\tbatch\trss_kib\trss_mib\tbatch_mean_ms\tquery_mean_ms\tqps\ttokens\tcentroids\tpersistent_cache_mib\ttransient_extra_mib\ttranspose_f32_mib\ttranspose_q8_mib\n' > "$results"
 
-          for variant in baseline pr170 fix; do
+          for variant in baseline pr169 fix; do
             case "$variant" in
               baseline)
                 binary=memory-bin/baseline
@@ -101,17 +100,17 @@ jobs:
                 cache_bytes_per_token=0
                 transient_mode=none
                 ;;
-              pr170)
-                binary=memory-bin/pr170
-                params='{}'
+              pr169)
+                binary=memory-bin/pr169
+                params='{"residual_asym":true}'
                 cache_bytes_per_token=4
-                transient_mode=q8
+                transient_mode=f32
                 ;;
               fix)
                 binary=memory-bin/fix
-                params='{}'
+                params='{"residual_asym":true}'
                 cache_bytes_per_token=0
-                transient_mode=q8
+                transient_mode=f32
                 ;;
             esac
 

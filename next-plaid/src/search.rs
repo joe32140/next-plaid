@@ -124,6 +124,14 @@ enum ScoreQuery<'a> {
     },
 }
 
+// Inverse norms are needed only for documents that survive to exact scoring.
+// Reuse one document-sized buffer per worker instead of retaining a
+// four-byte-per-index-token cache for the lifetime of the index.
+thread_local! {
+    static INV_NORM_SCRATCH: std::cell::RefCell<Vec<f32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// What a `residual_asym` request actually resolved to for this index/CPU.
 #[derive(Clone, Copy)]
 enum AsymDispatch {
@@ -252,21 +260,29 @@ fn exact_doc_score(
             // kernels' centroid-major [K, nq] layout; prepare_score_query
             // never builds this arm on paths without it.
             let cdot_t = cdot_t?;
-            let inv_norms = index.residual_inv_norms()?;
             let start = index.doc_offsets[doc_id];
             let end = index.doc_offsets[doc_id + 1];
             let packed = index.mmap_residuals.slice_rows(start, end);
             let codes = index.mmap_codes.slice(start, end);
-            Some(crate::residual_lut::maxsim_residual_lut_i8(
-                q8,
-                planes.as_ref(),
-                &packed,
-                &codes,
-                &cdot_t.view(),
-                lut,
-                &inv_norms[start..end],
-                index.codec.embedding_dim(),
-            ))
+            INV_NORM_SCRATCH.with(|scratch| {
+                let mut inv_norms = scratch.borrow_mut();
+                crate::residual_lut::compute_inv_norms_into(
+                    &index.codec,
+                    &codes,
+                    &packed,
+                    &mut inv_norms,
+                )?;
+                Some(crate::residual_lut::maxsim_residual_lut_i8(
+                    q8,
+                    planes.as_ref(),
+                    &packed,
+                    &codes,
+                    &cdot_t.view(),
+                    lut,
+                    &inv_norms,
+                    index.codec.embedding_dim(),
+                ))
+            })
         }
     }
 }
@@ -291,7 +307,6 @@ fn exact_doc_score_asym_compact(
     remap: &HashMap<i64, i64>,
     doc_id: usize,
 ) -> Option<f32> {
-    let inv_norms = index.residual_inv_norms()?;
     let start = index.doc_offsets[doc_id];
     let end = index.doc_offsets[doc_id + 1];
     let packed = index.mmap_residuals.slice_rows(start, end);
@@ -306,16 +321,20 @@ fn exact_doc_score_asym_compact(
         );
         remapped.push(*remap.get(c)?);
     }
-    Some(crate::residual_lut::maxsim_residual_lut_i8(
-        q8,
-        planes,
-        &packed,
-        &remapped,
-        &compact_cd_t.view(),
-        lut,
-        &inv_norms[start..end],
-        index.codec.embedding_dim(),
-    ))
+    INV_NORM_SCRATCH.with(|scratch| {
+        let mut inv_norms = scratch.borrow_mut();
+        crate::residual_lut::compute_inv_norms_into(&index.codec, &codes, &packed, &mut inv_norms)?;
+        Some(crate::residual_lut::maxsim_residual_lut_i8(
+            q8,
+            planes,
+            &packed,
+            &remapped,
+            &compact_cd_t.view(),
+            lut,
+            &inv_norms,
+            index.codec.embedding_dim(),
+        ))
+    })
 }
 
 /// Transpose stage-1's `[nq, K]` centroid scores into the kernels'
@@ -616,8 +635,6 @@ pub fn search_one_mmap(
     // Chunked processing limits concurrent memory from parallel decompression.
     let exact_query = prepare_score_query(index, query, params.residual_asym);
     let cdot_t = if matches!(&exact_query, ScoreQuery::ResidualLut { .. }) {
-        // Build the per-token norm cache once, outside the parallel loop.
-        let _ = index.residual_inv_norms();
         // One transpose pass per query: stage-1 needs [nq, K] row-major for
         // per-token probing, the exact kernels want centroid-major [K, nq]
         // so a token's scores across query rows are one contiguous strip
@@ -905,8 +922,6 @@ fn search_one_mmap_batched(
     // feeds the same fused kernels the dense path uses.
     let exact_query = prepare_score_query(index, query, params.residual_asym);
     let asym_compact = if matches!(&exact_query, ScoreQuery::ResidualLut { .. }) {
-        // Build the per-token norm cache once, outside the parallel loop.
-        let _ = index.residual_inv_norms();
         let mut ids: Vec<usize> = sparse_scores.keys().copied().collect();
         ids.sort_unstable();
         let remap: HashMap<i64, i64> = ids

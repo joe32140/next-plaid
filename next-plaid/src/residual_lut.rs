@@ -23,13 +23,13 @@
 //! can be A/B'd with and without it.
 //!
 //! The float path L2-normalizes each decompressed token; this path applies
-//! the identical normalization via a cached per-token `1/||recon||`
-//! ([`compute_inv_norms`]) — measured as load-bearing (skipping it costs up
-//! to 0.17 NDCG@10 at nbits=1). The one remaining delta vs the float path is
-//! int8 quantization of the residual term (measured ≈ 0.001 NDCG@10).
+//! the identical normalization via per-shortlisted-document
+//! `1/||recon||` values (`compute_inv_norms_into`) — measured as
+//! load-bearing (skipping it costs up to 0.17 NDCG@10 at nbits=1). The one
+//! remaining delta vs the float path is int8 quantization of the residual
+//! term (measured ≈ 0.001 NDCG@10).
 
 use ndarray::{ArrayView2, Axis};
-use rayon::prelude::*;
 
 use crate::binary::QueryI8;
 use crate::codec::ResidualCodec;
@@ -168,68 +168,58 @@ pub fn build_query_planes(q8: &QueryI8, lut: &ResidualLut, dim: usize) -> QueryP
     QueryPlanes { data, stride, sqw }
 }
 
-/// Per-token `1 / ||centroid + dequantized residual||` for a whole index —
+/// Per-token `1 / ||centroid + dequantized residual||` for a document —
 /// the exact normalization [`ResidualCodec::decompress`] applies to every
 /// reconstructed token (computed with the f32 bucket weights, so it
 /// normalizes by the same quantity the float path does).
 ///
-/// This is *derived* data: recomputable from the stored codes at any time,
-/// cached once per index by `MmapIndex::residual_inv_norms`. Without it the
-/// asymmetric path scores un-normalized reconstructions, whose per-token
-/// norm spread MaxSim's argmax amplifies (measured: up to -0.17 NDCG@10 at
-/// nbits=1 on long-query corpora).
+/// This is derived only for shortlisted documents. Without it the asymmetric
+/// path scores un-normalized reconstructions, whose per-token norm spread
+/// MaxSim's argmax amplifies (measured: up to -0.17 NDCG@10 at nbits=1 on
+/// long-query corpora).
 pub fn compute_inv_norms(
     codec: &ResidualCodec,
     codes: &[i64],
     packed: &ArrayView2<u8>,
 ) -> Option<Vec<f32>> {
-    compute_inv_norms_with(codec, codes.len(), |t| codes[t], packed)
+    let mut out = Vec::with_capacity(codes.len());
+    compute_inv_norms_into(codec, codes, packed, &mut out)?;
+    Some(out)
 }
 
-/// Mmap-backed variant used by the index cache initializer. Reading each code
-/// through `get` avoids first materializing an 8-byte-per-token `Vec<i64>`
-/// alongside the retained 4-byte-per-token inverse-norm cache.
-pub(crate) fn compute_inv_norms_mmap(
+/// Fill a reusable inverse-norm buffer for one shortlisted document.
+/// Sequential evaluation avoids nested Rayon overhead at document lengths;
+/// document-level scoring already runs across the Rayon pool.
+pub(crate) fn compute_inv_norms_into(
     codec: &ResidualCodec,
-    codes: &crate::mmap::MmapNpyArray1I64,
-    len: usize,
+    codes: &[i64],
     packed: &ArrayView2<u8>,
-) -> Option<Vec<f32>> {
-    assert!(len <= codes.len(), "code prefix exceeds mmap length");
-    compute_inv_norms_with(codec, len, |t| codes.get(t), packed)
-}
-
-fn compute_inv_norms_with(
-    codec: &ResidualCodec,
-    len: usize,
-    code_at: impl Fn(usize) -> i64 + Sync,
-    packed: &ArrayView2<u8>,
-) -> Option<Vec<f32>> {
+    out: &mut Vec<f32>,
+) -> Option<()> {
     let weights = codec.bucket_weights.as_ref()?;
     let lookup = codec.bucket_weight_indices_lookup.as_ref()?;
     let dim = codec.embedding_dim();
-    Some(
-        (0..len)
-            .into_par_iter()
-            .map(|t| {
-                let centroid = codec.centroids.row(code_at(t) as usize);
-                let mut sq = 0.0f32;
-                let mut d = 0usize;
-                'row: for &byte in packed.row(t).iter() {
-                    let reversed = codec.byte_reversed_bits_map[byte as usize] as usize;
-                    for &bi in lookup.row(reversed).iter() {
-                        if d == dim {
-                            break 'row;
-                        }
-                        let v = centroid[d] + weights[bi];
-                        sq += v * v;
-                        d += 1;
-                    }
+    assert_eq!(codes.len(), packed.nrows());
+    out.clear();
+    out.reserve(codes.len());
+    for (t, &code) in codes.iter().enumerate() {
+        let centroid = codec.centroids.row(code as usize);
+        let mut sq = 0.0f32;
+        let mut d = 0usize;
+        'row: for &byte in packed.row(t).iter() {
+            let reversed = codec.byte_reversed_bits_map[byte as usize] as usize;
+            for &bi in lookup.row(reversed).iter() {
+                if d == dim {
+                    break 'row;
                 }
-                1.0 / sq.sqrt().max(1e-12)
-            })
-            .collect(),
-    )
+                let v = centroid[d] + weights[bi];
+                sq += v * v;
+                d += 1;
+            }
+        }
+        out.push(1.0 / sq.sqrt().max(1e-12));
+    }
+    Some(())
 }
 
 /// MaxSim of an int8 query against one document's stored residual codes.

@@ -233,15 +233,10 @@ fn batched_path_asym_matches_dense_path() {
 
 /// The parallel batch path must not deadlock on a **cold** index.
 ///
-/// `search_many_mmap(parallel = true)` fans queries across rayon workers, and
-/// with `residual_asym` on, every one of them races into the lazily-built
-/// inverse-norm cache at once. An initializer that blocks the calling worker
-/// in any way that leaves the outer pool free to schedule onto it — a
-/// global-pool `par_iter`, or `ThreadPool::install`, which keeps the caller
-/// available for its own pool's stealing while it waits — self-deadlocks:
-/// the worker steals a sibling query, that query re-enters the initializer on
-/// the same thread, and nothing ever completes. This is the first-request
-/// shape of a batch-serving deployment, so it must hold from cold.
+/// `search_many_mmap(parallel = true)` fans queries across Rayon workers.
+/// Parallel first use must remain deadlock-free while every worker computes
+/// document-local inverse norms and enters nested document-level scoring.
+/// This is the first-request shape of a batch-serving deployment.
 ///
 /// The watchdog exists because the failure mode is a hang, not a panic: it
 /// turns a stalled CI job into a fast, unambiguous failure.
@@ -279,8 +274,8 @@ fn parallel_batch_on_cold_index_does_not_deadlock() {
         });
     }
 
-    // Cold: no search has run, so the inverse-norm cache is unbuilt and every
-    // worker will reach for it simultaneously.
+    // Cold: no search has run, so all workers reach the document-local
+    // normalization path simultaneously.
     let queries: Vec<Array2<f32>> = docs.iter().take(128).cloned().collect();
     let results =
         next_plaid::search::search_many_mmap(&index, &queries, &params(true), true, None).unwrap();

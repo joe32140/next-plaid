@@ -1,7 +1,8 @@
 name: memory-ab
 
-# Peak-RSS matrix for upstream v1.6.5 versus PR #170. Each measurement is a
-# fresh process over the same mmap index. Batch sizes also set
+# Peak-RSS and latency matrix for upstream v1.6.5, PR #170, and the zero-copy
+# mmap fix. Each measurement is a fresh process over the same mmap index.
+# Batch sizes also set
 # RAYON_NUM_THREADS so the larger cells expose per-query transpose
 # amplification that a sequential benchmark cannot show. Queries use the
 # 128-token production shape documented in PR #26.
@@ -57,11 +58,15 @@ jobs:
         with:
           ref: b44b7af6b82d5e73c93af0ed6382450cbab99583
           path: pr170
+      - uses: actions/checkout@v4
+        with:
+          ref: 45f1434dac366f9478e1d85ae73e06dfa39cb1cc
+          path: fix
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: graft identical memory driver into every ref
         run: |
-          for tree in baseline pr170; do
+          for tree in baseline pr170 fix; do
             mkdir -p "$tree/next-plaid/examples"
             cp next-plaid/examples/memory_bench.rs \
               "$tree/next-plaid/examples/memory_bench.rs"
@@ -69,7 +74,7 @@ jobs:
       - name: build all variants
         run: |
           mkdir -p memory-bin
-          for tree in baseline pr170; do
+          for tree in baseline pr170 fix; do
             CARGO_TARGET_DIR=target-memory cargo build --release \
               --manifest-path "$tree/Cargo.toml" \
               --example memory_bench -p next-plaid
@@ -86,9 +91,9 @@ jobs:
           index=memory-index
           lens=next-plaid/examples/shapes/scifact/query_lens.npy
           results="memory-${RUNNER_OS}-${RUNNER_ARCH}.tsv"
-          printf 'runner\tarch\tvariant\tbatch\trss_kib\trss_mib\ttokens\tcentroids\tpersistent_cache_mib\ttransient_extra_mib\ttranspose_f32_mib\ttranspose_q8_mib\n' > "$results"
+          printf 'runner\tarch\tvariant\tbatch\trss_kib\trss_mib\tbatch_mean_ms\tquery_mean_ms\tqps\ttokens\tcentroids\tpersistent_cache_mib\ttransient_extra_mib\ttranspose_f32_mib\ttranspose_q8_mib\n' > "$results"
 
-          for variant in baseline pr170; do
+          for variant in baseline pr170 fix; do
             case "$variant" in
               baseline)
                 binary=memory-bin/baseline
@@ -100,6 +105,12 @@ jobs:
                 binary=memory-bin/pr170
                 params='{}'
                 cache_bytes_per_token=4
+                transient_mode=q8
+                ;;
+              fix)
+                binary=memory-bin/fix
+                params='{}'
+                cache_bytes_per_token=0
                 transient_mode=q8
                 ;;
             esac
@@ -122,14 +133,18 @@ jobs:
               centroids=$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^centroids=/) {split($i,a,"="); print a[2]}}' <<<"$bench_out")
               transpose_f32_bytes=$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^transpose_f32_bytes=/) {split($i,a,"="); print a[2]}}' <<<"$bench_out")
               transpose_q8_bytes=$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^transpose_q8_bytes=/) {split($i,a,"="); print a[2]}}' <<<"$bench_out")
+              batch_mean_ms=$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^batch_mean_ms=/) {split($i,a,"="); print a[2]}}' <<<"$bench_out")
+              query_mean_ms=$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^query_mean_ms=/) {split($i,a,"="); print a[2]}}' <<<"$bench_out")
+              qps=$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^qps=/) {split($i,a,"="); print a[2]}}' <<<"$bench_out")
 
               awk -v runner="$RUNNER_OS" -v arch="$RUNNER_ARCH" \
                 -v variant="$variant" -v batch="$batch" -v rss="$rss_kib" \
+                -v batch_ms="$batch_mean_ms" -v query_ms="$query_mean_ms" -v qps="$qps" \
                 -v tokens="$tokens" -v centroids="$centroids" \
                 -v cache_bpt="$cache_bytes_per_token" \
                 -v transient_mode="$transient_mode" \
                 -v t32="$transpose_f32_bytes" -v tq8="$transpose_q8_bytes" \
-                'BEGIN {extra=(transient_mode=="f32" ? t32 : (transient_mode=="q8" ? tq8 : (transient_mode=="both" ? t32+tq8 : 0))); printf "%s\t%s\t%s\t%d\t%d\t%.2f\t%d\t%d\t%.2f\t%.2f\t%.2f\t%.2f\n", runner, arch, variant, batch, rss, rss/1024, tokens, centroids, tokens*cache_bpt/1048576, extra/1048576, t32/1048576, tq8/1048576}' \
+                'BEGIN {extra=(transient_mode=="f32" ? t32 : (transient_mode=="q8" ? tq8 : (transient_mode=="both" ? t32+tq8 : 0))); printf "%s\t%s\t%s\t%d\t%d\t%.2f\t%.3f\t%.3f\t%.3f\t%d\t%d\t%.2f\t%.2f\t%.2f\t%.2f\n", runner, arch, variant, batch, rss, rss/1024, batch_ms, query_ms, qps, tokens, centroids, tokens*cache_bpt/1048576, extra/1048576, t32/1048576, tq8/1048576}' \
                 >> "$results"
               rm -f "$timing"
             done
@@ -137,7 +152,7 @@ jobs:
 
           cat "$results"
           {
-            echo '### Peak RSS memory A/B'
+            echo '### Peak RSS and latency A/B/fix'
             echo
             echo '```tsv'
             cat "$results"

@@ -1,10 +1,11 @@
-//! Cross-version peak-RSS driver for the PR #169/#170 search paths.
+//! Cross-version peak-RSS and latency driver for the PR #170 search path.
 //!
 //! The driver intentionally keeps measurement policy out of the process:
 //! CI launches it under the platform's `/usr/bin/time` so every variant is a
 //! fresh process and reports OS-observed peak RSS. One sequential query warms
 //! mmap pages and lazy index caches, then the requested number of queries run
-//! concurrently through the public batch API.
+//! concurrently through the public batch API. The warm-up is excluded from
+//! latency, while the process peak still includes every retained allocation.
 //!
 //! usage: memory_bench <index_dir> <query_lens.npy> [params_json] [batch] [query_rows]
 
@@ -90,8 +91,11 @@ fn main() {
     std::hint::black_box(warm.passage_ids.len());
 
     // Repeat to make the concurrent allocation window long enough for OS peak
-    // accounting without retaining the result vectors between repetitions.
-    for _ in 0..3 {
+    // accounting and to average scheduler noise without retaining result
+    // vectors between repetitions.
+    const REPEATS: usize = 5;
+    let started = std::time::Instant::now();
+    for _ in 0..REPEATS {
         let results =
             search_many_mmap(&index, &queries, &params, true, None).expect("parallel batch search");
         std::hint::black_box(
@@ -101,6 +105,10 @@ fn main() {
                 .sum::<usize>(),
         );
     }
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+    let batch_mean_ms = elapsed_ms / REPEATS as f64;
+    let query_mean_ms = elapsed_ms / (REPEATS * batch) as f64;
+    let qps = (REPEATS * batch) as f64 / (elapsed_ms / 1e3);
 
     let tokens = index.doc_offsets.last().copied().unwrap_or(0);
     let centroids = index.num_partitions();
@@ -116,6 +124,8 @@ fn main() {
     println!(
         "MEMBENCH index={index_dir} params={params_json} batch={batch} tokens={tokens} \
          centroids={centroids} query_rows={query_rows} cdot_f32_bytes={cdot_f32_bytes} \
-         transpose_f32_bytes={transpose_f32_bytes} transpose_q8_bytes={transpose_q8_bytes}"
+         transpose_f32_bytes={transpose_f32_bytes} transpose_q8_bytes={transpose_q8_bytes} \
+         repeats={REPEATS} elapsed_ms={elapsed_ms:.3} batch_mean_ms={batch_mean_ms:.3} \
+         query_mean_ms={query_mean_ms:.3} qps={qps:.3}"
     );
 }

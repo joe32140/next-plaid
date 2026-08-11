@@ -1272,11 +1272,18 @@ fn get_mtime(path: &Path) -> Result<f64> {
 /// Build the NPY header dict string and compute the total header size (magic + version + len + padded dict).
 fn npy_header_layout(header_dict: &str) -> (usize, usize) {
     let header_len = header_dict.len();
-    // The trailing newline is part of the NPY header. Include it in the
-    // padding calculation so numeric payloads start at a naturally aligned
-    // offset (and the complete preamble remains a multiple of 64 bytes).
-    let padding = (64 - ((10 + header_len + 1) % 64)) % 64;
+    let padding = (64 - ((10 + header_len) % 64)) % 64;
     let total = 10 + header_len + padding + 1; // +1 for the trailing newline
+    (padding, total)
+}
+
+/// Header layout whose data payload is 64-byte aligned. Existing merged
+/// codes/residual files intentionally keep their historical byte layout;
+/// only zero-copy numeric sidecars use this corrected alignment.
+fn aligned_npy_header_layout(header_dict: &str) -> (usize, usize) {
+    let header_len = header_dict.len();
+    let padding = (64 - ((10 + header_len + 1) % 64)) % 64;
+    let total = 10 + header_len + padding + 1;
     (padding, total)
 }
 
@@ -1300,6 +1307,11 @@ fn npy_header_size_1d(len: usize, dtype: &str) -> usize {
     npy_header_layout(&dict).1
 }
 
+fn aligned_npy_header_size_1d(len: usize, dtype: &str) -> usize {
+    let dict = npy_header_dict_1d(len, dtype);
+    aligned_npy_header_layout(&dict).1
+}
+
 /// Compute the NPY header size for a 2D array (without writing).
 fn npy_header_size_2d(nrows: usize, ncols: usize, dtype: &str) -> usize {
     let dict = npy_header_dict_2d(nrows, ncols, dtype);
@@ -1309,6 +1321,21 @@ fn npy_header_size_2d(nrows: usize, ncols: usize, dtype: &str) -> usize {
 /// Write an NPY header (shared implementation for 1D and 2D).
 fn write_npy_header(writer: &mut impl Write, header_dict: &str) -> Result<usize> {
     let (padding, total) = npy_header_layout(header_dict);
+    write_npy_header_with_layout(writer, header_dict, padding, total)
+}
+
+fn write_aligned_npy_header_1d(writer: &mut impl Write, len: usize, dtype: &str) -> Result<usize> {
+    let header_dict = npy_header_dict_1d(len, dtype);
+    let (padding, total) = aligned_npy_header_layout(&header_dict);
+    write_npy_header_with_layout(writer, &header_dict, padding, total)
+}
+
+fn write_npy_header_with_layout(
+    writer: &mut impl Write,
+    header_dict: &str,
+    padding: usize,
+    total: usize,
+) -> Result<usize> {
     let padded_header = format!("{}{}\n", header_dict, " ".repeat(padding));
 
     // Write magic + version (v1.0)
@@ -1610,7 +1637,7 @@ pub fn merge_inv_norm_chunks(
             && merged_path.exists()
         {
             if let Ok(meta) = fs::metadata(&merged_path) {
-                let expected_size = npy_header_size_1d(manifest.total_rows, "<f4")
+                let expected_size = aligned_npy_header_size_1d(manifest.total_rows, "<f4")
                     + manifest.total_rows * std::mem::size_of::<f32>();
                 if meta.len() == expected_size as u64 {
                     return Ok(Some(merged_path));
@@ -1665,7 +1692,7 @@ pub fn merge_inv_norm_chunks(
             Error::IndexLoad(format!("Failed to create inverse norm temp file: {}", e))
         })?;
         let mut writer = BufWriter::new(file);
-        let header_size = write_npy_header_1d(&mut writer, final_rows, "<f4")?;
+        let header_size = write_aligned_npy_header_1d(&mut writer, final_rows, "<f4")?;
         let mut written_rows = 0usize;
         for chunk in &chunks {
             let arr: Array1<f32> = Array1::read_npy(File::open(&chunk.path)?)?;

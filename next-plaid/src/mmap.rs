@@ -1311,7 +1311,11 @@ fn write_npy_header(writer: &mut impl Write, header_dict: &str) -> Result<usize>
     write_npy_header_with_layout(writer, header_dict, padding, total)
 }
 
-fn write_aligned_npy_header_1d(writer: &mut impl Write, len: usize, dtype: &str) -> Result<usize> {
+pub(crate) fn write_aligned_npy_header_1d(
+    writer: &mut impl Write,
+    len: usize,
+    dtype: &str,
+) -> Result<usize> {
     let header_dict = npy_header_dict_1d(len, dtype);
     let (padding, total) = aligned_npy_header_layout(&header_dict);
     write_npy_header_with_layout(writer, &header_dict, padding, total)

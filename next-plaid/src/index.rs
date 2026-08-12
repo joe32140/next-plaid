@@ -43,6 +43,50 @@ fn write_inv_norms_chunk(
     )
 }
 
+/// Keep legacy-sidecar prewarm memory independent of the index's creation
+/// chunk size. At the default 128 dimensions and 4-bit residuals this touches
+/// about 4 MiB of residual payload plus small code/norm buffers per block.
+const INV_NORM_PREWARM_BLOCK_TOKENS: usize = 64 * 1024;
+
+fn write_inv_norms_chunk_from_mmap(
+    index_dir: &Path,
+    chunk_idx: usize,
+    codec: &ResidualCodec,
+    mmap_codes: &crate::mmap::MmapNpyArray1I64,
+    mmap_residuals: &crate::mmap::MmapNpyArray2U8,
+    chunk_start: usize,
+    chunk_end: usize,
+) -> Result<()> {
+    let chunk_len = chunk_end - chunk_start;
+    atomic_write_file(
+        &index_dir.join(format!("{}.inv_norms.npy", chunk_idx)),
+        |file| {
+            let mut writer = BufWriter::new(file);
+            crate::mmap::write_aligned_npy_header_1d(&mut writer, chunk_len, "<f4")?;
+            let mut inv_norms = Vec::with_capacity(INV_NORM_PREWARM_BLOCK_TOKENS);
+            for block_start in (chunk_start..chunk_end).step_by(INV_NORM_PREWARM_BLOCK_TOKENS) {
+                let block_end = (block_start + INV_NORM_PREWARM_BLOCK_TOKENS).min(chunk_end);
+                let codes = mmap_codes.slice(block_start, block_end);
+                let residuals = mmap_residuals.slice_rows(block_start, block_end);
+                crate::residual_lut::compute_inv_norms_into(
+                    codec,
+                    &codes,
+                    &residuals,
+                    &mut inv_norms,
+                )
+                .ok_or_else(|| {
+                    Error::IndexLoad("residual codec is missing inverse norm tables".into())
+                })?;
+                for &inv_norm in &inv_norms {
+                    writer.write_all(&inv_norm.to_le_bytes())?;
+                }
+            }
+            writer.flush()?;
+            Ok(())
+        },
+    )
+}
+
 /// CPU implementation of fused compress_into_codes + residual computation.
 fn compress_and_residuals_cpu(
     embeddings: &Array2<f32>,
@@ -1270,46 +1314,61 @@ impl MmapIndex {
     /// index.
     ///
     /// New indexes persist this data while indexing. For an older index this
-    /// method streams its existing code and residual chunks one at a time,
-    /// atomically writes the missing sidecar chunks, then maps the merged
-    /// result. No embeddings are required and no full-index heap allocation is
-    /// made. Call this during provisioning to avoid the legacy per-query norm
-    /// recomputation fallback on the first asymmetric residual search.
+    /// method streams its existing code and residual payload in fixed-size
+    /// token blocks, atomically writes the missing sidecar chunks, then maps
+    /// the merged result. No embeddings are required and no full-index or
+    /// full-chunk heap allocation is made. Call this during provisioning to
+    /// avoid the legacy per-query norm recomputation fallback on the first
+    /// asymmetric residual search.
     ///
     /// Returns `true` when a legacy index was upgraded, and `false` for binary
     /// indexes or indexes whose sidecar is already mapped.
     pub fn prewarm_residual_lut_sidecar(&mut self) -> Result<bool> {
-        use ndarray_npy::ReadNpyExt;
-
         if self.metadata.binary || self.mmap_inv_norms.is_some() {
             return Ok(false);
         }
 
         let index_dir = Path::new(&self.path);
+        let mut chunk_start = 0usize;
         for chunk_idx in 0..self.metadata.num_chunks {
-            let codes_path = index_dir.join(format!("{}.codes.npy", chunk_idx));
-            let codes: Array1<i64> = Array1::read_npy(File::open(&codes_path)?)?;
+            let chunk_metadata_path = index_dir.join(format!("{}.metadata.json", chunk_idx));
+            let chunk_metadata: ChunkMetadata =
+                serde_json::from_reader(BufReader::new(File::open(&chunk_metadata_path)?))?;
+            let chunk_end = chunk_start + chunk_metadata.num_embeddings;
+            if chunk_end > self.mmap_codes.len() || chunk_end > self.mmap_residuals.nrows() {
+                return Err(Error::IndexLoad(format!(
+                    "chunk {} extends past the merged code or residual mapping",
+                    chunk_idx
+                )));
+            }
             let inv_norms_path = index_dir.join(format!("{}.inv_norms.npy", chunk_idx));
             let sidecar_is_current = if inv_norms_path.exists() {
-                let existing: Array1<f32> = Array1::read_npy(File::open(&inv_norms_path)?)?;
-                existing.len() == codes.len()
+                crate::mmap::MmapNpyArray1F32::from_npy_file(&inv_norms_path)?.len()
+                    == chunk_metadata.num_embeddings
             } else {
                 false
             };
 
             if !sidecar_is_current {
-                let residuals_path = index_dir.join(format!("{}.residuals.npy", chunk_idx));
-                let residuals: Array2<u8> = Array2::read_npy(File::open(&residuals_path)?)?;
-                if residuals.nrows() != codes.len() {
-                    return Err(Error::IndexLoad(format!(
-                        "chunk {} has {} codes but {} residual rows",
-                        chunk_idx,
-                        codes.len(),
-                        residuals.nrows()
-                    )));
-                }
-                write_inv_norms_chunk(index_dir, chunk_idx, &self.codec, &codes, &residuals)?;
+                write_inv_norms_chunk_from_mmap(
+                    index_dir,
+                    chunk_idx,
+                    &self.codec,
+                    &self.mmap_codes,
+                    &self.mmap_residuals,
+                    chunk_start,
+                    chunk_end,
+                )?;
             }
+            chunk_start = chunk_end;
+        }
+
+        if chunk_start != *self.doc_offsets.last().unwrap_or(&0) {
+            return Err(Error::IndexLoad(format!(
+                "chunk metadata covers {} tokens but document offsets cover {}",
+                chunk_start,
+                self.doc_offsets.last().unwrap_or(&0)
+            )));
         }
 
         let max_len = self.doc_lengths.iter().copied().max().unwrap_or(0) as usize;

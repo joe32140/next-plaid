@@ -12,6 +12,7 @@ IMPORTANT: Uses pylate's tokenizer which adds [Q] and [D] as special tokens.
 The ONNX model will have extended embeddings to support these tokens.
 """
 
+import inspect
 import json
 from pathlib import Path
 from typing import Optional
@@ -31,10 +32,12 @@ def detect_model_architecture(pylate_model: pylate_models.ColBERT) -> dict:
     auto_model = pylate_model[0].auto_model
     model_class_name = auto_model.__class__.__name__
 
-    # Check if model uses token_type_ids
-    uses_token_type_ids = True
-    if "ModernBert" in model_class_name:
-        uses_token_type_ids = False
+    # Whether the tokenizer actually emits token_type_ids varies by model
+    # family (e.g. Llama/LFM2-style tokenizers never produce it), so ask the
+    # tokenizer directly rather than guessing from the architecture name.
+    tokenizer = pylate_model[0].tokenizer
+    probe = tokenizer("probe", return_tensors="pt")
+    uses_token_type_ids = "token_type_ids" in probe
 
     # Get hidden size and output dimension
     config = auto_model.config
@@ -73,6 +76,12 @@ class ColBERTForONNX(nn.Module):
 
         self.uses_token_type_ids = uses_token_type_ids
 
+        # Decoder-style backbones (e.g. LFM2) default use_cache=True from their
+        # config, which builds a KV cache and triggers data-dependent control
+        # flow (cache_position[0] > 0) that torch.export can't trace. We only
+        # ever run a single forward pass here, so force it off when supported.
+        self.supports_use_cache = "use_cache" in inspect.signature(self.bert.forward).parameters
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -84,16 +93,19 @@ class ColBERTForONNX(nn.Module):
         Returns per-token embeddings [batch_size, seq_len, embedding_dim].
         """
         # Get hidden states from transformer
+        extra_kwargs = {"use_cache": False} if self.supports_use_cache else {}
         if self.uses_token_type_ids and token_type_ids is not None:
             outputs = self.bert(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
+                **extra_kwargs,
             )
         else:
             outputs = self.bert(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                **extra_kwargs,
             )
         hidden_states = outputs.last_hidden_state
 
@@ -114,6 +126,7 @@ def export_model(
     quantize: bool = False,
     verbose: bool = True,
     force: bool = False,
+    trust_remote_code: bool = False,
 ) -> Path:
     """Export a ColBERT model from HuggingFace to ONNX format.
 
@@ -126,6 +139,8 @@ def export_model(
         quantize: Whether to also create an INT8 quantized version
         verbose: Whether to print progress messages
         force: Force re-export even if model already exists
+        trust_remote_code: Allow loading HF models that ship custom modeling code
+            (e.g. jinaai/jina-colbert-v2)
 
     Returns:
         Path to the output directory containing the exported model
@@ -171,10 +186,15 @@ def export_model(
     if verbose:
         print(f"Loading pylate model: {model_name}")
 
+    # Don't override do_query_expansion (or any other trained config): pylate
+    # defaults it from the model's own config_sentence_transformers.json, and
+    # that value gets baked into onnx_config.json for the Rust inference side
+    # to act on. Forcing it to False here would silently disable MASK-token
+    # query expansion for any model trained with it on (e.g. LFM2.5).
     pylate_model = pylate_models.ColBERT(
         model_name_or_path=model_name,
         device="cpu",
-        do_query_expansion=False,
+        trust_remote_code=trust_remote_code,
     )
 
     # Detect model architecture
@@ -188,6 +208,10 @@ def export_model(
 
     # Create ONNX wrapper using pylate's model
     model = ColBERTForONNX(pylate_model, uses_token_type_ids=arch_info["uses_token_type_ids"])
+    # Some checkpoints (e.g. LFM2) load in bfloat16 by default. ONNX Runtime's
+    # CPU EP doesn't support bfloat16 for several ops (e.g. Conv), so force
+    # fp32 before export regardless of the checkpoint's native dtype.
+    model = model.float()
     model.eval()
 
     # Use pylate's tokenizer (has [Q] and [D] as special tokens)
@@ -251,8 +275,12 @@ def export_model(
     if verbose:
         print(f"Saved ONNX config to: {onnx_config_output_path}")
 
-    # Create dummy inputs with reasonable dimensions
-    dummy_text = "[D] This is a sample text for ONNX export"
+    # Create dummy inputs with reasonable dimensions. Use batch_size=2 (not 1)
+    # so torch.export doesn't specialize the batch dim to a static size.
+    dummy_text = [
+        "[D] This is a sample text for ONNX export",
+        "[D] A second document to keep the batch dim genuinely dynamic",
+    ]
     inputs = tokenizer(
         dummy_text,
         return_tensors="pt",
@@ -261,7 +289,7 @@ def export_model(
         truncation=True,
     )
 
-    # Prepare inputs and dynamic axes based on architecture
+    # Prepare inputs based on architecture
     if arch_info["uses_token_type_ids"]:
         input_names = ["input_ids", "attention_mask", "token_type_ids"]
         example_inputs = (
@@ -269,20 +297,18 @@ def export_model(
             inputs["attention_mask"],
             inputs["token_type_ids"],
         )
-        dynamic_axes = {
-            "input_ids": {0: "batch_size", 1: "sequence_length"},
-            "attention_mask": {0: "batch_size", 1: "sequence_length"},
-            "token_type_ids": {0: "batch_size", 1: "sequence_length"},
-            "output": {0: "batch_size", 1: "sequence_length"},
-        }
     else:
         input_names = ["input_ids", "attention_mask"]
         example_inputs = (inputs["input_ids"], inputs["attention_mask"])
-        dynamic_axes = {
-            "input_ids": {0: "batch_size", 1: "sequence_length"},
-            "attention_mask": {0: "batch_size", 1: "sequence_length"},
-            "output": {0: "batch_size", 1: "sequence_length"},
-        }
+
+    # dynamic_axes is the legacy (dynamo=False) API and silently produces
+    # models with a statically-baked batch dimension under the current
+    # dynamo=True default exporter (e.g. LFM2's causal mask gets specialized
+    # to batch_size=1 and then fails at inference on any other batch size).
+    # dynamic_shapes is what the dynamo path actually respects.
+    from torch.export import Dim
+
+    dynamic_shapes = tuple({0: Dim.DYNAMIC, 1: Dim.DYNAMIC} for _ in example_inputs)
 
     # Export to ONNX
     if verbose:
@@ -295,7 +321,7 @@ def export_model(
             str(onnx_output_path),
             input_names=input_names,
             output_names=["output"],
-            dynamic_axes=dynamic_axes,
+            dynamic_shapes=dynamic_shapes,
             opset_version=14,
             do_constant_folding=True,
         )
@@ -307,8 +333,15 @@ def export_model(
     if verbose:
         print("Verifying exported model...")
 
-    onnx_model = onnx.load(str(onnx_output_path))
-    onnx.checker.check_model(onnx_model)
+    # Large models (e.g. Jina-v2's ~2.2GB fp32 weights) exceed protobuf's 2GB
+    # in-memory serialization limit, so loading full external data and
+    # checking the in-memory proto (which calls SerializeToString()
+    # internally) fails even though the on-disk model is valid. Passing the
+    # path directly lets the checker stream/handle external data without
+    # materializing everything in memory. Load without external data just to
+    # inspect the graph structure (input names).
+    onnx.checker.check_model(str(onnx_output_path))
+    onnx_model = onnx.load(str(onnx_output_path), load_external_data=False)
 
     if verbose:
         print("ONNX model verification passed!")

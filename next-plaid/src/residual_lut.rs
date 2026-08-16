@@ -549,8 +549,21 @@ pub fn maxsim_residual_lut_i8(
                 let score = TRANSCODE_SCRATCH.with(|s| {
                     let buf = &mut *s.borrow_mut();
                     let ntok = doc_packed.nrows();
-                    buf.clear();
-                    buf.resize(ntok * tcols, 0);
+                    let need = ntok * tcols;
+                    // Grow only. The repack below writes `ceil(10·src_cols/8)`
+                    // bytes per row and the kernel reads `edim/4` of them, and
+                    // the former is `>=` the latter for every dim — so no byte
+                    // the kernel touches can be a leftover from the previous
+                    // document, and zeroing the buffer on every call would be a
+                    // second pass over it for nothing. This runs once per
+                    // (query, document), so that pass is not free.
+                    debug_assert!(
+                        (10 * src_cols).div_ceil(8) >= edim / 4,
+                        "repack must cover every byte the kernel reads"
+                    );
+                    if buf.len() < need {
+                        buf.resize(need, 0);
+                    }
                     for (t, row) in doc_packed.axis_iter(Axis(0)).enumerate() {
                         let dst = &mut buf[t * tcols..(t + 1) * tcols];
                         let src = &row.as_slice().expect("packed row contiguous")[..src_cols];
@@ -578,7 +591,7 @@ pub fn maxsim_residual_lut_i8(
                             dst[5 * g..5 * g + nbytes].copy_from_slice(&v.to_le_bytes()[..nbytes]);
                         }
                     }
-                    let view = ndarray::ArrayView2::from_shape((ntok, tcols), &buf[..])
+                    let view = ndarray::ArrayView2::from_shape((ntok, tcols), &buf[..need])
                         .expect("transcode scratch shape");
                     let nib2 = ts
                         .lut2
@@ -1510,9 +1523,23 @@ mod tests {
     #[test]
     fn ternary_simd_matches_scalar_bitwise() {
         let mut rng = StdRng::seed_from_u64(29);
+        // Ascending THEN descending, and 31 tokens before 13: the transcode
+        // scratch is a per-thread buffer that only grows and is deliberately
+        // not re-zeroed, so a shrinking call reuses a buffer whose tail still
+        // holds the previous document's bytes. Only a shrinking sequence can
+        // catch a kernel that reads further than the repack writes; an
+        // ascending-only sweep never reuses a dirty tail and would pass even
+        // if the coverage argument were wrong.
+        let dims = [5usize, 7, 10, 40, 48, 64, 128, 130, 160, 200, 256];
+        let order: Vec<usize> = dims
+            .iter()
+            .copied()
+            .chain(dims.iter().copied().rev())
+            .collect();
         for &nq in &[3usize, 9, 32] {
-            for &dim in &[5usize, 7, 10, 40, 48, 64, 128, 130, 160, 200, 256] {
+            for (di, &dim) in order.iter().enumerate() {
                 let k = 12;
+                let ntok = if di % 2 == 0 { 31 } else { 13 };
                 let codec = toy_ternary_codec(dim, k, &mut rng);
                 let lut = quantize_lut(&codec).unwrap();
                 if !lut.simd_available(dim) {
@@ -1521,11 +1548,11 @@ mod tests {
                 let query = Array2::from_shape_fn((nq, dim), |_| rng.gen_range(-1.0f32..1.0));
                 let q8 = crate::binary::quantize_query_i8(&query.view());
                 let planes = build_query_planes(&q8, &lut, dim);
-                let res = Array2::from_shape_fn((13, dim), |_| rng.gen_range(-0.4f32..0.4));
+                let res = Array2::from_shape_fn((ntok, dim), |_| rng.gen_range(-0.4f32..0.4));
                 let packed = codec.quantize_residuals(&res).unwrap();
-                let codes: Vec<i64> = (0..13).map(|_| rng.gen_range(0..k as i64)).collect();
+                let codes: Vec<i64> = (0..ntok).map(|_| rng.gen_range(0..k as i64)).collect();
                 let cdot_t = Array2::from_shape_fn((k, nq), |_| rng.gen_range(-1.0f32..1.0));
-                let inv: Vec<f32> = (0..13).map(|_| rng.gen_range(0.5f32..1.5)).collect();
+                let inv: Vec<f32> = (0..ntok).map(|_| rng.gen_range(0.5f32..1.5)).collect();
 
                 let scalar = maxsim_residual_lut_scalar(
                     &q8,

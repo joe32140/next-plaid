@@ -151,11 +151,11 @@ unsafe fn nibble_expand(row: &[u8], pdim: usize, kpb: usize, nib: &NibbleLut, w:
 /// one is *pure* — the next iteration overwrites the slack, so there is no
 /// read-modify-write and no store-forwarding stall. Output is natural dim
 /// order, so the query needs no permutation at all.
-fn direct_expand(row: &[u8], src_cols: usize, table: &[u64; 256], w: &mut [i8]) {
+fn direct_expand(row: &[u8], src_cols: usize, table: &[[i8; 8]; 256], w: &mut [i8]) {
     let wp = w.as_mut_ptr();
     for (i, &b) in row[..src_cols].iter().enumerate() {
         unsafe {
-            std::ptr::write_unaligned(wp.add(5 * i) as *mut u64, table[b as usize]);
+            std::ptr::copy_nonoverlapping(table[b as usize].as_ptr(), wp.add(5 * i), 8);
         }
     }
 }
@@ -182,17 +182,36 @@ fn main() {
     )
     .unwrap();
     let lut = quantize_lut(&codec).expect("ternary LUT");
-    let ts = lut.ternary_simd.as_ref().expect("repack table");
-    let nib2 = ts.lut2.nibble.as_ref().expect("companion nibble LUT");
+    let td = lut.ternary_direct.as_ref().expect("one-hop table");
 
-    // The one-hop table: five int8 weights per base-3 byte, packed into a u64.
-    let mut direct = [0u64; 256];
-    for (b, slot) in direct.iter_mut().enumerate() {
-        let mut v = 0u64;
-        for k in 0..5 {
-            v |= (lut.fused[b * 5 + k] as u8 as u64) << (8 * k);
+    // The two-hop route this replaced, rebuilt here from the codec's own trit
+    // table. The library no longer carries it, but the comparison is the whole
+    // reason the one-hop route exists, so the bench keeps it reproducible.
+    let trits = codec.trit_lookup.as_ref().expect("ternary trit table");
+    let mut repack_tab = [0u16; 256];
+    for (byte, quintet) in trits.iter().enumerate() {
+        let mut v = 0u16;
+        for (k, &t) in quintet.iter().enumerate() {
+            v |= (t as u16) << (2 * k);
         }
-        *slot = v;
+        repack_tab[byte] = v;
+    }
+    // The 2-bit alphabet the repacked stream was scored with: [w-, w0, w+, 0].
+    // Byte value j (j < 3) has trits [j,0,0,0,0], so its weight is fused[5j].
+    // Key k of a 2-bit byte is `(b >> 2k) & 3`, so keys 0,1 read the low
+    // nibble and keys 2,3 the high one — which is why it factored and base-3
+    // does not.
+    let vals2: [i8; 4] = [lut.fused[0], lut.fused[5], lut.fused[10], 0];
+    let mut nib2 = NibbleLut {
+        tables: [[0i8; 16]; 8],
+        from_hi: [false; 8],
+    };
+    for k in 0..4 {
+        nib2.from_hi[k] = k >= 2;
+        let shift = 2 * (k % 2);
+        for x in 0..16usize {
+            nib2.tables[k][x] = vals2[(x >> shift) & 3];
+        }
     }
 
     let residuals = Array2::from_shape_fn((ntok, dim), |_| rng.next_f32() * 0.3);
@@ -211,9 +230,9 @@ fn main() {
     for row in packed.rows() {
         let src = &row.as_slice().unwrap()[..src_cols];
         tmp.fill(0);
-        repack(src, &mut tmp, &ts.repack);
-        unsafe { nibble_expand(&tmp, pdim2, 4, nib2, &mut w_nibble) };
-        direct_expand(src, src_cols, &direct, &mut w_direct);
+        repack(src, &mut tmp, &repack_tab);
+        unsafe { nibble_expand(&tmp, pdim2, 4, &nib2, &mut w_nibble) };
+        direct_expand(src, src_cols, &td.table, &mut w_direct);
         for d in 0..dim {
             let want = lut.fused[src[d / 5] as usize * 5 + d % 5];
             assert_eq!(w_direct[d], want, "direct expand wrong at dim {d}");
@@ -237,14 +256,14 @@ fn main() {
     for rep in 0..=reps {
         let t = Instant::now();
         for row in packed.rows() {
-            repack(&row.as_slice().unwrap()[..src_cols], &mut tmp, &ts.repack);
+            repack(&row.as_slice().unwrap()[..src_cols], &mut tmp, &repack_tab);
             black_box(&tmp);
         }
         let ta = t.elapsed().as_secs_f64() * 1e9 / ntok as f64;
 
         let t = Instant::now();
         for _ in 0..ntok {
-            unsafe { nibble_expand(&tmp, pdim2, 4, nib2, &mut w_nibble) };
+            unsafe { nibble_expand(&tmp, pdim2, 4, &nib2, &mut w_nibble) };
             black_box(&w_nibble);
         }
         let tb = t.elapsed().as_secs_f64() * 1e9 / ntok as f64;
@@ -254,7 +273,7 @@ fn main() {
             direct_expand(
                 &row.as_slice().unwrap()[..src_cols],
                 src_cols,
-                &direct,
+                &td.table,
                 &mut w_direct,
             );
             black_box(&w_direct);
@@ -272,7 +291,7 @@ fn main() {
     println!("    A  repack (base-3 -> 2-bit)     {a:9.2}");
     println!("    B  nibble tbl (2-bit -> w)      {b:9.2}   <- 2-bit pays only this");
     println!("    A+B  what ternary pays today    {:9.2}", a + b);
-    println!("    C  fused u64 (base-3 -> w)      {c:9.2}   <- proposed");
+    println!("    C  fused copy (base-3 -> w)     {c:9.2}   <- shipped");
     println!();
     println!(
         "    C vs A+B   {:+.1}%  (is one hop worth doing)",

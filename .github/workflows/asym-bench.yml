@@ -47,24 +47,13 @@ jobs:
         run: |
           echo "arch: $(uname -m)"
           lscpu | grep -iE "model name|flags" | head -2 || true
-      - name: Rescore ratio — 4-bit (SIMD)
-        run: ./target/release/examples/asym_rescore_check 4096 4
-      - name: Rescore ratio — 2-bit (SIMD)
-        run: ./target/release/examples/asym_rescore_check 4096 2
-      - name: Rescore ratio — 1-bit (SIMD)
-        run: ./target/release/examples/asym_rescore_check 4096 1
-      - name: Rescore ratio — ternary (transcoded onto the SIMD kernels)
-        run: ./target/release/examples/asym_rescore_check 4096 t
-      # Both repack arms in ONE process: the effect here is smaller than the
-      # +/-30% swing the same benchmark shows on *unchanged* code across two
-      # runners, so it can only be resolved within a single process.
-      - name: Build repack A/B
-        run: cargo build --release -p next-plaid --example ternary_repack_bench --features openblas
-      - name: Ternary repack — per-byte vs batched
-        run: ./target/release/examples/ternary_repack_bench 4096 15
-      # Two-hop (repack + nibble tbl) against one-hop (fused u64 straight to
-      # weights). Decides whether the one-stage expansion is worth wiring into
-      # the kernels, and what ternary would still owe 2-bit if it were.
+      # All four codecs in ONE process. Run one-per-process (as this job used
+      # to) and the cross-codec deltas are noise: the same benchmark moves
+      # +/-30% between runners, and it once reported ternary faster than 2-bit,
+      # which cannot happen.
+      - name: Rescore ratio — every codec, one process
+        run: ./target/release/examples/asym_rescore_check 4096 all
+      # Two-hop (repack + nibble tbl) against the shipped one-hop expansion.
       - name: Build expansion A/B
         run: cargo build --release -p next-plaid --example ternary_expand_bench --features openblas
       - name: Ternary expansion — two hops vs one

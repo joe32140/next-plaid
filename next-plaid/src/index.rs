@@ -159,20 +159,35 @@ pub struct IndexConfig {
     pub ternary: bool,
     /// Width of ternary's dead zone, in units of the residual standard
     /// deviation: a dimension stores `0` when `|r| < ternary_tau · σ`, else
-    /// `±E[|r| : live]`. `None` (the default) keeps the equal-mass split —
-    /// cutoffs at the 1/3 and 2/3 residual quantiles, which zeroes exactly a
-    /// third of the dimensions regardless of how the residuals are shaped.
+    /// `±E[|r| : live]`. Defaults to `Some(0.65)`. `None` selects the
+    /// equal-mass split instead — cutoffs at the 1/3 and 2/3 residual
+    /// quantiles, which zeroes exactly a third of the dimensions regardless of
+    /// how the residuals are shaped.
     ///
-    /// The knob exists because the dead zone is the codec's one real degree of
-    /// freedom: three levels spent where the mass actually is. On roughly
-    /// Gaussian residuals `tau = 0.65` zeroes ~48 % of dims, buying a larger
-    /// magnitude for the ones that survive. Ignored unless `ternary`.
-    #[serde(default)]
+    /// The dead zone is the codec's one real degree of freedom, and the
+    /// equal-mass split spends it badly: measured across five model×corpus
+    /// cells it left ternary *below* 2-bit by 0.0029 NDCG@10 on average, while
+    /// `tau = 0.65` puts it *above* 2-bit in all five (+0.0024 mean) at 19 %
+    /// fewer bytes — mean retention equal to 4-bit's, at 26 B/token against 64.
+    /// On roughly Gaussian residuals 0.65 zeroes ~48 % of dims, buying a larger
+    /// magnitude for the ones that survive.
+    ///
+    /// `tau = 0.80` scored a comparable mean but went negative in two of the
+    /// five cells, which is why the default is the setting that was positive in
+    /// all of them rather than the marginally higher mean. See
+    /// `docs/ternary_codec_findings.md`. Ignored unless `ternary`.
+    #[serde(default = "default_ternary_tau")]
     pub ternary_tau: Option<f32>,
 }
 
 fn default_start_from_scratch() -> usize {
     crate::default_start_from_scratch()
+}
+
+/// The dead-zone width that measured best across the codec study; see
+/// [`IndexConfig::ternary_tau`].
+fn default_ternary_tau() -> Option<f32> {
+    Some(0.65)
 }
 
 fn default_kmeans_niters() -> usize {
@@ -197,7 +212,7 @@ impl Default for IndexConfig {
             fts_tokenizer: crate::text_search::FtsTokenizer::default(),
             binary: false,
             ternary: false,
-            ternary_tau: None,
+            ternary_tau: default_ternary_tau(),
         }
     }
 }

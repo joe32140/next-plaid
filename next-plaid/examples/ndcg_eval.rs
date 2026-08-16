@@ -164,11 +164,15 @@ fn scalar_cfg(nbits: usize) -> IndexConfig {
     }
 }
 
+/// Ternary with the *equal-mass* bucket split (cutoffs at the 1/3 and 2/3
+/// residual quantiles). This was the default until the tau sweep; it stays in
+/// the ladder as the control the shipped default has to beat.
 fn ternary_cfg() -> IndexConfig {
     IndexConfig {
         nbits: 2, // nominal; the ternary codec supersedes it
         seed: Some(42),
         ternary: true,
+        ternary_tau: None,
         ..Default::default()
     }
 }
@@ -230,9 +234,9 @@ fn main() {
     let profiles: Vec<(&str, IndexConfig, usize)> = vec![
         ("4-bit", scalar_cfg(4), dim / 2),
         ("2-bit", scalar_cfg(2), dim / 4),
-        ("ternary", ternary_cfg(), dim.div_ceil(5)),
+        ("tern-mass", ternary_cfg(), dim.div_ceil(5)),
         ("tern@.50", ternary_tau_cfg(0.50), dim.div_ceil(5)),
-        ("tern@.65", ternary_tau_cfg(0.65), dim.div_ceil(5)),
+        ("tern@.65*", ternary_tau_cfg(0.65), dim.div_ceil(5)), // * = shipped default
         ("tern@.80", ternary_tau_cfg(0.80), dim.div_ceil(5)),
         ("1-bit", scalar_cfg(1), dim / 8),
     ];

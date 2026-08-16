@@ -94,5 +94,12 @@ jobs:
       # reporting one arbitrary point. All depths share one index build per
       # codec — k-means over the corpus costs more than the searches being
       # timed, so rebuilding per depth would spend the job on the wrong thing.
-      - name: Codec ladder — probe sweep
+      - name: Codec ladder — probe sweep (dim 128)
+        run: ./target/release/examples/search_latency synth 5 1,8,32,128
+      # dim 48 is a real deployment regime (LateOn-Code-edge), and it is where
+      # ternary's byte count stops dividing evenly: ceil(48/5) = 10 B against
+      # 2-bit's 12, and the expansion's final copy overhangs the row.
+      - name: Codec ladder — probe sweep (dim 48)
+        env:
+          DIM: "48"
         run: ./target/release/examples/search_latency synth 5 1,8,32,128

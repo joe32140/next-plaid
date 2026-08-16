@@ -31,6 +31,9 @@
 //! `DIM` (128), `TOKENS` (230 per doc), `NQ` (32 query tokens), `CENTROIDS`
 //! (16384), `REPS` (5).
 
+mod common;
+
+use common::{median, Lcg};
 use ndarray::{Array1, Array2};
 use next_plaid::binary::quantize_query_i8;
 use next_plaid::codec::ResidualCodec;
@@ -38,29 +41,6 @@ use next_plaid::maxsim::maxsim_score;
 use next_plaid::residual_lut::{build_query_planes, maxsim_residual_lut_i8, quantize_lut};
 use rayon::prelude::*;
 use std::time::Instant;
-
-/// Deterministic pseudo-random floats in `[-1, 1)`; no rand dependency needed
-/// and the same numbers on every platform, so two machines' outputs compare.
-struct Lcg(u64);
-
-impl Lcg {
-    fn next_f32(&mut self) -> f32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((self.0 >> 33) as f32 / (1u64 << 31) as f32) - 1.0
-    }
-
-    fn array(&mut self, rows: usize, cols: usize, scale: f32) -> Array2<f32> {
-        Array2::from_shape_fn((rows, cols), |_| self.next_f32() * scale)
-    }
-}
-
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.total_cmp(b));
-    v[v.len() / 2]
-}
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)

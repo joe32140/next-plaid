@@ -1,12 +1,21 @@
 name: Asym Rescore Bench
 
-# Contention-free Stage-2 rescore measurement (float decompress+MaxSim vs #169's
-# asym fused-LUT) on dedicated runners, across both SIMD kernel families:
+# Contention-free codec measurement on dedicated runners, across both SIMD
+# kernel families:
 #   ubuntu-latest    -> x86_64 (avx2 / avx512-vnni)
 #   ubuntu-24.04-arm -> aarch64 (neon-sdot)
-# The harness is `examples/asym_rescore_check` (seeded synthetic shapes, no data
-# dependency). It reports the dispatched kernel and the float/asym ratio for the
-# scalar rungs (SIMD) and the ternary base-3 codec (scalar kernel by design).
+#
+# Two levels:
+#   * `asym-bench` — Stage-2 rescore in isolation (float decompress+MaxSim vs
+#     #169's fused LUT), plus the ternary repack A/B.
+#   * `e2e-latency` — whole-search latency down the codec ladder
+#     (4-bit / 2-bit / ternary / 1-bit) x (float / asym) on a seeded synthetic
+#     corpus, so no dataset is needed.
+#
+# Why CI and not a laptop: these are *latency* numbers, and latency measured on
+# a machine running anything else measures that other thing. NDCG is not here
+# on purpose — it is deterministic, so a contended machine reports it exactly
+# right, and it needs the real bundles CI cannot carry.
 on:
   push:
     branches: [integration/ternary-asym]
@@ -46,10 +55,43 @@ jobs:
         run: ./target/release/examples/asym_rescore_check 4096 1
       - name: Rescore ratio — ternary (transcoded onto the SIMD kernels)
         run: ./target/release/examples/asym_rescore_check 4096 t
-      # Both repack arms in ONE process: the ~15% effect here is smaller than
-      # the +/-30% swing the same benchmark shows on *unchanged* code across
-      # two runners, so it can only be resolved within a single process.
+      # Both repack arms in ONE process: the effect here is smaller than the
+      # +/-30% swing the same benchmark shows on *unchanged* code across two
+      # runners, so it can only be resolved within a single process.
       - name: Build repack A/B
         run: cargo build --release -p next-plaid --example ternary_repack_bench --features openblas
       - name: Ternary repack — per-byte vs batched
         run: ./target/release/examples/ternary_repack_bench 4096 15
+
+  e2e-latency:
+    name: E2E latency ladder (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    env:
+      DOCS: "4000"
+      TOKENS: "180"
+      QUERIES: "128"
+      QTOKENS: "32"
+      DIM: "128"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install OpenBLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+      - name: Build harness (release)
+        run: cargo build --release -p next-plaid --example search_latency --features openblas
+      - name: CPU features
+        run: |
+          echo "arch: $(uname -m), cores: $(nproc)"
+          lscpu | grep -iE "model name" || true
+      # Probe depth sets how many candidate docs reach the residual path, which
+      # is the only place the codec choice can show up — so report both a
+      # shallow and a deep probe rather than one arbitrary point.
+      - name: Codec ladder — n_ivf_probe=8
+        run: ./target/release/examples/search_latency synth 5 8
+      - name: Codec ladder — n_ivf_probe=32
+        run: ./target/release/examples/search_latency synth 5 32

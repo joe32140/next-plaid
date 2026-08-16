@@ -21,28 +21,14 @@
 //! ```
 //! Args: `[n_tokens] [reps]` (defaults 4096, 15). Env: `DIM` (128).
 
+mod common;
+
+use common::{median, Lcg};
 use ndarray::{Array1, Array2};
 use next_plaid::codec::ResidualCodec;
 use next_plaid::residual_lut::quantize_lut;
 use std::hint::black_box;
 use std::time::Instant;
-
-struct Lcg(u64);
-
-impl Lcg {
-    fn next_f32(&mut self) -> f32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((self.0 >> 33) as f32 / (1u64 << 31) as f32) - 1.0
-    }
-}
-
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.total_cmp(b));
-    v[v.len() / 2]
-}
 
 /// The shipped strategy: one pure 5-byte store per four stored bytes.
 fn repack_batched(src: &[u8], dst: &mut [u8], tab: &[u16; 256]) {

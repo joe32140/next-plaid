@@ -23,10 +23,13 @@
 //! ```text
 //! cargo run --release -p next-plaid --example asym_rescore_check
 //! cargo run --release -p next-plaid --example asym_rescore_check -- 1024 2
+//! cargo run --release -p next-plaid --example asym_rescore_check -- 1024 t
 //! ```
 //!
-//! Args: `[n_docs] [nbits]` (defaults 1024, 4). Env: `DIM` (128), `TOKENS`
-//! (230 per doc), `NQ` (32 query tokens), `CENTROIDS` (16384), `REPS` (5).
+//! Args: `[n_docs] [nbits|t]` (defaults 1024, 4). The second arg selects a scalar
+//! rung (`1`/`2`/`4`) or the ternary base-3 codec (`t`, or set `TERNARY=1`). Env:
+//! `DIM` (128), `TOKENS` (230 per doc), `NQ` (32 query tokens), `CENTROIDS`
+//! (16384), `REPS` (5).
 
 use ndarray::{Array1, Array2};
 use next_plaid::binary::quantize_query_i8;
@@ -93,13 +96,39 @@ fn synth_codec(dim: usize, nbits: usize, k: usize, rng: &mut Lcg) -> ResidualCod
     .unwrap()
 }
 
+/// The ternary (base-3 dead-zone) analogue of [`synth_codec`]: two cutoffs at the
+/// residual tertiles and three weights at the bucket centers, so the `{-m,0,+m}`
+/// buckets sit on the same synthetic distribution. `quantize_lut` maps this to the
+/// base-3 fused table (`nibble = None`), so asym scores it on the *scalar* kernel —
+/// exactly what a real ternary index dispatches to.
+fn synth_ternary_codec(dim: usize, k: usize, rng: &mut Lcg) -> ResidualCodec {
+    let centroids = rng.array(k, dim, 1.0);
+    let mut sample: Vec<f32> = (0..40_000).map(|_| rng.next_f32() * 0.3).collect();
+    sample.sort_by(|a, b| a.total_cmp(b));
+    let q = |p: f64| sample[((sample.len() - 1) as f64 * p) as usize];
+    let cutoffs: Array1<f32> = [1.0 / 3.0, 2.0 / 3.0].iter().map(|&p| q(p)).collect();
+    let weights: Array1<f32> = [1.0 / 6.0, 0.5, 5.0 / 6.0].iter().map(|&p| q(p)).collect();
+    ResidualCodec::new_ternary(
+        2,
+        centroids,
+        Array1::zeros(dim),
+        Some(cutoffs),
+        Some(weights),
+    )
+    .unwrap()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n_docs = args
         .get(1)
         .and_then(|v| v.parse().ok())
         .unwrap_or(1024usize);
-    let nbits = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(4usize);
+    // `[nbits]` selects the scalar rung; pass `t`/`ternary` (or set TERNARY=1) for
+    // the base-3 dead-zone codec instead.
+    let arg2 = args.get(2).cloned().unwrap_or_default();
+    let ternary = env_usize("TERNARY", 0) == 1 || arg2.starts_with('t');
+    let nbits = arg2.parse().unwrap_or(4usize);
     let dim = env_usize("DIM", 128);
     let tokens = env_usize("TOKENS", 230);
     let nq = env_usize("NQ", 32);
@@ -107,9 +136,18 @@ fn main() {
     let reps = env_usize("REPS", 5);
 
     let mut rng = Lcg(0x5EED);
-    let codec = synth_codec(dim, nbits, k, &mut rng);
+    let codec = if ternary {
+        synth_ternary_codec(dim, k, &mut rng)
+    } else {
+        synth_codec(dim, nbits, k, &mut rng)
+    };
+    let codec_label = if ternary {
+        "ternary".to_string()
+    } else {
+        format!("{nbits}-bit")
+    };
     let Some(lut) = quantize_lut(&codec) else {
-        println!("this codec has no fused LUT (nbits={nbits}); asym would score in float");
+        println!("this codec has no fused LUT ({codec_label}); asym would score in float");
         return;
     };
 
@@ -162,7 +200,9 @@ fn main() {
              !! without `dotprod` lands here."
         );
     }
-    println!("\n  {n_docs} docs x {tokens} tokens, dim {dim}, nbits {nbits}, {nq} query tokens");
+    println!(
+        "\n  {n_docs} docs x {tokens} tokens, dim {dim}, codec {codec_label}, {nq} query tokens"
+    );
     println!(
         "  {k} centroids, median of {reps} reps, {} threads\n",
         rayon::current_num_threads()

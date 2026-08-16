@@ -1,0 +1,48 @@
+name: Asym Rescore Bench
+
+# Contention-free Stage-2 rescore measurement (float decompress+MaxSim vs #169's
+# asym fused-LUT) on dedicated runners, across both SIMD kernel families:
+#   ubuntu-latest    -> x86_64 (avx2 / avx512-vnni)
+#   ubuntu-24.04-arm -> aarch64 (neon-sdot)
+# The harness is `examples/asym_rescore_check` (seeded synthetic shapes, no data
+# dependency). It reports the dispatched kernel and the float/asym ratio for the
+# scalar rungs (SIMD) and the ternary base-3 codec (scalar kernel by design).
+on:
+  push:
+    branches: [integration/ternary-asym]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  REPS: "9"
+  TOKENS: "230"
+
+jobs:
+  asym-bench:
+    name: Asym rescore (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install OpenBLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+      - name: Build harness (release)
+        run: cargo build --release -p next-plaid --example asym_rescore_check --features openblas
+      - name: CPU features
+        run: |
+          echo "arch: $(uname -m)"
+          lscpu | grep -iE "model name|flags" | head -2 || true
+      - name: Rescore ratio — 4-bit (SIMD)
+        run: ./target/release/examples/asym_rescore_check 4096 4
+      - name: Rescore ratio — 2-bit (SIMD)
+        run: ./target/release/examples/asym_rescore_check 4096 2
+      - name: Rescore ratio — 1-bit (SIMD)
+        run: ./target/release/examples/asym_rescore_check 4096 1
+      - name: Rescore ratio — ternary (scalar kernel)
+        run: ./target/release/examples/asym_rescore_check 4096 t

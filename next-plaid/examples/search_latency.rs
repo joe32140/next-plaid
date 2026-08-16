@@ -69,8 +69,15 @@ fn ternary_cfg() -> IndexConfig {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let dir = Path::new(args.get(1).expect("usage: search_latency <bundle_dir> [reps]"));
+    let dir = Path::new(
+        args.get(1)
+            .expect("usage: search_latency <bundle_dir> [reps] [n_ivf_probe]"),
+    );
     let reps: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(5);
+    // Probe depth controls how many centroid cells (and thus candidate docs) reach
+    // residual rescoring — the lever that shifts cost from stage-1 into the residual
+    // path where #169's asym LUT applies. Sweep it to find the asym crossover.
+    let n_ivf_probe: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(8);
     let read_json = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
 
     let corpus: Array2<f32> = read_npy(dir.join("corpus.npy")).unwrap();
@@ -85,15 +92,19 @@ fn main() {
     let docs = split_rows(&corpus, corpus_lens.as_slice().unwrap());
     let qs = split_rows(&queries, query_lens.as_slice().unwrap());
     let dim = docs[0].ncols();
-    let row_of_docid: HashMap<&str, usize> =
-        corpus_ids.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+    let row_of_docid: HashMap<&str, usize> = corpus_ids
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
 
     println!(
-        "bundle: {} docs, {} queries, dim={}, reps={}\n",
+        "bundle: {} docs, {} queries, dim={}, reps={}, n_ivf_probe={}\n",
         docs.len(),
         qs.len(),
         dim,
-        reps
+        reps,
+        n_ivf_probe
     );
     println!(
         "{:<9} {:>6} {:>8} {:>11} {:>11}  speedup",
@@ -114,7 +125,7 @@ fn main() {
         for (mi, asym) in [false, true].into_iter().enumerate() {
             let params = SearchParameters {
                 top_k: 10,
-                n_ivf_probe: 8,
+                n_ivf_probe,
                 residual_asym: asym,
                 ..Default::default()
             };
@@ -154,7 +165,11 @@ fn main() {
                 "—".to_string()
             };
             let mode = if asym { "asym-LUT" } else { "float" };
-            let b = if mi == 0 { format!("{bytes}") } else { String::new() };
+            let b = if mi == 0 {
+                format!("{bytes}")
+            } else {
+                String::new()
+            };
             println!(
                 "{:<9} {:>6} {:>8} {:>11.1} {:>11.4}  {}",
                 if mi == 0 { label } else { "" },

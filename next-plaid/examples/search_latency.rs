@@ -25,10 +25,12 @@
 //!   (64), `SPREAD` (0.35), `SEED` (0x5EED).
 //!
 //! ```text
-//! cargo run -p next-plaid --release --example search_latency -- synth 5
+//! cargo run -p next-plaid --release --example search_latency -- synth 5 1,8,64
 //! cargo run -p next-plaid --release --example search_latency -- data/nfcorpus_colbertv2 10
 //! ```
-//! Args: `<bundle_dir|synth> [reps] [n_ivf_probe]`. Env: `TERNARY_TAU` (0.65).
+//! Args: `<bundle_dir|synth> [reps] [probes]`, where `probes` is a
+//! comma-separated list of `n_ivf_probe` depths swept over one index build.
+//! Env: `TERNARY_TAU` (0.65).
 
 mod common;
 
@@ -177,12 +179,19 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg1 = args
         .get(1)
-        .expect("usage: search_latency <bundle_dir|synth> [reps] [n_ivf_probe]");
+        .expect("usage: search_latency <bundle_dir|synth> [reps] [probes]");
     let reps: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(5);
     // Probe depth controls how many centroid cells (and thus candidate docs) reach
     // residual rescoring — the lever that shifts cost from stage-1 into the residual
     // path where #169's asym LUT applies. Sweep it to find the asym crossover.
-    let n_ivf_probe: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(8);
+    // Comma-separated, because every depth reuses one index: k-means over the whole
+    // corpus costs far more than the searches being timed, so rebuilding per depth
+    // would spend most of the job on a quantity nobody is measuring.
+    let probes: Vec<usize> = args
+        .get(3)
+        .map(|v| v.split(',').filter_map(|p| p.trim().parse().ok()).collect())
+        .filter(|v: &Vec<usize>| !v.is_empty())
+        .unwrap_or_else(|| vec![8]);
 
     let bundle = if arg1 == "synth" {
         load_synth()
@@ -202,17 +211,17 @@ fn main() {
         dim
     );
     println!(
-        "build: {}-{}, reps={}, n_ivf_probe={}\n",
+        "build: {}-{}, reps={}, probes={:?}\n",
         std::env::consts::ARCH,
         std::env::consts::OS,
         reps,
-        n_ivf_probe
+        probes
     );
     println!(
-        "{:<9} {:>6} {:>9} {:>11} {:>9} {:>7}  speedup",
-        "codec", "B/tok", "rescore", "us/query", "NDCG@10", "agree"
+        "{:<9} {:>6} {:>6} {:>9} {:>11} {:>9} {:>7}  speedup",
+        "codec", "B/tok", "probe", "rescore", "us/query", "NDCG@10", "agree"
     );
-    println!("{}", "-".repeat(70));
+    println!("{}", "-".repeat(78));
 
     for (label, cfg) in [
         ("4-bit", scalar_cfg(4)),
@@ -225,74 +234,83 @@ fn main() {
         MmapIndex::create_with_kmeans(docs, path, &cfg).unwrap();
         let index = MmapIndex::load(path).unwrap();
 
-        let mut float_us = 0.0f64;
-        let mut float_top: Vec<Vec<i64>> = Vec::new();
-        for (mi, asym) in [false, true].into_iter().enumerate() {
-            let params = SearchParameters {
-                top_k: 10,
-                n_ivf_probe,
-                residual_asym: asym,
-                ..Default::default()
-            };
-            // Warm up (mmap faults, thread pool, caches).
-            let _ = index.search_batch(qs, &params, true, None).unwrap();
-
-            let t = Instant::now();
-            let mut last = Vec::new();
-            for _ in 0..reps {
-                last = index.search_batch(qs, &params, true, None).unwrap();
-            }
-            let us = t.elapsed().as_micros() as f64 / (reps * qs.len()) as f64;
-
-            let mut ndcg_sum = 0.0f32;
-            let mut n = 0u32;
-            for (qi, res) in last.iter().enumerate() {
-                let Some(rels_row) = bundle.rels[qi].as_ref() else {
-                    continue;
+        let mut first_row = true;
+        for &n_ivf_probe in &probes {
+            let mut float_us = 0.0f64;
+            let mut float_top: Vec<Vec<i64>> = Vec::new();
+            for (mi, asym) in [false, true].into_iter().enumerate() {
+                let params = SearchParameters {
+                    top_k: 10,
+                    n_ivf_probe,
+                    residual_asym: asym,
+                    ..Default::default()
                 };
-                let ranked: Vec<usize> = res.passage_ids.iter().map(|&p| p as usize).collect();
-                ndcg_sum += ndcg_at_k(&ranked, rels_row, 10);
-                n += 1;
-            }
-            let ndcg = if n > 0 {
-                format!("{:.4}", ndcg_sum / n as f32)
-            } else {
-                "—".to_string()
-            };
+                // Warm up (mmap faults, thread pool, caches).
+                let _ = index.search_batch(qs, &params, true, None).unwrap();
 
-            let top: Vec<Vec<i64>> = last.iter().map(|r| r.passage_ids.clone()).collect();
-            let (agree, speedup) = if asym {
-                let mean = top
-                    .iter()
-                    .zip(float_top.iter())
-                    .map(|(a, f)| {
-                        let fs: HashSet<i64> = f.iter().copied().collect();
-                        let hits = a.iter().filter(|id| fs.contains(id)).count();
-                        hits as f64 / a.len().max(1) as f64
-                    })
-                    .sum::<f64>()
-                    / top.len().max(1) as f64;
-                (format!("{mean:.3}"), format!("{:.2}x", float_us / us))
-            } else {
-                float_us = us;
-                float_top = top;
-                ("—".to_string(), "—".to_string())
-            };
+                let t = Instant::now();
+                let mut last = Vec::new();
+                for _ in 0..reps {
+                    last = index.search_batch(qs, &params, true, None).unwrap();
+                }
+                let us = t.elapsed().as_micros() as f64 / (reps * qs.len()) as f64;
 
-            println!(
-                "{:<9} {:>6} {:>9} {:>11.1} {:>9} {:>7}  {}",
-                if mi == 0 { label } else { "" },
-                if mi == 0 {
-                    format!("{}", bytes_per_token(label, dim))
+                let mut ndcg_sum = 0.0f32;
+                let mut n = 0u32;
+                for (qi, res) in last.iter().enumerate() {
+                    let Some(rels_row) = bundle.rels[qi].as_ref() else {
+                        continue;
+                    };
+                    let ranked: Vec<usize> = res.passage_ids.iter().map(|&p| p as usize).collect();
+                    ndcg_sum += ndcg_at_k(&ranked, rels_row, 10);
+                    n += 1;
+                }
+                let ndcg = if n > 0 {
+                    format!("{:.4}", ndcg_sum / n as f32)
                 } else {
-                    String::new()
-                },
-                if asym { "asym-LUT" } else { "float" },
-                us,
-                ndcg,
-                agree,
-                speedup
-            );
+                    "—".to_string()
+                };
+
+                let top: Vec<Vec<i64>> = last.iter().map(|r| r.passage_ids.clone()).collect();
+                let (agree, speedup) = if asym {
+                    let mean = top
+                        .iter()
+                        .zip(float_top.iter())
+                        .map(|(a, f)| {
+                            let fs: HashSet<i64> = f.iter().copied().collect();
+                            let hits = a.iter().filter(|id| fs.contains(id)).count();
+                            hits as f64 / a.len().max(1) as f64
+                        })
+                        .sum::<f64>()
+                        / top.len().max(1) as f64;
+                    (format!("{mean:.3}"), format!("{:.2}x", float_us / us))
+                } else {
+                    float_us = us;
+                    float_top = top;
+                    ("—".to_string(), "—".to_string())
+                };
+
+                println!(
+                    "{:<9} {:>6} {:>6} {:>9} {:>11.1} {:>9} {:>7}  {}",
+                    if first_row { label } else { "" },
+                    if first_row {
+                        format!("{}", bytes_per_token(label, dim))
+                    } else {
+                        String::new()
+                    },
+                    if mi == 0 {
+                        format!("{n_ivf_probe}")
+                    } else {
+                        String::new()
+                    },
+                    if asym { "asym-LUT" } else { "float" },
+                    us,
+                    ndcg,
+                    agree,
+                    speedup
+                );
+                first_row = false;
+            }
         }
     }
 }

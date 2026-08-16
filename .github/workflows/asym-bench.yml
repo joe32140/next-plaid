@@ -76,6 +76,11 @@ jobs:
       QUERIES: "128"
       QTOKENS: "32"
       DIM: "128"
+      # Few clusters make the candidate set saturate at shallow probe depths —
+      # measured: 64 clusters left probe=8 and probe=32 within 3% of each other,
+      # so the probe lever reported nothing. Real token embeddings are spread
+      # over far more modes than that.
+      CLUSTERS: "4096"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -89,9 +94,9 @@ jobs:
           echo "arch: $(uname -m), cores: $(nproc)"
           lscpu | grep -iE "model name" || true
       # Probe depth sets how many candidate docs reach the residual path, which
-      # is the only place the codec choice can show up — so report both a
-      # shallow and a deep probe rather than one arbitrary point.
-      - name: Codec ladder — n_ivf_probe=8
-        run: ./target/release/examples/search_latency synth 5 8
-      - name: Codec ladder — n_ivf_probe=32
-        run: ./target/release/examples/search_latency synth 5 32
+      # is the only place the codec choice can show up, so sweep it rather than
+      # reporting one arbitrary point. All depths share one index build per
+      # codec — k-means over the corpus costs more than the searches being
+      # timed, so rebuilding per depth would spend the job on the wrong thing.
+      - name: Codec ladder — probe sweep
+        run: ./target/release/examples/search_latency synth 5 1,8,32,128

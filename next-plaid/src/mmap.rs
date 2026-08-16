@@ -757,6 +757,89 @@ pub struct MmapNpyArray1I64 {
     data_offset: usize,
 }
 
+/// Memory-mapped NPY array for 1D f32 values.
+///
+/// Used for the optional per-token inverse reconstruction norms. The NPY
+/// writer aligns the payload, so slices can borrow the mmap directly without
+/// copying the whole index into the process heap.
+pub struct MmapNpyArray1F32 {
+    _mmap: Mmap,
+    len: usize,
+    data_offset: usize,
+}
+
+impl MmapNpyArray1F32 {
+    /// Create an empty anonymous mapping for releasing file handles.
+    pub fn empty() -> Self {
+        let mmap = MmapMut::map_anon(1)
+            .expect("failed to create anonymous mmap")
+            .make_read_only()
+            .expect("failed to make anonymous mmap read-only");
+        Self {
+            _mmap: mmap,
+            len: 0,
+            data_offset: 0,
+        }
+    }
+
+    /// Load a 1D f32 array from an NPY file.
+    pub fn from_npy_file(path: &Path) -> Result<Self> {
+        let file = File::open(path)
+            .map_err(|e| Error::IndexLoad(format!("Failed to open NPY file {:?}: {}", path, e)))?;
+        let mmap = unsafe {
+            Mmap::map(&file).map_err(|e| {
+                Error::IndexLoad(format!("Failed to mmap NPY file {:?}: {}", path, e))
+            })?
+        };
+        let (shape, data_offset, _fortran_order) = parse_npy_header(path, &mmap)?;
+        if shape.len() != 1 {
+            return Err(Error::IndexLoad(format!(
+                "Expected 1D array, got {}D",
+                shape.len()
+            )));
+        }
+        let len = shape[0];
+        let expected_size = data_offset + len * std::mem::size_of::<f32>();
+        if mmap.len() < expected_size {
+            return Err(Error::IndexLoad(format!(
+                "NPY file size {} too small for {} f32 elements",
+                mmap.len(),
+                len
+            )));
+        }
+        if data_offset % std::mem::align_of::<f32>() != 0 {
+            return Err(Error::IndexLoad(format!(
+                "Unaligned f32 payload in {:?}: offset {}",
+                path, data_offset
+            )));
+        }
+        Ok(Self {
+            _mmap: mmap,
+            len,
+            data_offset,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Borrow a zero-copy slice of `[start, end)`.
+    pub fn slice(&self, start: usize, end: usize) -> &[f32] {
+        assert!(start <= end && end <= self.len);
+        let byte_start = self.data_offset + start * std::mem::size_of::<f32>();
+        let bytes =
+            &self._mmap[byte_start..byte_start + (end - start) * std::mem::size_of::<f32>()];
+        // SAFETY: from_npy_file verifies bounds and alignment; f32 accepts all
+        // bit patterns, and the mapping outlives the returned slice.
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), end - start) }
+    }
+}
+
 impl MmapNpyArray1I64 {
     /// Create an empty instance backed by an anonymous mmap (no file).
     ///
@@ -1194,6 +1277,16 @@ fn npy_header_layout(header_dict: &str) -> (usize, usize) {
     (padding, total)
 }
 
+/// Header layout whose data payload is 64-byte aligned. Existing merged
+/// codes/residual files intentionally keep their historical byte layout;
+/// only zero-copy numeric sidecars use this corrected alignment.
+fn aligned_npy_header_layout(header_dict: &str) -> (usize, usize) {
+    let header_len = header_dict.len();
+    let padding = (64 - ((10 + header_len + 1) % 64)) % 64;
+    let total = 10 + header_len + padding + 1;
+    (padding, total)
+}
+
 fn npy_header_dict_1d(len: usize, dtype: &str) -> String {
     format!(
         "{{'descr': '{}', 'fortran_order': False, 'shape': ({},), }}",
@@ -1214,6 +1307,11 @@ fn npy_header_size_1d(len: usize, dtype: &str) -> usize {
     npy_header_layout(&dict).1
 }
 
+fn aligned_npy_header_size_1d(len: usize, dtype: &str) -> usize {
+    let dict = npy_header_dict_1d(len, dtype);
+    aligned_npy_header_layout(&dict).1
+}
+
 /// Compute the NPY header size for a 2D array (without writing).
 fn npy_header_size_2d(nrows: usize, ncols: usize, dtype: &str) -> usize {
     let dict = npy_header_dict_2d(nrows, ncols, dtype);
@@ -1223,6 +1321,25 @@ fn npy_header_size_2d(nrows: usize, ncols: usize, dtype: &str) -> usize {
 /// Write an NPY header (shared implementation for 1D and 2D).
 fn write_npy_header(writer: &mut impl Write, header_dict: &str) -> Result<usize> {
     let (padding, total) = npy_header_layout(header_dict);
+    write_npy_header_with_layout(writer, header_dict, padding, total)
+}
+
+pub(crate) fn write_aligned_npy_header_1d(
+    writer: &mut impl Write,
+    len: usize,
+    dtype: &str,
+) -> Result<usize> {
+    let header_dict = npy_header_dict_1d(len, dtype);
+    let (padding, total) = aligned_npy_header_layout(&header_dict);
+    write_npy_header_with_layout(writer, &header_dict, padding, total)
+}
+
+fn write_npy_header_with_layout(
+    writer: &mut impl Write,
+    header_dict: &str,
+    padding: usize,
+    total: usize,
+) -> Result<usize> {
     let padded_header = format!("{}{}\n", header_dict, " ".repeat(padding));
 
     // Write magic + version (v1.0)
@@ -1489,6 +1606,161 @@ pub fn merge_codes_chunks(
     Ok(merged_path)
 }
 
+/// Merge optional per-chunk inverse reconstruction norms.
+///
+/// Legacy indexes do not contain these files. If any chunk is missing, return
+/// `None` so callers can use the compatibility path that computes norms only
+/// for shortlisted documents.
+pub fn merge_inv_norm_chunks(
+    index_path: &Path,
+    num_chunks: usize,
+    padding_rows: usize,
+) -> Result<Option<std::path::PathBuf>> {
+    use ndarray_npy::ReadNpyExt;
+
+    for i in 0..num_chunks {
+        if !index_path.join(format!("{}.inv_norms.npy", i)).exists() {
+            return Ok(None);
+        }
+    }
+
+    let merged_path = index_path.join("merged_inv_norms.npy");
+    let manifest_path = index_path.join("merged_inv_norms.manifest.json");
+    let temp_path = index_path.join("merged_inv_norms.npy.tmp");
+    let lock_path = index_path.join("merged_inv_norms.lock");
+    let metadata_json_path = index_path.join("metadata.json");
+    let current_metadata_mtime = get_mtime(&metadata_json_path).unwrap_or(0.0);
+
+    if let Some(ref manifest) = load_merge_manifest(&manifest_path) {
+        if manifest.num_chunks == num_chunks
+            && manifest.padding_rows == padding_rows
+            && manifest.chunks.len() == num_chunks
+            && manifest.total_rows > 0
+            && manifest.metadata_mtime > 0.0
+            && (manifest.metadata_mtime - current_metadata_mtime).abs() < 0.001
+            && merged_path.exists()
+        {
+            if let Ok(meta) = fs::metadata(&merged_path) {
+                let expected_size = aligned_npy_header_size_1d(manifest.total_rows, "<f4")
+                    + manifest.total_rows * std::mem::size_of::<f32>();
+                if meta.len() == expected_size as u64 {
+                    return Ok(Some(merged_path));
+                }
+            }
+        }
+    }
+
+    let _lock = FileLockGuard::acquire(&lock_path)?;
+    let old_manifest = load_merge_manifest(&manifest_path);
+    let mut chunks = Vec::with_capacity(num_chunks);
+    let mut total_rows = 0usize;
+    let mut chain_broken = false;
+
+    for i in 0..num_chunks {
+        let filename = format!("{}.inv_norms.npy", i);
+        let path = index_path.join(&filename);
+        let mtime = get_mtime(&path)?;
+        let arr: Array1<f32> = Array1::read_npy(File::open(&path)?)?;
+        let rows = arr.len();
+        total_rows += rows;
+        let is_clean = old_manifest.as_ref().is_some_and(|manifest| {
+            manifest
+                .chunks
+                .get(&filename)
+                .is_some_and(|entry| entry.mtime == mtime && entry.rows == rows)
+        });
+        if !is_clean {
+            chain_broken = true;
+        }
+        chunks.push(ChunkInfo {
+            path,
+            filename,
+            rows,
+            mtime,
+        });
+    }
+
+    if total_rows == 0 {
+        return Err(Error::IndexLoad("No inverse norm data to merge".into()));
+    }
+    let final_rows = total_rows + padding_rows;
+    let needs_full_rewrite = !merged_path.exists()
+        || chain_broken
+        || old_manifest
+            .as_ref()
+            .map(|m| m.padding_rows != padding_rows || m.total_rows != final_rows)
+            .unwrap_or(true);
+
+    if needs_full_rewrite {
+        let file = File::create(&temp_path).map_err(|e| {
+            Error::IndexLoad(format!("Failed to create inverse norm temp file: {}", e))
+        })?;
+        let mut writer = BufWriter::new(file);
+        let header_size = write_aligned_npy_header_1d(&mut writer, final_rows, "<f4")?;
+        let mut written_rows = 0usize;
+        for chunk in &chunks {
+            let arr: Array1<f32> = Array1::read_npy(File::open(&chunk.path)?)?;
+            for &value in arr.iter() {
+                writer.write_all(&value.to_le_bytes())?;
+            }
+            written_rows += arr.len();
+        }
+        // Padding rows are never scored. Use a neutral finite value anyway so
+        // accidental reads cannot introduce NaNs or infinities.
+        for _ in 0..padding_rows {
+            writer.write_all(&1.0f32.to_le_bytes())?;
+        }
+        written_rows += padding_rows;
+        writer.flush().map_err(|e| {
+            Error::IndexLoad(format!("Failed to flush merged inverse norms: {}", e))
+        })?;
+        let file = writer
+            .into_inner()
+            .map_err(|e| Error::IndexLoad(format!("Failed to get inverse norm file: {}", e)))?;
+        file.sync_all()
+            .map_err(|e| Error::IndexLoad(format!("Failed to sync merged inverse norms: {}", e)))?;
+
+        let expected_size = header_size + written_rows * std::mem::size_of::<f32>();
+        let actual_size = fs::metadata(&temp_path)?.len() as usize;
+        if actual_size != expected_size {
+            let _ = fs::remove_file(&temp_path);
+            return Err(Error::IndexLoad(format!(
+                "Merged inverse norm file size mismatch: expected {}, got {}",
+                expected_size, actual_size
+            )));
+        }
+        fs::rename(&temp_path, &merged_path).map_err(|e| {
+            Error::IndexLoad(format!("Failed to rename merged inverse norms: {}", e))
+        })?;
+    }
+
+    let chunks = chunks
+        .into_iter()
+        .map(|chunk| {
+            (
+                chunk.filename,
+                ChunkManifestEntry {
+                    rows: chunk.rows,
+                    mtime: chunk.mtime,
+                },
+            )
+        })
+        .collect();
+    save_merge_manifest(
+        &manifest_path,
+        &MergeManifest {
+            chunks,
+            padding_rows,
+            num_chunks,
+            metadata_mtime: current_metadata_mtime,
+            total_rows: final_rows,
+            ncols: 0,
+        },
+    )?;
+
+    Ok(Some(merged_path))
+}
+
 /// Merge chunked residuals NPY files into a single merged file.
 ///
 /// Uses atomic writes to prevent corruption from interrupted writes.
@@ -1730,8 +2002,10 @@ pub fn clear_merged_files(index_path: &Path) -> Result<()> {
     // be loading (merging) while another is updating (clearing).
     let codes_lock_path = index_path.join("merged_codes.lock");
     let residuals_lock_path = index_path.join("merged_residuals.lock");
+    let inv_norms_lock_path = index_path.join("merged_inv_norms.lock");
     let _codes_lock = FileLockGuard::acquire(&codes_lock_path)?;
     let _residuals_lock = FileLockGuard::acquire(&residuals_lock_path)?;
+    let _inv_norms_lock = FileLockGuard::acquire(&inv_norms_lock_path)?;
 
     let files_to_remove = [
         "merged_codes.npy",
@@ -1742,6 +2016,10 @@ pub fn clear_merged_files(index_path: &Path) -> Result<()> {
         "merged_residuals.npy.tmp",
         "merged_residuals.manifest.json",
         "merged_residuals.manifest.json.tmp",
+        "merged_inv_norms.npy",
+        "merged_inv_norms.npy.tmp",
+        "merged_inv_norms.manifest.json",
+        "merged_inv_norms.manifest.json.tmp",
     ];
 
     for filename in files_to_remove {
@@ -1927,5 +2205,16 @@ mod tests {
         let loaded = mmap.to_owned();
 
         assert_eq!(array, loaded);
+    }
+
+    #[test]
+    fn inverse_norm_header_alignment_preserves_existing_merge_layout() {
+        let legacy_codes = npy_header_size_1d(1_000, "<i8");
+        let legacy_residuals = npy_header_size_2d(1_000, 32, "|u1");
+        let aligned_inv_norms = aligned_npy_header_size_1d(1_000, "<f4");
+
+        assert_eq!(legacy_codes % 64, 1);
+        assert_eq!(legacy_residuals % 64, 1);
+        assert_eq!(aligned_inv_norms % 64, 0);
     }
 }

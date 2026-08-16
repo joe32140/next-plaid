@@ -826,8 +826,11 @@ const DEFAULT_N_FULL_SCORES: usize = 8192;
 /// * `COLGREP_CENTROID_SCORE_THRESHOLD` (default = next-plaid 0.4) —
 ///   minimum centroid max-score to be considered; -1 disables pruning.
 ///   Saturated empirically; left at the next-plaid default.
+/// * `COLGREP_RESIDUAL_ASYM=1` (default = next-plaid off) — rescore residual
+///   candidates with the fused int8 x LUT kernel over the stored codes
+///   instead of decompressing them to float first.
 ///
-/// All three are search-time only, so they can be tuned on cached indices
+/// All of them are search-time only, so they can be tuned on cached indices
 /// without re-indexing.
 fn search_params_from_env(top_k: usize) -> SearchParameters {
     let defaults = SearchParameters::default();
@@ -849,11 +852,16 @@ fn search_params_from_env(top_k: usize) -> SearchParameters {
         },
         Err(_) => defaults.centroid_score_threshold,
     };
+    let residual_asym = match std::env::var("COLGREP_RESIDUAL_ASYM") {
+        Ok(s) => matches!(s.trim(), "1" | "true" | "yes" | "on"),
+        Err(_) => defaults.residual_asym,
+    };
     SearchParameters {
         top_k,
         n_ivf_probe,
         n_full_scores,
         centroid_score_threshold,
+        residual_asym,
         ..defaults
     }
 }

@@ -17,12 +17,14 @@
   no-reconstruction rescoring, with NDCG bit-for-bit matching the float path
   (parity test + real-search NDCG agree to ≤0.0005). No new SIMD kernel: ternary
   routes to the scalar kernel whose `d == dim` break already masks the padded byte.
-- **Latency.** At BEIR scale end-to-end search is **stage-1-bound**, so the asym LUT is
-  not an end-to-end win there. The clean **Stage-2 rescore** question (what #169 actually
-  changes) is measured contention-free on CI per-ISA (`asym-bench` workflow) — local
-  end-to-end timings were noisy under a shared machine and are kept only as
-  regime-indicative. Ternary's own latency lever is its **smaller float-path footprint**
-  (26 vs 32 B, memory-bandwidth-bound). See [CI rescore ratios](#ci-rescore-ratios-contention-free).
+- **Latency.** Measured contention-free on CI per-ISA (`asym-bench` workflow; local
+  end-to-end runs were noisy under a shared machine). At the **Stage-2 rescore kernel**
+  (what #169 changes), asym is a **7–9× speedup** on the SIMD rungs (1/2/4-bit) on both
+  x86 (`avx2`) and arm (`neon-sdot`). Ternary takes the *scalar* kernel, so it splits:
+  **1.49× on arm64, 0.67× on x86_64** — enable `residual_asym` for ternary on arm, keep it
+  on float rescore on x86 until a base-3 SIMD kernel lands. End-to-end this dilutes because
+  search is stage-1-bound (unchanged by #169, #170's territory). See
+  [CI rescore ratios](#ci-rescore-ratios-contention-free).
 
 ## What shipped (integration)
 
@@ -177,21 +179,54 @@ dedicated per-ISA runners — `ubuntu-latest` (x86_64 `avx2`/`avx512-vnni`) and
 `ubuntu-24.04-arm` (`neon-sdot`). Scalar rungs (1/2/4-bit) take the SIMD kernel; ternary
 takes the scalar kernel (`nibble = None`) by design.
 
-<!-- CI_RATIO_TABLE -->
-_(pending first CI run of `.github/workflows/asym-bench.yml`)_
+Stage-2 rescore only, **ns/token**, median of 9 reps, 4096 docs × 230 tokens, dim 128
+(run [31964951628](https://github.com/joe32140/next-plaid/actions/runs/31964951628)):
+
+| codec | kernel | x86_64 float | x86_64 asym | **x86_64 ratio** | arm64 float | arm64 asym | **arm64 ratio** |
+|---|---|--:|--:|--:|--:|--:|--:|
+| 4-bit | SIMD | 708.0 | 100.2 | **7.06×** | 388.7 | 45.7 | **8.50×** |
+| 2-bit | SIMD | 690.9 | 99.9 | **6.92×** | 348.5 | 45.7 | **7.62×** |
+| 1-bit | SIMD | 612.5 | 69.1 | **8.86×** | 308.4 | 37.6 | **8.21×** |
+| **ternary** | scalar | 387.9 | 575.5 | **0.67×** | 239.4 | 161.0 | **1.49×** |
+
+*(x86_64 = `avx2`; arm64 = `neon-sdot`; ternary = `scalar` on both.)*
+
+**This is the result the contended end-to-end table buried.** At the rescore kernel #169
+is a **7–9× win on the scalar rungs (1/2/4-bit) on both ISAs** — float decompresses to f32
+then MaxSims, asym scores int8 straight over packed codes under SIMD. So the asym LUT is
+emphatically worth it *at Stage 2*; the end-to-end dilution is entirely stage-1 (which is
+what #170 attacks, and which the local numbers were dominated by).
+
+**Ternary splits on ISA — the one caveat.** Because ternary factors to `nibble = None` it
+takes the *scalar* asym kernel, and that races the (well-vectorized) float path
+differently per arch: on **arm64 asym still wins 1.49×** (scalar-int accumulation beats
+float reconstruct+MaxSim), but on **x86_64 it loses 0.67×** (avx2 makes the float path
+faster than the non-SIMD integer LUT walk). Concretely, ternary-asym costs 575 ns/tok on
+x86 vs 2-bit-asym's 100 — the missing SIMD, not the codec. **Deployment:** for ternary,
+prefer `residual_asym` on arm64 and the float rescore on x86_64. **Future work:** a
+vectorized base-3 expand (pack 5 trits → SIMD lanes) would give ternary the same 7–9× on
+x86 that the nibble rungs already get — the single highest-value follow-up here.
 
 ## How far can we push latency — bottom line
 
-At BEIR scale the residual codec is **not** the latency bottleneck; stage-1 is. So the
-honest "push latency" answer is two-part:
+Separate the two stages:
 
-- **Storage-first:** ternary is a clean ~19 % index shrink over 2-bit with **≤ 0.005
-  NDCG cost** (and *zero* on the low-retention model). If the deployment is
-  memory/footprint constrained, ternary is the better default than 2-bit.
-- **Latency-first:** the win is the smaller float-path footprint (up to ~20 % on
-  bandwidth-bound corpora), not the asym LUT — until you're in a rescoring-bound regime
-  (large corpus / deep shortlist), where the crossover sweep above shows asym pulling
-  ahead.
+- **Stage-2 rescore (what the codec + #169 own):** asym is a **7–9× kernel speedup** on the
+  SIMD rungs (1/2/4-bit), clean on both x86 and arm (CI). Ternary gets the same idea but on
+  the scalar kernel, so it wins on arm (1.49×) and loses on x86 (0.67×) — vectorizing the
+  base-3 expand is the fix. So Stage-2 rescore is *already* pushed near its floor for the
+  nibble codecs; the ceiling that remains is stage-1.
+- **Stage-1 (candidate generation):** owns end-to-end latency at BEIR scale — unchanged by
+  #169, targeted by #170. This is why the end-to-end asym speedup is small even though the
+  kernel speedup is 7–9×.
+- **Storage:** ternary is a clean ~19 % index shrink over 2-bit with **≤ 0.0065 NDCG cost**
+  (free on capacity-bound models, and it clears 1-bit everywhere). If footprint-bound,
+  ternary is the better default than 2-bit; and its smaller float-path footprint also helps
+  the float rescore path on bandwidth-bound corpora.
+
+**Deployment recipe:** 2-bit or ternary for footprint; enable `residual_asym` for the
+7–9× rescore win on the nibble rungs (all ISAs) and for ternary **on arm64**; keep ternary
+on float rescore on x86_64 until the base-3 kernel is vectorized.
 
 ## Repro
 

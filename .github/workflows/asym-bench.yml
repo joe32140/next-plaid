@@ -62,6 +62,13 @@ jobs:
         run: cargo build --release -p next-plaid --example ternary_repack_bench --features openblas
       - name: Ternary repack — per-byte vs batched
         run: ./target/release/examples/ternary_repack_bench 4096 15
+      # Two-hop (repack + nibble tbl) against one-hop (fused u64 straight to
+      # weights). Decides whether the one-stage expansion is worth wiring into
+      # the kernels, and what ternary would still owe 2-bit if it were.
+      - name: Build expansion A/B
+        run: cargo build --release -p next-plaid --example ternary_expand_bench --features openblas
+      - name: Ternary expansion — two hops vs one
+        run: ./target/release/examples/ternary_expand_bench 4096 15
 
   e2e-latency:
     name: E2E latency ladder (${{ matrix.os }})

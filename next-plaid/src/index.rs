@@ -150,6 +150,13 @@ pub struct IndexConfig {
     /// Documents shrink ~32x versus `f32`; queries stay full precision.
     #[serde(default)]
     pub binary: bool,
+    /// Use the ternary (base-3 dead-zone) residual codec: each dimension is
+    /// stored as one of `{-m, 0, +m}` at ~1.585 bits/dim (five trits per byte),
+    /// a size/quality rung between 1-bit and 2-bit scalar residuals. Reconstructs
+    /// `centroid + weight` and scores with float MaxSim like the scalar codec, so
+    /// it supersedes `nbits`. Mutually exclusive with `binary`.
+    #[serde(default)]
+    pub ternary: bool,
 }
 
 fn default_start_from_scratch() -> usize {
@@ -177,7 +184,26 @@ impl Default for IndexConfig {
             force_cpu: false,
             fts_tokenizer: crate::text_search::FtsTokenizer::default(),
             binary: false,
+            ternary: false,
         }
+    }
+}
+
+impl IndexConfig {
+    /// Validate mutually-incompatible storage options before a build.
+    ///
+    /// `binary` (1-bit sign store, asymmetric scoring) and `ternary` (base-3
+    /// residual codec) are different storage schemes; a document is stored under
+    /// exactly one, so requesting both is a configuration error rather than a
+    /// silent precedence.
+    pub fn validate(&self) -> Result<()> {
+        if self.binary && self.ternary {
+            return Err(Error::IndexCreation(
+                "`binary` and `ternary` are mutually exclusive storage modes; enable at most one"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -208,6 +234,11 @@ pub struct Metadata {
     /// binary MaxSim (see [`crate::binary`]) rather than residual quantization.
     #[serde(default)]
     pub binary: bool,
+    /// Whether the residual codec is ternary (base-3 dead-zone, ~1.585 bits/dim)
+    /// rather than the scalar `nbits` codec. Absent in pre-existing indexes, so
+    /// it defaults to false on load. See [`crate::codec::ResidualCodec::ternary`].
+    #[serde(default)]
+    pub ternary: bool,
 }
 
 impl Metadata {
@@ -268,6 +299,7 @@ pub fn prepare_codec_artifacts(
     centroids: Array2<f32>,
     config: &IndexConfig,
 ) -> Result<PreparedCodecArtifacts> {
+    config.validate()?;
     let embedding_dim = centroids.ncols();
     let total_embeddings: usize = embeddings.iter().map(|e| e.nrows()).sum();
     let num_documents = embeddings.len();
@@ -341,7 +373,10 @@ pub fn prepare_codec_artifacts(
         .map(|col| col.iter().map(|x| x.abs()).sum::<f32>() / col.len() as f32)
         .collect();
 
-    let n_options = 1 << config.nbits;
+    // Ternary uses 3 buckets: cutoffs at the 1/3 & 2/3 residual quantiles, weights
+    // at 1/6, 1/2, 5/6 (the middle weight ~ 0 is the dead-zone). Same generic
+    // formula as the scalar path, just n_options = 3.
+    let n_options = if config.ternary { 3 } else { 1 << config.nbits };
     let quantile_values: Vec<f64> = (1..n_options)
         .map(|i| i as f64 / n_options as f64)
         .collect();
@@ -353,13 +388,23 @@ pub fn prepare_codec_artifacts(
     let bucket_cutoffs = Array1::from_vec(quantiles(&flat_residuals, &quantile_values));
     let bucket_weights = Array1::from_vec(quantiles(&flat_residuals, &weight_quantile_values));
 
-    let codec = ResidualCodec::new(
-        config.nbits,
-        centroids,
-        avg_res_per_dim.clone(),
-        Some(bucket_cutoffs.clone()),
-        Some(bucket_weights.clone()),
-    )?;
+    let codec = if config.ternary {
+        ResidualCodec::new_ternary(
+            config.nbits,
+            centroids,
+            avg_res_per_dim.clone(),
+            Some(bucket_cutoffs.clone()),
+            Some(bucket_weights.clone()),
+        )?
+    } else {
+        ResidualCodec::new(
+            config.nbits,
+            centroids,
+            avg_res_per_dim.clone(),
+            Some(bucket_cutoffs.clone()),
+            Some(bucket_weights.clone()),
+        )?
+    };
 
     Ok(PreparedCodecArtifacts {
         codec,
@@ -380,7 +425,7 @@ pub fn encode_index_chunk(
     let packed_dim = if binary {
         binary::packed_dim(embedding_dim)
     } else {
-        embedding_dim * codec.nbits / 8
+        codec.packed_residual_dim(embedding_dim)
     };
     let doclens: Vec<i64> = embeddings.iter().map(|d| d.nrows() as i64).collect();
     let total_tokens: usize = doclens.iter().sum::<i64>() as usize;
@@ -631,6 +676,7 @@ pub fn write_index_from_encoded_chunks(
         embedding_dim,
         next_plaid_compatible: true,
         binary: config.binary,
+        ternary: config.ternary,
     };
     atomic_write_file(&index_dir.join("metadata.json"), |file| {
         let mut writer = BufWriter::new(file);
@@ -669,6 +715,7 @@ pub fn create_index_files(
     index_path: &str,
     config: &IndexConfig,
 ) -> Result<Metadata> {
+    config.validate()?;
     let index_dir = Path::new(index_path);
     fs::create_dir_all(index_dir)?;
 
@@ -759,7 +806,10 @@ pub fn create_index_files(
         .collect();
 
     // Compute quantization buckets
-    let n_options = 1 << config.nbits;
+    // Ternary uses 3 buckets: cutoffs at the 1/3 & 2/3 residual quantiles, weights
+    // at 1/6, 1/2, 5/6 (the middle weight ~ 0 is the dead-zone). Same generic
+    // formula as the scalar path, just n_options = 3.
+    let n_options = if config.ternary { 3 } else { 1 << config.nbits };
     let quantile_values: Vec<f64> = (1..n_options)
         .map(|i| i as f64 / n_options as f64)
         .collect();
@@ -772,13 +822,23 @@ pub fn create_index_files(
     let bucket_cutoffs = Array1::from_vec(quantiles(&flat_residuals, &quantile_values));
     let bucket_weights = Array1::from_vec(quantiles(&flat_residuals, &weight_quantile_values));
 
-    let codec = ResidualCodec::new(
-        config.nbits,
-        centroids.clone(),
-        avg_res_per_dim.clone(),
-        Some(bucket_cutoffs.clone()),
-        Some(bucket_weights.clone()),
-    )?;
+    let codec = if config.ternary {
+        ResidualCodec::new_ternary(
+            config.nbits,
+            centroids.clone(),
+            avg_res_per_dim.clone(),
+            Some(bucket_cutoffs.clone()),
+            Some(bucket_weights.clone()),
+        )?
+    } else {
+        ResidualCodec::new(
+            config.nbits,
+            centroids.clone(),
+            avg_res_per_dim.clone(),
+            Some(bucket_cutoffs.clone()),
+            Some(bucket_weights.clone()),
+        )?
+    };
 
     // Save codec components
     use ndarray_npy::WriteNpyExt;
@@ -1037,6 +1097,7 @@ pub fn create_index_files(
         embedding_dim,
         next_plaid_compatible: true, // Created by next-plaid, always compatible
         binary: config.binary,
+        ternary: config.ternary,
     };
 
     let metadata_path = index_dir.join("metadata.json");
@@ -1069,6 +1130,7 @@ pub fn create_index_with_kmeans_files(
     index_path: &str,
     config: &IndexConfig,
 ) -> Result<Metadata> {
+    config.validate()?;
     if embeddings.is_empty() {
         return Err(Error::IndexCreation("No documents provided".into()));
     }
@@ -1783,8 +1845,9 @@ impl MmapIndex {
                     force_cpu: config.force_cpu,
                     // A rebuild from raw embeddings must keep the index's
                     // storage scheme, or an update would silently convert a
-                    // binary index back to residual.
+                    // binary index back to residual, or a ternary index to scalar.
                     binary: self.metadata.binary,
+                    ternary: self.metadata.ternary,
                     ..Default::default()
                 };
 

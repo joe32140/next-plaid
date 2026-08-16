@@ -78,11 +78,16 @@ pub struct ResidualLut {
 /// the same as a 2-bit index. (Transcoding each stored byte *independently*
 /// is simpler — 5 trits to 2 bytes — but wastes 3 of every 8 slots, costing
 /// 8/5 lane occupancy in both the expand and the dot; this walks trits across
-/// byte boundaries instead.) Input byte `i` carries trits `5i..5i+4`, whose
-/// first output bit is `2·(5i mod 4)`; since `5 ≡ 1 (mod 4)` that offset is
-/// `2·(i mod 4)`, so the whole rewrite is a `[4][256] → u16` table indexed by
-/// `(i mod 4, byte)`, OR-ed in at output byte `5i/4`. Ten payload bits at an
-/// offset of at most 6 fit inside one `u16`.
+/// byte boundaries instead.)
+///
+/// It runs **four input bytes at a time**, because `4 × 5 = 20` trits is
+/// exactly `40` bits — five whole output bytes, straddling nothing on either
+/// side. Each byte's ten payload bits come from one `[256] → u16` table and
+/// shift to `10·(i mod 4)` within a `u64`, which then stores as five bytes.
+/// Grouping this way keeps every store *pure*: the per-byte form has to OR
+/// into the byte its predecessor already wrote, serializing the loop on
+/// read-modify-write store-forwarding — measured at roughly a third of
+/// ternary's rescore cost once the dot itself is fast (NEON).
 ///
 /// Bit-parity: real dims contribute the exact product the scalar base-3
 /// reference computes, and every slot past `dim` — whether it holds a padding
@@ -94,9 +99,9 @@ pub struct ResidualLut {
 /// bytes/token, and the repacked `ceil(dim/4)` bytes live only in a
 /// per-thread scratch.
 pub struct TernarySimd {
-    /// `[phase][byte] → u16`: that byte's five trits as 2-bit codes, shifted
-    /// to the output bit offset implied by the phase (`i mod 4`).
-    pub repack: Box<[[u16; 256]; 4]>,
+    /// `[byte] → u16`: that byte's five trits as 2-bit codes in the low ten
+    /// bits. The caller shifts by `10·(i mod 4)` into the group's `u64`.
+    pub repack: Box<[u16; 256]>,
     /// The companion LUT the kernels consume over repacked rows:
     /// `keys_per_byte = 4`, weights `[w₋, w₀, w₊, 0]`, `nibble` always `Some`
     /// (2-bit codes never cross a nibble; verified at build).
@@ -189,18 +194,15 @@ pub fn quantize_lut(codec: &ResidualCodec) -> Option<ResidualLut> {
                 *w = vals2[(byte >> (2 * k)) & 3];
             }
         }
-        // Phase `p = i mod 4` shifts the byte's five 2-bit codes to the output
-        // bit offset input byte `i` starts at (`2·(5i mod 4)` = `2·(i mod 4)`).
-        // Max shift is `2·(3 + 4) = 14`, so the payload always fits a u16.
-        let mut repack = Box::new([[0u16; 256]; 4]);
+        // Each byte's five trits as 2-bit codes in the low ten bits; the
+        // repack loop shifts by 10·(i mod 4) to place them in its group.
+        let mut repack = Box::new([0u16; 256]);
         for (byte, quintet) in trits.iter().enumerate() {
-            for (phase, table) in repack.iter_mut().enumerate() {
-                let mut v = 0u16;
-                for (k, &trit) in quintet.iter().enumerate() {
-                    v |= (trit as u16) << (2 * (phase + k));
-                }
-                table[byte] = v;
+            let mut v = 0u16;
+            for (k, &trit) in quintet.iter().enumerate() {
+                v |= (trit as u16) << (2 * k);
             }
+            repack[byte] = v;
         }
         // 2-bit codes never cross a nibble, so this factorization always
         // succeeds; guard anyway so a future packing change degrades to the
@@ -540,9 +542,9 @@ pub fn maxsim_residual_lut_i8(
             let edim = ternary_expanded_dim(dim);
             if edim <= MAX_DIM {
                 let src_cols = dim.div_ceil(crate::codec::TERNARY_TRITS_PER_BYTE);
-                // `edim/4` output bytes, plus slack: the last input byte's u16
-                // write can reach one byte past them (its trailing trits are
-                // padding, and the kernels never read past `edim/4`).
+                // `edim/4` output bytes, plus slack: the final group rounds up
+                // to whole bytes past them (those slots hold padding trits, and
+                // the kernels never read past `edim/4`).
                 let tcols = edim / 4 + 2;
                 let score = TRANSCODE_SCRATCH.with(|s| {
                     let buf = &mut *s.borrow_mut();
@@ -551,14 +553,29 @@ pub fn maxsim_residual_lut_i8(
                     buf.resize(ntok * tcols, 0);
                     for (t, row) in doc_packed.axis_iter(Axis(0)).enumerate() {
                         let dst = &mut buf[t * tcols..(t + 1) * tcols];
-                        for (i, &b) in row.iter().take(src_cols).enumerate() {
-                            // Ten payload bits at bit offset 2·(i mod 4),
-                            // anchored at output byte 5i/4; successive writes
-                            // overlap by design, hence OR into a zeroed row.
-                            let v = ts.repack[i & 3][b as usize];
-                            let j = 5 * i / 4;
-                            dst[j] |= v as u8;
-                            dst[j + 1] |= (v >> 8) as u8;
+                        let src = &row.as_slice().expect("packed row contiguous")[..src_cols];
+                        // Four input bytes = 20 trits = 40 bits = five output
+                        // bytes, exactly — so each group is an independent pure
+                        // store, no OR against the previous group.
+                        let mut groups = src.chunks_exact(4);
+                        for (g, quad) in groups.by_ref().enumerate() {
+                            let v = ts.repack[quad[0] as usize] as u64
+                                | (ts.repack[quad[1] as usize] as u64) << 10
+                                | (ts.repack[quad[2] as usize] as u64) << 20
+                                | (ts.repack[quad[3] as usize] as u64) << 30;
+                            dst[5 * g..5 * g + 5].copy_from_slice(&v.to_le_bytes()[..5]);
+                        }
+                        // Tail of 1–3 bytes: same accumulator, rounded up to
+                        // whole output bytes (10 bits each).
+                        let rem = groups.remainder();
+                        if !rem.is_empty() {
+                            let g = src_cols / 4;
+                            let mut v = 0u64;
+                            for (k, &b) in rem.iter().enumerate() {
+                                v |= (ts.repack[b as usize] as u64) << (10 * k);
+                            }
+                            let nbytes = (10 * rem.len()).div_ceil(8);
+                            dst[5 * g..5 * g + nbytes].copy_from_slice(&v.to_le_bytes()[..nbytes]);
                         }
                     }
                     let view = ndarray::ArrayView2::from_shape((ntok, tcols), &buf[..])
@@ -1455,11 +1472,24 @@ mod tests {
             for row in packed.axis_iter(Axis(0)) {
                 // Repack exactly as the dispatcher does.
                 let mut dst = vec![0u8; tcols];
-                for (i, &b) in row.iter().take(src_cols).enumerate() {
-                    let v = ts.repack[i & 3][b as usize];
-                    let j = 5 * i / 4;
-                    dst[j] |= v as u8;
-                    dst[j + 1] |= (v >> 8) as u8;
+                let src = &row.as_slice().unwrap()[..src_cols];
+                let mut groups = src.chunks_exact(4);
+                for (g, quad) in groups.by_ref().enumerate() {
+                    let v = ts.repack[quad[0] as usize] as u64
+                        | (ts.repack[quad[1] as usize] as u64) << 10
+                        | (ts.repack[quad[2] as usize] as u64) << 20
+                        | (ts.repack[quad[3] as usize] as u64) << 30;
+                    dst[5 * g..5 * g + 5].copy_from_slice(&v.to_le_bytes()[..5]);
+                }
+                let rem = groups.remainder();
+                if !rem.is_empty() {
+                    let g = src_cols / 4;
+                    let mut v = 0u64;
+                    for (k, &b) in rem.iter().enumerate() {
+                        v |= (ts.repack[b as usize] as u64) << (10 * k);
+                    }
+                    let nbytes = (10 * rem.len()).div_ceil(8);
+                    dst[5 * g..5 * g + nbytes].copy_from_slice(&v.to_le_bytes()[..nbytes]);
                 }
                 // Every real dim must expand to the same int8 weight the
                 // base-3 fused table gives at that dim.

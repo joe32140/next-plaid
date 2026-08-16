@@ -202,8 +202,8 @@ fn main() {
         dim
     );
     println!(
-        "\n{:<9} {:>8} {:>10} {:>11}  {}",
-        "profile", "B/token", "NDCG@10", "reconCos", "notes"
+        "\n{:<9} {:>8} {:>10} {:>11}  notes",
+        "profile", "B/token", "NDCG@10", "reconCos"
     );
     println!("{}", "-".repeat(60));
 
@@ -211,8 +211,11 @@ fn main() {
     let (flat_float, dindex) = flatten(&docs, dim);
     let float_ndcg = eval_ndcg(&flat_float, &dindex, &qs, &query_ids, &corpus_ids, &qrels);
     println!(
-        "{:<9} {:>7}B {:>10.4} {:>11}  {}",
-        "float", dim * 4, float_ndcg, "1.0000", "lossless ceiling"
+        "{:<9} {:>7}B {:>10.4} {:>11}  lossless ceiling",
+        "float",
+        dim * 4,
+        float_ndcg,
+        "1.0000"
     );
 
     let profiles: Vec<(&str, IndexConfig, usize)> = vec![

@@ -198,3 +198,54 @@ fn ternary_metadata_round_trips_through_load() {
     let result = reloaded.search(&docs[5], &params(), None).unwrap();
     assert_eq!(result.passage_ids.first(), Some(&5));
 }
+
+#[test]
+fn ternary_asymmetric_scoring_agrees_with_float() {
+    // #169's asymmetric residual LUT, extended to base-3: scoring a ternary
+    // index with `residual_asym` (int8 query x fused trit LUT, no float
+    // reconstruction) must rank the same as the float reconstruct path. The
+    // only slack is int8 query quantization, so top-1 must match exactly and
+    // the top-10 sets overlap almost completely.
+    let dim = 64usize;
+    let docs = random_docs(64, 10, dim);
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_str().unwrap();
+    MmapIndex::create_with_kmeans(&docs, path, &ternary_config()).unwrap();
+    let index = MmapIndex::load(path).unwrap();
+
+    let float = SearchParameters {
+        top_k: 10,
+        n_ivf_probe: 16,
+        residual_asym: false,
+        ..Default::default()
+    };
+    let asym = SearchParameters {
+        top_k: 10,
+        n_ivf_probe: 16,
+        residual_asym: true,
+        ..Default::default()
+    };
+
+    let mut overlap_total = 0usize;
+    for (i, q) in docs.iter().enumerate() {
+        let rf = index.search(q, &float, None).unwrap();
+        let ra = index.search(q, &asym, None).unwrap();
+        assert_eq!(
+            ra.passage_ids.first(),
+            Some(&(i as i64)),
+            "asym self-retrieval must place the query doc at rank 0"
+        );
+        assert_eq!(
+            rf.passage_ids.first(),
+            ra.passage_ids.first(),
+            "asym top-1 disagrees with float for query {i}"
+        );
+        let fset: std::collections::HashSet<i64> = rf.passage_ids.iter().copied().collect();
+        overlap_total += ra.passage_ids.iter().filter(|id| fset.contains(id)).count();
+    }
+    let avg_overlap = overlap_total as f64 / docs.len() as f64;
+    assert!(
+        avg_overlap >= 9.0,
+        "asym vs float mean top-10 overlap {avg_overlap:.2} < 9.0"
+    );
+}

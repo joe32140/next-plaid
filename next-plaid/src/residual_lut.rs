@@ -68,35 +68,45 @@ pub struct ResidualLut {
 /// instead of needing a fourth kernel family per ISA.
 ///
 /// A ternary byte packs five trits in base 3, so no trit is a function of a
-/// single nibble and [`derive_nibble_lut`] rightly refuses it. But a 256-entry
-/// table can transcode each stored byte into **two nibble-aligned bytes**
-/// holding the five trits as 2-bit codes (0/1/2 = the trit, 3 = a dead slot
-/// whose weight is 0): byte A carries trits 0–3 in keys 0–3, byte B carries
-/// trit 4 in key 0 and dead codes above. Scoring then runs the unmodified
-/// `tbl`/`pshufb` kernels over the transcoded row with `keys_per_byte = 4`
-/// and the weight alphabet `[w₋, w₀, w₊, 0]`, against query planes whose
-/// dead slots hold 0 — so every real dim contributes the exact product the
-/// scalar base-3 reference computes and every dead slot contributes `0·w = 0`.
-/// The integer accumulator is therefore bit-equal to the scalar kernel's.
+/// single nibble and [`derive_nibble_lut`] rightly refuses it. The way onto
+/// the nibble kernels is to change the alphabet: rewrite the row as 2-bit
+/// codes (0/1/2 = the trit) and score it with `keys_per_byte = 4` and the
+/// weight alphabet `[w₋, w₀, w₊, 0]`.
 ///
-/// Cost: a 26 → 52 byte table walk per token (amortized over all query rows)
-/// and 8/5 lane occupancy in the dot product. The on-disk index is untouched —
-/// ternary keeps its `ceil(dim/5)` bytes/token; the expansion lives only in a
-/// per-thread scratch. The expanded dim `8·ceil(dim/5)` is always a multiple
-/// of 8, so any real dim up to [`MAX_DIM`]·5/8 (= 160) takes the SIMD path.
+/// The repack is **dense** — trit `d` lands at output byte `d/4`, key `d%4`,
+/// so `dim` trits occupy exactly `ceil(dim/4)` bytes and `dim` SIMD lanes,
+/// the same as a 2-bit index. (Transcoding each stored byte *independently*
+/// is simpler — 5 trits to 2 bytes — but wastes 3 of every 8 slots, costing
+/// 8/5 lane occupancy in both the expand and the dot; this walks trits across
+/// byte boundaries instead.) Input byte `i` carries trits `5i..5i+4`, whose
+/// first output bit is `2·(5i mod 4)`; since `5 ≡ 1 (mod 4)` that offset is
+/// `2·(i mod 4)`, so the whole rewrite is a `[4][256] → u16` table indexed by
+/// `(i mod 4, byte)`, OR-ed in at output byte `5i/4`. Ten payload bits at an
+/// offset of at most 6 fit inside one `u16`.
+///
+/// Bit-parity: real dims contribute the exact product the scalar base-3
+/// reference computes, and every slot past `dim` — whether it holds a padding
+/// trit or the zero-init code 0 — meets a **zeroed query lane** (see
+/// `build_query_planes_ternary`), contributing `0·w = 0` exactly. So the
+/// integer accumulator equals the scalar kernel's.
+///
+/// The on-disk index is untouched: ternary keeps its `ceil(dim/5)`
+/// bytes/token, and the repacked `ceil(dim/4)` bytes live only in a
+/// per-thread scratch.
 pub struct TernarySimd {
-    /// Stored byte → its two transcoded bytes `[trits 0–3, trit 4 | dead]`.
-    pub transcode: Box<[[u8; 2]; 256]>,
-    /// The companion LUT the kernels consume over transcoded rows:
+    /// `[phase][byte] → u16`: that byte's five trits as 2-bit codes, shifted
+    /// to the output bit offset implied by the phase (`i mod 4`).
+    pub repack: Box<[[u16; 256]; 4]>,
+    /// The companion LUT the kernels consume over repacked rows:
     /// `keys_per_byte = 4`, weights `[w₋, w₀, w₊, 0]`, `nibble` always `Some`
     /// (2-bit codes never cross a nibble; verified at build).
     pub lut2: Box<ResidualLut>,
 }
 
 /// Lane count the SIMD kernels see for a ternary index of real dim `dim`:
-/// two transcoded bytes × four keys per stored byte.
+/// the dense repack rounds up to whole 4-trit output bytes.
 pub fn ternary_expanded_dim(dim: usize) -> usize {
-    8 * dim.div_ceil(5)
+    4 * dim.div_ceil(4)
 }
 
 /// The fused table factored per key position into 16-entry nibble tables —
@@ -179,18 +189,24 @@ pub fn quantize_lut(codec: &ResidualCodec) -> Option<ResidualLut> {
                 *w = vals2[(byte >> (2 * k)) & 3];
             }
         }
-        let mut transcode = Box::new([[0u8; 2]; 256]);
+        // Phase `p = i mod 4` shifts the byte's five 2-bit codes to the output
+        // bit offset input byte `i` starts at (`2·(5i mod 4)` = `2·(i mod 4)`).
+        // Max shift is `2·(3 + 4) = 14`, so the payload always fits a u16.
+        let mut repack = Box::new([[0u16; 256]; 4]);
         for (byte, quintet) in trits.iter().enumerate() {
-            transcode[byte] = [
-                quintet[0] | quintet[1] << 2 | quintet[2] << 4 | quintet[3] << 6,
-                quintet[4] | 0b11_11_11_00, // dead code 3 in keys 1..3
-            ];
+            for (phase, table) in repack.iter_mut().enumerate() {
+                let mut v = 0u16;
+                for (k, &trit) in quintet.iter().enumerate() {
+                    v |= (trit as u16) << (2 * (phase + k));
+                }
+                table[byte] = v;
+            }
         }
         // 2-bit codes never cross a nibble, so this factorization always
         // succeeds; guard anyway so a future packing change degrades to the
         // scalar kernel instead of silently mis-scoring.
         let ternary_simd = derive_nibble_lut(&fused2, 4).map(|nib2| TernarySimd {
-            transcode,
+            repack,
             lut2: Box::new(ResidualLut {
                 fused: fused2,
                 keys_per_byte: 4,
@@ -272,27 +288,29 @@ pub fn build_query_planes(q8: &QueryI8, lut: &ResidualLut, dim: usize) -> QueryP
     QueryPlanes { data, stride, sqw }
 }
 
-/// Ternary planes: plane order over the *transcoded* stream. Expanded slot
-/// `s` (byte `s/4`, key `s%4`) maps to real dim `5·(s/8) + s%8` when
-/// `s%8 < 5`; the three dead keys of every odd transcoded byte — and the
-/// padding trits past `dim` in the last stored byte — get a 0 lane, which
-/// zeroes whatever weight the kernel looks up there (`0·w = 0`, exact in
-/// integer arithmetic, so bit-parity with the scalar base-3 kernel holds).
+/// Ternary planes: plane order over the *repacked* 2-bit stream. The dense
+/// repack puts real dim `d` at output byte `d/4`, key `d%4` — the same
+/// mapping the scalar rungs use — so this differs from the generic builder
+/// only in rounding `pdim` up and zeroing the tail lanes past `dim`. Those
+/// zeros are what make the repack's trailing slots (padding trits, or the
+/// zero-init code 0) contribute `0·w = 0`, exactly, preserving bit-parity
+/// with the scalar base-3 kernel.
 fn build_query_planes_ternary(q8: &QueryI8, lut: &ResidualLut, dim: usize) -> QueryPlanes {
     let nq = q8.values.nrows();
     let edim = ternary_expanded_dim(dim);
-    let pdim = edim / 4; // transcoded bytes per token
+    let pdim = edim / 4; // repacked bytes per token
     let stride = crate::binary::padded_stride(edim);
     let qv = q8.values.as_slice().expect("QueryI8.values is contiguous");
     let mut data = vec![0i8; nq * stride];
     for qi in 0..nq {
         let row = &qv[qi * dim..(qi + 1) * dim];
         let out = &mut data[qi * stride..qi * stride + edim];
-        for s in 0..edim {
-            let r = s % 8;
-            let d = 5 * (s / 8) + r;
-            if r < 5 && d < dim {
-                out[(s % 4) * pdim + s / 4] = row[d];
+        for i in 0..pdim {
+            for k in 0..4 {
+                let d = 4 * i + k;
+                if d < dim {
+                    out[k * pdim + i] = row[d];
+                }
             }
         }
     }
@@ -515,16 +533,17 @@ pub fn maxsim_residual_lut_i8(
                 }
             }
         }
-        // Ternary: transcode the stored base-3 rows into the nibble-aligned
-        // 2-bit stream and run the very same kernels over it with the
-        // companion LUT (see [`TernarySimd`] for the bit-parity argument).
-        // The expanded dim is always a multiple of 8, so the only shape gate
-        // is the kernels' expansion-buffer ceiling.
+        // Ternary: repack the stored base-3 rows into a dense 2-bit stream and
+        // run the very same kernels over it with the companion LUT (see
+        // [`TernarySimd`] for the layout and the bit-parity argument).
         if let (Some(planes), Some(ts)) = (planes, lut.ternary_simd.as_ref()) {
             let edim = ternary_expanded_dim(dim);
             if edim <= MAX_DIM {
                 let src_cols = dim.div_ceil(crate::codec::TERNARY_TRITS_PER_BYTE);
-                let tcols = 2 * src_cols;
+                // `edim/4` output bytes, plus slack: the last input byte's u16
+                // write can reach one byte past them (its trailing trits are
+                // padding, and the kernels never read past `edim/4`).
+                let tcols = edim / 4 + 2;
                 let score = TRANSCODE_SCRATCH.with(|s| {
                     let buf = &mut *s.borrow_mut();
                     let ntok = doc_packed.nrows();
@@ -533,7 +552,13 @@ pub fn maxsim_residual_lut_i8(
                     for (t, row) in doc_packed.axis_iter(Axis(0)).enumerate() {
                         let dst = &mut buf[t * tcols..(t + 1) * tcols];
                         for (i, &b) in row.iter().take(src_cols).enumerate() {
-                            dst[2 * i..2 * i + 2].copy_from_slice(&ts.transcode[b as usize]);
+                            // Ten payload bits at bit offset 2·(i mod 4),
+                            // anchored at output byte 5i/4; successive writes
+                            // overlap by design, hence OR into a zeroed row.
+                            let v = ts.repack[i & 3][b as usize];
+                            let j = 5 * i / 4;
+                            dst[j] |= v as u8;
+                            dst[j + 1] |= (v >> 8) as u8;
                         }
                     }
                     let view = ndarray::ArrayView2::from_shape((ntok, tcols), &buf[..])
@@ -1400,60 +1425,63 @@ mod tests {
         }
     }
 
-    /// The transcode table must map every stored byte to two nibble-aligned
-    /// bytes whose companion-LUT expansion reproduces the base-3 fused row
-    /// exactly, with weight 0 in all three dead slots — the invariant that
-    /// makes the transcoded SIMD accumulator equal the scalar one.
+    /// The dense repack must place trit `d` of the stored row at output byte
+    /// `d/4`, key `d%4` — the invariant that lets the companion LUT reproduce
+    /// the base-3 fused weights lane for lane. Walks whole rows so every phase
+    /// and every cross-byte carry is exercised.
     #[test]
-    fn ternary_transcode_matches_fused() {
+    fn ternary_repack_is_dense_and_matches_fused() {
         let mut rng = StdRng::seed_from_u64(17);
-        let codec = toy_ternary_codec(40, 8, &mut rng);
-        let lut = quantize_lut(&codec).unwrap();
-        let ts = lut.ternary_simd.as_ref().expect("transcode built");
-        assert_eq!(ts.lut2.keys_per_byte, 4);
-        assert_eq!(
-            ts.lut2.scale, lut.scale,
-            "shared scale is the parity precondition"
-        );
-        assert!(ts.lut2.nibble.is_some(), "companion LUT must nibble-factor");
-        for b in 0..256usize {
-            let [a, c] = ts.transcode[b];
-            // Keys 0..3 of byte A and key 0 of byte B are the five trits.
-            for k in 0..4 {
-                assert_eq!(
-                    ts.lut2.fused[a as usize * 4 + k],
-                    lut.fused[b * 5 + k],
-                    "byte={b} trit={k}"
-                );
-            }
+        for &dim in &[10usize, 40, 48, 128, 130] {
+            let codec = toy_ternary_codec(dim, 8, &mut rng);
+            let lut = quantize_lut(&codec).unwrap();
+            let ts = lut.ternary_simd.as_ref().expect("repack built");
+            assert_eq!(ts.lut2.keys_per_byte, 4);
             assert_eq!(
-                ts.lut2.fused[c as usize * 4],
-                lut.fused[b * 5 + 4],
-                "byte={b} trit=4"
+                ts.lut2.scale, lut.scale,
+                "shared scale is the parity precondition"
             );
-            // Dead slots must carry weight 0 (belt and braces on top of the
-            // zeroed query lanes).
-            for k in 1..4 {
-                assert_eq!(
-                    ts.lut2.fused[c as usize * 4 + k],
-                    0,
-                    "byte={b} dead key={k}"
-                );
+            assert!(ts.lut2.nibble.is_some(), "companion LUT must nibble-factor");
+            assert_eq!(
+                ternary_expanded_dim(dim) / 4,
+                dim.div_ceil(4),
+                "dense repack must occupy ceil(dim/4) bytes, same as 2-bit"
+            );
+
+            let res = Array2::from_shape_fn((4, dim), |_| rng.gen_range(-0.4f32..0.4));
+            let packed = codec.quantize_residuals(&res).unwrap();
+            let src_cols = dim.div_ceil(5);
+            let tcols = ternary_expanded_dim(dim) / 4 + 2;
+            for row in packed.axis_iter(Axis(0)) {
+                // Repack exactly as the dispatcher does.
+                let mut dst = vec![0u8; tcols];
+                for (i, &b) in row.iter().take(src_cols).enumerate() {
+                    let v = ts.repack[i & 3][b as usize];
+                    let j = 5 * i / 4;
+                    dst[j] |= v as u8;
+                    dst[j + 1] |= (v >> 8) as u8;
+                }
+                // Every real dim must expand to the same int8 weight the
+                // base-3 fused table gives at that dim.
+                for d in 0..dim {
+                    let scalar_w = lut.fused[row[d / 5] as usize * 5 + d % 5];
+                    let repacked_w = ts.lut2.fused[dst[d / 4] as usize * 4 + d % 4];
+                    assert_eq!(repacked_w, scalar_w, "dim={dim} d={d}");
+                }
             }
         }
     }
 
-    /// The ternary transcode route through the public dispatcher must equal
-    /// the scalar base-3 reference bit-for-bit — same integer accumulator
-    /// (zero lanes at dead/padding slots), same float epilogue. Covers dims
-    /// that are not multiples of 8 or 5 (the transcoded stream is always
-    /// 8-aligned) and the `edim == MAX_DIM` boundary (dim 160).
+    /// The ternary repack route through the public dispatcher must equal the
+    /// scalar base-3 reference bit-for-bit — same integer accumulator (zero
+    /// query lanes at the tail slots), same float epilogue. Covers dims that
+    /// are multiples of neither 8 nor 5, and the `edim == MAX_DIM` boundary.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn ternary_simd_matches_scalar_bitwise() {
         let mut rng = StdRng::seed_from_u64(29);
         for &nq in &[3usize, 9, 32] {
-            for &dim in &[5usize, 7, 10, 40, 48, 64, 128, 130, 160] {
+            for &dim in &[5usize, 7, 10, 40, 48, 64, 128, 130, 160, 200, 256] {
                 let k = 12;
                 let codec = toy_ternary_codec(dim, k, &mut rng);
                 let lut = quantize_lut(&codec).unwrap();
@@ -1491,7 +1519,7 @@ mod tests {
                 assert_eq!(
                     scalar.to_bits(),
                     simd.to_bits(),
-                    "nq={nq} dim={dim}: scalar {scalar} != transcoded simd {simd}"
+                    "nq={nq} dim={dim}: scalar {scalar} != repacked simd {simd}"
                 );
             }
         }

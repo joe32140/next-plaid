@@ -173,6 +173,15 @@ fn ternary_cfg() -> IndexConfig {
     }
 }
 
+/// Ternary with an explicit dead-zone width (`|r| < tau*sigma` stores 0)
+/// instead of the equal-mass 1/3–2/3 quantile split.
+fn ternary_tau_cfg(tau: f32) -> IndexConfig {
+    IndexConfig {
+        ternary_tau: Some(tau),
+        ..ternary_cfg()
+    }
+}
+
 fn main() {
     let dir = std::env::args()
         .nth(1)
@@ -222,6 +231,9 @@ fn main() {
         ("4-bit", scalar_cfg(4), dim / 2),
         ("2-bit", scalar_cfg(2), dim / 4),
         ("ternary", ternary_cfg(), dim.div_ceil(5)),
+        ("tern@.50", ternary_tau_cfg(0.50), dim.div_ceil(5)),
+        ("tern@.65", ternary_tau_cfg(0.65), dim.div_ceil(5)),
+        ("tern@.80", ternary_tau_cfg(0.80), dim.div_ceil(5)),
         ("1-bit", scalar_cfg(1), dim / 8),
     ];
 

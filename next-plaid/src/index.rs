@@ -157,6 +157,18 @@ pub struct IndexConfig {
     /// it supersedes `nbits`. Mutually exclusive with `binary`.
     #[serde(default)]
     pub ternary: bool,
+    /// Width of ternary's dead zone, in units of the residual standard
+    /// deviation: a dimension stores `0` when `|r| < ternary_tau · σ`, else
+    /// `±E[|r| : live]`. `None` (the default) keeps the equal-mass split —
+    /// cutoffs at the 1/3 and 2/3 residual quantiles, which zeroes exactly a
+    /// third of the dimensions regardless of how the residuals are shaped.
+    ///
+    /// The knob exists because the dead zone is the codec's one real degree of
+    /// freedom: three levels spent where the mass actually is. On roughly
+    /// Gaussian residuals `tau = 0.65` zeroes ~48 % of dims, buying a larger
+    /// magnitude for the ones that survive. Ignored unless `ternary`.
+    #[serde(default)]
+    pub ternary_tau: Option<f32>,
 }
 
 fn default_start_from_scratch() -> usize {
@@ -185,6 +197,7 @@ impl Default for IndexConfig {
             fts_tokenizer: crate::text_search::FtsTokenizer::default(),
             binary: false,
             ternary: false,
+            ternary_tau: None,
         }
     }
 }
@@ -294,6 +307,43 @@ pub struct PreparedCodecArtifacts {
     pub avg_res_per_dim: Array1<f32>,
 }
 
+/// Ternary buckets from a dead-zone width rather than equal-mass quantiles.
+///
+/// A dimension is *live* when `|r| >= tau * sigma` (sigma over all residuals);
+/// live dims store `±E[|r| : live]`, dead dims store exactly `0`. This is the
+/// construction the TACET dead-zone sweep tuned, restated for the codec's
+/// global two-cutoff/three-weight format: the equal-mass default always zeroes
+/// a third of the dimensions, while `tau` lets the dead zone follow the actual
+/// residual distribution (`tau = 0.65` zeroes ~48 % of Gaussian residuals) and
+/// spends the surviving levels on a correspondingly larger magnitude.
+///
+/// Returns `(cutoffs, weights)` shaped as [`ResidualCodec::new_ternary`] wants:
+/// `[-t, +t]` and `[-m, 0, +m]`.
+fn ternary_deadzone_buckets(flat: &Array1<f32>, tau: f32) -> (Array1<f32>, Array1<f32>) {
+    let n = flat.len().max(1) as f32;
+    let mean = flat.iter().sum::<f32>() / n;
+    let var = flat.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / n;
+    let t = tau * var.sqrt();
+    let (sum, count) = flat.iter().fold((0.0f32, 0usize), |(s, c), &x| {
+        if x.abs() >= t {
+            (s + x.abs(), c + 1)
+        } else {
+            (s, c)
+        }
+    });
+    // All-dead (tau past every residual) would give a zero codec; fall back to
+    // the mean magnitude so the index still discriminates.
+    let m = if count > 0 {
+        sum / count as f32
+    } else {
+        flat.iter().map(|x| x.abs()).sum::<f32>() / n
+    };
+    (
+        Array1::from_vec(vec![-t, t]),
+        Array1::from_vec(vec![-m, 0.0, m]),
+    )
+}
+
 pub fn prepare_codec_artifacts(
     embeddings: &[Array2<f32>],
     centroids: Array2<f32>,
@@ -385,8 +435,13 @@ pub fn prepare_codec_artifacts(
         .collect();
 
     let flat_residuals: Array1<f32> = residuals.iter().copied().collect();
-    let bucket_cutoffs = Array1::from_vec(quantiles(&flat_residuals, &quantile_values));
-    let bucket_weights = Array1::from_vec(quantiles(&flat_residuals, &weight_quantile_values));
+    let (bucket_cutoffs, bucket_weights) = match config.ternary.then_some(config.ternary_tau) {
+        Some(Some(tau)) => ternary_deadzone_buckets(&flat_residuals, tau),
+        _ => (
+            Array1::from_vec(quantiles(&flat_residuals, &quantile_values)),
+            Array1::from_vec(quantiles(&flat_residuals, &weight_quantile_values)),
+        ),
+    };
 
     let codec = if config.ternary {
         ResidualCodec::new_ternary(
@@ -819,8 +874,13 @@ pub fn create_index_files(
 
     // Flatten residuals for quantile computation
     let flat_residuals: Array1<f32> = residuals.iter().copied().collect();
-    let bucket_cutoffs = Array1::from_vec(quantiles(&flat_residuals, &quantile_values));
-    let bucket_weights = Array1::from_vec(quantiles(&flat_residuals, &weight_quantile_values));
+    let (bucket_cutoffs, bucket_weights) = match config.ternary.then_some(config.ternary_tau) {
+        Some(Some(tau)) => ternary_deadzone_buckets(&flat_residuals, tau),
+        _ => (
+            Array1::from_vec(quantiles(&flat_residuals, &quantile_values)),
+            Array1::from_vec(quantiles(&flat_residuals, &weight_quantile_values)),
+        ),
+    };
 
     let codec = if config.ternary {
         ResidualCodec::new_ternary(

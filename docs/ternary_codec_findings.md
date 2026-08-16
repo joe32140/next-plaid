@@ -28,6 +28,68 @@
   stage-1-bound (unchanged by #169, #170's territory). See
   [CI rescore ratios](#ci-rescore-ratios-contention-free).
 
+## r=1 vs r=2 vs ternary — head to head
+
+Everything below is one table: storage is exact, NDCG is the 7-cell mean over
+model×corpus cells (codec-isolated, fixed k-means seed), rescore is CI ns/token at dim 128.
+
+| | **r=1** (1-bit) | **ternary** | **r=2** (2-bit) |
+|---|--:|--:|--:|
+| bits / dim | 1.000 | 1.585 | 2.000 |
+| **B/token @ dim128** | **16** | **26** | **32** |
+| B/token @ dim96 | 12 | 20 | 24 |
+| vs r=2 storage | −50 % | **−19 %** | — |
+| **mean NDCG retention** (7 cells) | **96.86 %** | **98.31 %** | **98.84 %** |
+| worst cell | 93.91 % | 95.85 % | 97.58 % |
+| best cell | 99.01 % | 99.79 % | 100.00 % |
+| cells where it beats r=2 | 0 / 7 | 1 / 7 (+1 tie) | — |
+| cells where it beats r=1 | — | **7 / 7** | 7 / 7 |
+| mean reconCos | 0.9678 | 0.9792 | 0.9847 |
+| rescore ns/tok — x86 `avx2` | 102.5 | 138.5 | 123.3 |
+| rescore ns/tok — arm `neon-sdot` | 70.3 | 96.6 | 70.3 |
+| asym vs float — x86 / arm | 5.44× / 2.90× | 3.23× / 2.58× | 4.06× / 4.53× |
+
+**Retention per cell** (NDCG@10 ÷ float ceiling; raw NDCG in parentheses):
+
+| bundle (fragility axis) | float | **r=1** | **ternary** | **r=2** |
+|---|--:|--:|--:|--:|
+| scifact / ColBERTv2 | 0.6464 | 99.01 % (.6400) | 99.18 % (.6411) | 100.00 % (.6464) |
+| nfcorpus / ColBERTv2 | 0.3324 | 98.62 % (.3278) | 99.79 % (.3317) | 99.79 % (.3317) |
+| scifact / mxbai (capacity) | 0.6309 | 97.18 % (.6131) | 99.03 % (.6248) | 99.10 % (.6252) |
+| nfcorpus / mxbai (capacity) | 0.3092 | 98.25 % (.3038) | **99.26 % (.3069)** | 98.64 % (.3050) |
+| scifact / mLateOn (basis) | 0.7533 | 96.20 % (.7247) | 97.96 % (.7379) | 98.43 % (.7415) |
+| nfcorpus / mLateOn (basis) | 0.3759 | 93.91 % (.3530) | 95.85 % (.3603) | 97.58 % (.3668) |
+| nfcorpus / answerai (dim96) | 0.3725 | 94.84 % (.3533) | 97.10 % (.3617) | 98.31 % (.3662) |
+
+**Reading it:**
+
+1. **Ternary beats r=1 in 7/7 cells** — never a reason to prefer r=1 on quality, only on
+   size (16 B vs 26 B).
+2. **Ternary does *not* beat r=2 here** (1 win, 1 tie, 5 losses; −0.53 pp mean). It buys
+   19 % of the bytes back for about half a point of retention.
+3. **But it's the more efficient step down from r=2**: ternary costs 0.088 pp of retention
+   per byte saved, r=1 costs 0.124 pp — the marginal price of dropping bits accelerates,
+   and ternary sits on the good side of that knee.
+4. **Where it lands depends on the fragility axis** (the finding this study added):
+   ties/beats r=2 on *capacity*-limited mxbai, clearly below r=2 on *basis*-fragile
+   mLateOn and small-dim answerai.
+5. **Rescore cost is now in the same class for all three** (previous versions of this doc
+   had ternary at 611 ns/tok on x86 — 5× the others — before the transcode landed). Ternary
+   pays ~12 % over r=2 on x86 and ~37 % on arm, the 8/5 lane-occupancy tax.
+
+> ⚠️ **Ternary's dead-zone is untuned here.** `create_with_kmeans` sets its cutoffs at the
+> 1/3 and 2/3 residual quantiles — equal-mass buckets, so ~⅓ of dims land in the dead zone
+> by construction. An earlier 14-cell TACET sweep that *tuned* the dead-zone width (τ ≈
+> 0.5–0.65) had ternary beating r=2 on average retention; this study, with the fixed
+> tertile split, has it 0.53 pp below. **The gap between those two results is most likely
+> the missing τ tuning, and closing it is the open lever** — a wider dead zone spends its
+> three levels where the residual distribution actually is. Until that is measured, read
+> row 2 above as "ternary at its default τ", not "ternary at its best".
+
+**Pick:** r=2 when quality is the binding constraint; **ternary when footprint is** (19 %
+smaller, ~0.5 pp, and free on capacity-bound checkpoints); r=1 only when 16 B/token is a
+hard requirement, since ternary dominates it on quality everywhere for 10 more bytes.
+
 ## What shipped (integration)
 
 `integration/ternary-asym` reconciles four lines of work:

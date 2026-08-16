@@ -35,9 +35,7 @@ use ndarray::{Array1, Array2};
 use next_plaid::binary::quantize_query_i8;
 use next_plaid::codec::ResidualCodec;
 use next_plaid::maxsim::maxsim_score;
-use next_plaid::residual_lut::{
-    active_kernel_name, build_query_planes, maxsim_residual_lut_i8, quantize_lut,
-};
+use next_plaid::residual_lut::{build_query_planes, maxsim_residual_lut_i8, quantize_lut};
 use rayon::prelude::*;
 use std::time::Instant;
 
@@ -99,7 +97,8 @@ fn synth_codec(dim: usize, nbits: usize, k: usize, rng: &mut Lcg) -> ResidualCod
 /// The ternary (base-3 dead-zone) analogue of [`synth_codec`]: two cutoffs at the
 /// residual tertiles and three weights at the bucket centers, so the `{-m,0,+m}`
 /// buckets sit on the same synthetic distribution. `quantize_lut` maps this to the
-/// base-3 fused table (`nibble = None`), so asym scores it on the *scalar* kernel —
+/// base-3 fused table plus a `TernarySimd` transcode, so asym rides the same
+/// nibble SIMD kernels as the scalar rungs (via the 2-bit transcoded stream) —
 /// exactly what a real ternary index dispatches to.
 fn synth_ternary_codec(dim: usize, k: usize, rng: &mut Lcg) -> ResidualCodec {
     let centroids = rng.array(k, dim, 1.0);
@@ -184,7 +183,7 @@ fn main() {
     let cdot_t = rng.array(k, nq, 1.0);
     let inv: Vec<f32> = (0..tokens).map(|_| 1.0).collect();
 
-    let kernel = active_kernel_name(dim, lut.nibble.is_some());
+    let kernel = lut.kernel_name(dim);
     println!("\nnext-plaid asym rescore check");
     println!(
         "  build        {}-{}",

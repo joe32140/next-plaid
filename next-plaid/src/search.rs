@@ -164,10 +164,14 @@ fn report_asym_dispatch(index: &crate::index::MmapIndex, got: AsymDispatch) {
     ONCE.call_once(|| {
         let dim = index.codec.embedding_dim();
         match got {
-            AsymDispatch::Simd => eprintln!(
-                "[next-plaid] residual_asym: {} kernel (dim={dim})",
-                crate::residual_lut::active_kernel_name(dim, true)
-            ),
+            AsymDispatch::Simd => {
+                // Rebuilding the LUT here is once-per-process (ONCE above) and
+                // keeps the name honest for every route, ternary included.
+                let name = crate::residual_lut::quantize_lut(&index.codec)
+                    .map(|l| l.kernel_name(dim))
+                    .unwrap_or("unknown");
+                eprintln!("[next-plaid] residual_asym: {name} kernel (dim={dim})")
+            }
             AsymDispatch::Scalar => eprintln!(
                 "[next-plaid] residual_asym: no SIMD dispatch (dim={dim}) — running the \
                  scalar kernel. Scores are correct, but only marginally faster than float \
@@ -200,15 +204,15 @@ fn prepare_score_query<'a>(
         if let Some(lut) = crate::residual_lut::quantize_lut(&index.codec) {
             let dim = index.codec.embedding_dim();
             let q8 = crate::binary::quantize_query_i8(&query.view());
-            // Planes feed the nibble-factored SIMD kernels only; the ternary LUT
-            // (`nibble = None`, base-3) always scores scalar, so skip building
-            // planes it would never read (and whose exact-division stride math
-            // does not apply to five trits per byte).
-            let planes = (dim.is_multiple_of(8) && lut.nibble.is_some())
+            // The LUT knows which SIMD route (nibble-factored, or ternary's
+            // transcoded stream) its planes would feed, and whether the shape
+            // qualifies — `wants_planes` skips building planes nothing reads.
+            let planes = lut
+                .wants_planes(dim)
                 .then(|| crate::residual_lut::build_query_planes(&q8, &lut, dim));
             report_asym_dispatch(
                 index,
-                if crate::residual_lut::simd_dispatch_available(dim, lut.nibble.is_some()) {
+                if lut.simd_available(dim) {
                     AsymDispatch::Simd
                 } else {
                     AsymDispatch::Scalar

@@ -58,6 +58,45 @@ pub struct ResidualLut {
     pub scale: f32,
     /// Nibble-factored form of `fused` for the SIMD expand paths.
     pub nibble: Option<NibbleLut>,
+    /// Ternary's route onto those same SIMD paths: a byte transcode plus a
+    /// 2-bit-alphabet companion LUT (see [`TernarySimd`]). `None` for the
+    /// scalar rungs and when construction cannot factor.
+    pub ternary_simd: Option<TernarySimd>,
+}
+
+/// Lets the base-3 ternary codec ride the *existing* nibble SIMD kernels
+/// instead of needing a fourth kernel family per ISA.
+///
+/// A ternary byte packs five trits in base 3, so no trit is a function of a
+/// single nibble and [`derive_nibble_lut`] rightly refuses it. But a 256-entry
+/// table can transcode each stored byte into **two nibble-aligned bytes**
+/// holding the five trits as 2-bit codes (0/1/2 = the trit, 3 = a dead slot
+/// whose weight is 0): byte A carries trits 0–3 in keys 0–3, byte B carries
+/// trit 4 in key 0 and dead codes above. Scoring then runs the unmodified
+/// `tbl`/`pshufb` kernels over the transcoded row with `keys_per_byte = 4`
+/// and the weight alphabet `[w₋, w₀, w₊, 0]`, against query planes whose
+/// dead slots hold 0 — so every real dim contributes the exact product the
+/// scalar base-3 reference computes and every dead slot contributes `0·w = 0`.
+/// The integer accumulator is therefore bit-equal to the scalar kernel's.
+///
+/// Cost: a 26 → 52 byte table walk per token (amortized over all query rows)
+/// and 8/5 lane occupancy in the dot product. The on-disk index is untouched —
+/// ternary keeps its `ceil(dim/5)` bytes/token; the expansion lives only in a
+/// per-thread scratch. The expanded dim `8·ceil(dim/5)` is always a multiple
+/// of 8, so any real dim up to [`MAX_DIM`]·5/8 (= 160) takes the SIMD path.
+pub struct TernarySimd {
+    /// Stored byte → its two transcoded bytes `[trits 0–3, trit 4 | dead]`.
+    pub transcode: Box<[[u8; 2]; 256]>,
+    /// The companion LUT the kernels consume over transcoded rows:
+    /// `keys_per_byte = 4`, weights `[w₋, w₀, w₊, 0]`, `nibble` always `Some`
+    /// (2-bit codes never cross a nibble; verified at build).
+    pub lut2: Box<ResidualLut>,
+}
+
+/// Lane count the SIMD kernels see for a ternary index of real dim `dim`:
+/// two transcoded bytes × four keys per stored byte.
+pub fn ternary_expanded_dim(dim: usize) -> usize {
+    8 * dim.div_ceil(5)
 }
 
 /// The fused table factored per key position into 16-entry nibble tables —
@@ -115,9 +154,10 @@ pub fn quantize_lut(codec: &ResidualCodec) -> Option<ResidualLut> {
     // Ternary is base-3 packed: five trits per byte, and a trit value (0..=2) is
     // itself the weight index. So the fused row is byte → [w(trit0)…w(trit4)] —
     // no bit-reversal (arithmetic packing has no sub-byte bit order) and no
-    // nibble factoring (trits don't align to nibbles), so `nibble = None` routes
-    // scoring to the scalar kernel, which already masks the padded last byte via
-    // its `d == dim` break.
+    // nibble factoring (trits don't align to nibbles), so `nibble = None` and
+    // the scalar kernel (whose `d == dim` break masks the padded last byte)
+    // stays the reference. SIMD rides the transcode route instead: see
+    // [`TernarySimd`].
     if codec.ternary {
         let trits = codec.trit_lookup.as_ref()?;
         let keys_per_byte = crate::codec::TERNARY_TRITS_PER_BYTE;
@@ -127,11 +167,44 @@ pub fn quantize_lut(codec: &ResidualCodec) -> Option<ResidualLut> {
                 fused[byte * keys_per_byte + k] = vals[trit as usize];
             }
         }
+
+        // Companion 2-bit-alphabet LUT over transcoded bytes. Same `scale` as
+        // the base-3 table (identical int8 weight values), so `sqw` and the
+        // float epilogue are the same expression — a precondition for the
+        // bit-parity between the SIMD (transcoded) and scalar (base-3) paths.
+        let vals2: [i8; 4] = [vals[0], vals[1], vals[2], 0];
+        let mut fused2 = vec![0i8; 256 * 4];
+        for (byte, row) in fused2.chunks_exact_mut(4).enumerate() {
+            for (k, w) in row.iter_mut().enumerate() {
+                *w = vals2[(byte >> (2 * k)) & 3];
+            }
+        }
+        let mut transcode = Box::new([[0u8; 2]; 256]);
+        for (byte, quintet) in trits.iter().enumerate() {
+            transcode[byte] = [
+                quintet[0] | quintet[1] << 2 | quintet[2] << 4 | quintet[3] << 6,
+                quintet[4] | 0b11_11_11_00, // dead code 3 in keys 1..3
+            ];
+        }
+        // 2-bit codes never cross a nibble, so this factorization always
+        // succeeds; guard anyway so a future packing change degrades to the
+        // scalar kernel instead of silently mis-scoring.
+        let ternary_simd = derive_nibble_lut(&fused2, 4).map(|nib2| TernarySimd {
+            transcode,
+            lut2: Box::new(ResidualLut {
+                fused: fused2,
+                keys_per_byte: 4,
+                scale,
+                nibble: Some(nib2),
+                ternary_simd: None,
+            }),
+        });
         return Some(ResidualLut {
             fused,
             keys_per_byte,
             scale,
             nibble: None,
+            ternary_simd,
         });
     }
 
@@ -150,6 +223,7 @@ pub fn quantize_lut(codec: &ResidualCodec) -> Option<ResidualLut> {
         keys_per_byte,
         scale,
         nibble,
+        ternary_simd: None,
     })
 }
 
@@ -170,10 +244,15 @@ pub struct QueryPlanes {
     pub sqw: Vec<f32>,
 }
 
-/// Build [`QueryPlanes`] from already-quantized query codes. `dim` must be a
-/// multiple of 8 (the SIMD dispatch precondition), so every plane holds
-/// exactly `dim / lut.keys_per_byte` lanes.
+/// Build [`QueryPlanes`] from already-quantized query codes. For the scalar
+/// rungs `dim` must be a multiple of 8 (the SIMD dispatch precondition), so
+/// every plane holds exactly `dim / lut.keys_per_byte` lanes. A ternary LUT
+/// gets *gapped* planes over its transcoded layout instead — same struct,
+/// same kernels; see [`TernarySimd`].
 pub fn build_query_planes(q8: &QueryI8, lut: &ResidualLut, dim: usize) -> QueryPlanes {
+    if lut.ternary_simd.is_some() {
+        return build_query_planes_ternary(q8, lut, dim);
+    }
     let nq = q8.values.nrows();
     let keys_per_byte = lut.keys_per_byte;
     let stride = crate::binary::padded_stride(dim);
@@ -186,6 +265,34 @@ pub fn build_query_planes(q8: &QueryI8, lut: &ResidualLut, dim: usize) -> QueryP
         for i in 0..pdim {
             for k in 0..keys_per_byte {
                 out[k * pdim + i] = row[i * keys_per_byte + k];
+            }
+        }
+    }
+    let sqw = q8.scales.iter().map(|&s| s * lut.scale).collect();
+    QueryPlanes { data, stride, sqw }
+}
+
+/// Ternary planes: plane order over the *transcoded* stream. Expanded slot
+/// `s` (byte `s/4`, key `s%4`) maps to real dim `5·(s/8) + s%8` when
+/// `s%8 < 5`; the three dead keys of every odd transcoded byte — and the
+/// padding trits past `dim` in the last stored byte — get a 0 lane, which
+/// zeroes whatever weight the kernel looks up there (`0·w = 0`, exact in
+/// integer arithmetic, so bit-parity with the scalar base-3 kernel holds).
+fn build_query_planes_ternary(q8: &QueryI8, lut: &ResidualLut, dim: usize) -> QueryPlanes {
+    let nq = q8.values.nrows();
+    let edim = ternary_expanded_dim(dim);
+    let pdim = edim / 4; // transcoded bytes per token
+    let stride = crate::binary::padded_stride(edim);
+    let qv = q8.values.as_slice().expect("QueryI8.values is contiguous");
+    let mut data = vec![0i8; nq * stride];
+    for qi in 0..nq {
+        let row = &qv[qi * dim..(qi + 1) * dim];
+        let out = &mut data[qi * stride..qi * stride + edim];
+        for s in 0..edim {
+            let r = s % 8;
+            let d = 5 * (s / 8) + r;
+            if r < 5 && d < dim {
+                out[(s % 4) * pdim + s / 4] = row[d];
             }
         }
     }
@@ -398,47 +505,110 @@ pub fn maxsim_residual_lut_i8(
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let _ = planes;
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    if let (Some(planes), Some(nib)) = (planes, lut.nibble.as_ref()) {
-        if dim.is_multiple_of(8) {
-            #[cfg(target_arch = "aarch64")]
-            if std::arch::is_aarch64_feature_detected!("dotprod") {
-                return SCRATCH.with(|s| {
-                    let (best, accs) = &mut *s.borrow_mut();
-                    unsafe {
-                        neon::maxsim_residual_lut_neon(
-                            q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim,
-                            best, accs,
-                        )
-                    }
-                });
+    {
+        if let (Some(planes), Some(nib)) = (planes, lut.nibble.as_ref()) {
+            if dim.is_multiple_of(8) {
+                if let Some(score) = dispatch_simd(
+                    q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim,
+                ) {
+                    return score;
+                }
             }
-            #[cfg(target_arch = "x86_64")]
-            if has_avx512_vnni() {
-                return SCRATCH.with(|s| {
-                    let (best, accs) = &mut *s.borrow_mut();
-                    unsafe {
-                        avx512::maxsim_residual_lut_avx512(
-                            q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim,
-                            best, accs,
-                        )
+        }
+        // Ternary: transcode the stored base-3 rows into the nibble-aligned
+        // 2-bit stream and run the very same kernels over it with the
+        // companion LUT (see [`TernarySimd`] for the bit-parity argument).
+        // The expanded dim is always a multiple of 8, so the only shape gate
+        // is the kernels' expansion-buffer ceiling.
+        if let (Some(planes), Some(ts)) = (planes, lut.ternary_simd.as_ref()) {
+            let edim = ternary_expanded_dim(dim);
+            if edim <= MAX_DIM {
+                let src_cols = dim.div_ceil(crate::codec::TERNARY_TRITS_PER_BYTE);
+                let tcols = 2 * src_cols;
+                let score = TRANSCODE_SCRATCH.with(|s| {
+                    let buf = &mut *s.borrow_mut();
+                    let ntok = doc_packed.nrows();
+                    buf.clear();
+                    buf.resize(ntok * tcols, 0);
+                    for (t, row) in doc_packed.axis_iter(Axis(0)).enumerate() {
+                        let dst = &mut buf[t * tcols..(t + 1) * tcols];
+                        for (i, &b) in row.iter().take(src_cols).enumerate() {
+                            dst[2 * i..2 * i + 2].copy_from_slice(&ts.transcode[b as usize]);
+                        }
                     }
+                    let view = ndarray::ArrayView2::from_shape((ntok, tcols), &buf[..])
+                        .expect("transcode scratch shape");
+                    let nib2 = ts
+                        .lut2
+                        .nibble
+                        .as_ref()
+                        .expect("ternary companion LUT is nibble-factored by construction");
+                    dispatch_simd(
+                        q8, planes, &view, doc_codes, cdot_t, &ts.lut2, nib2, inv_norms, edim,
+                    )
                 });
-            }
-            #[cfg(target_arch = "x86_64")]
-            if is_x86_feature_detected!("avx2") {
-                return SCRATCH.with(|s| {
-                    let (best, accs) = &mut *s.borrow_mut();
-                    unsafe {
-                        avx2::maxsim_residual_lut_avx2(
-                            q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim,
-                            best, accs,
-                        )
-                    }
-                });
+                if let Some(score) = score {
+                    return score;
+                }
             }
         }
     }
     maxsim_residual_lut_scalar(q8, doc_packed, doc_codes, cdot_t, lut, inv_norms, dim)
+}
+
+/// The per-CPU kernel selection shared by the nibble and ternary-transcode
+/// routes — one place that knows which fused kernel this machine runs.
+/// `None` when the CPU has none of them (caller falls back to scalar).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn dispatch_simd(
+    q8: &QueryI8,
+    planes: &QueryPlanes,
+    doc_packed: &ArrayView2<u8>,
+    doc_codes: &[i64],
+    cdot_t: &ArrayView2<f32>,
+    lut: &ResidualLut,
+    nib: &NibbleLut,
+    inv_norms: &[f32],
+    dim: usize,
+) -> Option<f32> {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("dotprod") {
+        return Some(SCRATCH.with(|s| {
+            let (best, accs) = &mut *s.borrow_mut();
+            unsafe {
+                neon::maxsim_residual_lut_neon(
+                    q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim, best, accs,
+                )
+            }
+        }));
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512_vnni() {
+            return Some(SCRATCH.with(|s| {
+                let (best, accs) = &mut *s.borrow_mut();
+                unsafe {
+                    avx512::maxsim_residual_lut_avx512(
+                        q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim, best,
+                        accs,
+                    )
+                }
+            }));
+        }
+        if is_x86_feature_detected!("avx2") {
+            return Some(SCRATCH.with(|s| {
+                let (best, accs) = &mut *s.borrow_mut();
+                unsafe {
+                    avx2::maxsim_residual_lut_avx2(
+                        q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim, best,
+                        accs,
+                    )
+                }
+            }));
+        }
+    }
+    None
 }
 
 /// Does this CPU have the full AVX-512 set the fused kernel needs?
@@ -449,14 +619,9 @@ fn has_avx512_vnni() -> bool {
         && is_x86_feature_detected!("avx512vnni")
 }
 
-/// Name of the kernel this process will actually run, for benchmark output.
-/// A speedup attributed to a path that never executed is the easiest
-/// measurement error to make and the hardest to notice, so harnesses print
-/// this next to their numbers.
-pub fn active_kernel_name(dim: usize, nibble_ok: bool) -> &'static str {
-    if !nibble_ok || !dim.is_multiple_of(8) || dim > MAX_DIM {
-        return "scalar (no SIMD dispatch)";
-    }
+/// The fused kernel this CPU runs, shape questions aside ("scalar" when it
+/// has none).
+fn arch_kernel_name() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx512_vnni() {
@@ -473,6 +638,58 @@ pub fn active_kernel_name(dim: usize, nibble_ok: bool) -> &'static str {
         }
     }
     "scalar"
+}
+
+/// Name of the kernel this process will actually run, for benchmark output.
+/// A speedup attributed to a path that never executed is the easiest
+/// measurement error to make and the hardest to notice, so harnesses print
+/// this next to their numbers.
+///
+/// Shape semantics are the *nibble* route's; ternary LUTs answer through
+/// [`ResidualLut::kernel_name`], which knows the transcoded shape instead.
+pub fn active_kernel_name(dim: usize, nibble_ok: bool) -> &'static str {
+    if !nibble_ok || !dim.is_multiple_of(8) || dim > MAX_DIM {
+        return "scalar (no SIMD dispatch)";
+    }
+    arch_kernel_name()
+}
+
+impl ResidualLut {
+    /// Should a search build [`QueryPlanes`] for this LUT at this dim — i.e.
+    /// is there a SIMD route the planes could feed? (CPU capability is the
+    /// dispatcher's question; planes are cheap and harmless without it.)
+    pub fn wants_planes(&self, dim: usize) -> bool {
+        if self.ternary_simd.is_some() {
+            ternary_expanded_dim(dim) <= MAX_DIM
+        } else {
+            dim.is_multiple_of(8) && self.nibble.is_some()
+        }
+    }
+
+    /// The kernel [`maxsim_residual_lut_i8`] will actually run for this LUT
+    /// (given planes) — the lut-aware form of [`active_kernel_name`], and the
+    /// one that answers correctly for ternary's transcoded shape.
+    pub fn kernel_name(&self, dim: usize) -> &'static str {
+        if self.ternary_simd.is_some() {
+            if ternary_expanded_dim(dim) <= MAX_DIM {
+                arch_kernel_name()
+            } else {
+                "scalar (no SIMD dispatch)"
+            }
+        } else {
+            active_kernel_name(dim, self.nibble.is_some())
+        }
+    }
+
+    /// Will the fused SIMD kernel actually run for this LUT on this CPU? The
+    /// lut-aware form of [`simd_dispatch_available`].
+    pub fn simd_available(&self, dim: usize) -> bool {
+        if self.ternary_simd.is_some() {
+            ternary_expanded_dim(dim) <= MAX_DIM && arch_kernel_name() != "scalar"
+        } else {
+            simd_dispatch_available(dim, self.nibble.is_some())
+        }
+    }
 }
 
 /// Will the fused SIMD kernel actually run for this shape on this CPU?
@@ -508,6 +725,16 @@ pub fn simd_dispatch_available(dim: usize, nibble_ok: bool) -> bool {
 thread_local! {
     static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<i32>)> =
         const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+// Per-thread buffer for the ternary→2-bit transcoded rows of one document
+// (~2·ceil(dim/5) bytes per token; a few tens of KB at document lengths).
+// Separate cell from SCRATCH: the transcoded view must stay borrowed across
+// the kernel call that borrows SCRATCH.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+thread_local! {
+    static TRANSCODE_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1129,10 +1356,9 @@ mod tests {
 
     /// The base-3 fused table must expand each packed byte to exactly the trit
     /// weights `quantize_residuals` encoded, including the padded last byte when
-    /// dim is not a multiple of five. Ternary never nibble-factors, so scoring
-    /// stays on the scalar kernel (`nibble == None`) — this is what makes #169's
-    /// asymmetric path engage on ternary indexes instead of silently falling
-    /// back to float.
+    /// dim is not a multiple of five. Ternary never nibble-factors — the scalar
+    /// kernel scores the base-3 bytes directly — while SIMD rides the
+    /// [`TernarySimd`] transcode route instead.
     #[test]
     fn ternary_fused_table_matches_packing() {
         let mut rng = StdRng::seed_from_u64(11);
@@ -1141,6 +1367,10 @@ mod tests {
             let lut = quantize_lut(&codec).expect("ternary must build a fused LUT");
             assert_eq!(lut.keys_per_byte, 5, "ternary packs five trits per byte");
             assert!(lut.nibble.is_none(), "ternary must not nibble-factor");
+            assert!(
+                lut.ternary_simd.is_some(),
+                "ternary must build its SIMD transcode"
+            );
 
             let cutoffs = codec.bucket_cutoffs.as_ref().unwrap();
             let weights = codec.bucket_weights.as_ref().unwrap();
@@ -1166,6 +1396,103 @@ mod tests {
                     }
                 }
                 assert_eq!(got, expect, "dim={dim}");
+            }
+        }
+    }
+
+    /// The transcode table must map every stored byte to two nibble-aligned
+    /// bytes whose companion-LUT expansion reproduces the base-3 fused row
+    /// exactly, with weight 0 in all three dead slots — the invariant that
+    /// makes the transcoded SIMD accumulator equal the scalar one.
+    #[test]
+    fn ternary_transcode_matches_fused() {
+        let mut rng = StdRng::seed_from_u64(17);
+        let codec = toy_ternary_codec(40, 8, &mut rng);
+        let lut = quantize_lut(&codec).unwrap();
+        let ts = lut.ternary_simd.as_ref().expect("transcode built");
+        assert_eq!(ts.lut2.keys_per_byte, 4);
+        assert_eq!(
+            ts.lut2.scale, lut.scale,
+            "shared scale is the parity precondition"
+        );
+        assert!(ts.lut2.nibble.is_some(), "companion LUT must nibble-factor");
+        for b in 0..256usize {
+            let [a, c] = ts.transcode[b];
+            // Keys 0..3 of byte A and key 0 of byte B are the five trits.
+            for k in 0..4 {
+                assert_eq!(
+                    ts.lut2.fused[a as usize * 4 + k],
+                    lut.fused[b * 5 + k],
+                    "byte={b} trit={k}"
+                );
+            }
+            assert_eq!(
+                ts.lut2.fused[c as usize * 4],
+                lut.fused[b * 5 + 4],
+                "byte={b} trit=4"
+            );
+            // Dead slots must carry weight 0 (belt and braces on top of the
+            // zeroed query lanes).
+            for k in 1..4 {
+                assert_eq!(
+                    ts.lut2.fused[c as usize * 4 + k],
+                    0,
+                    "byte={b} dead key={k}"
+                );
+            }
+        }
+    }
+
+    /// The ternary transcode route through the public dispatcher must equal
+    /// the scalar base-3 reference bit-for-bit — same integer accumulator
+    /// (zero lanes at dead/padding slots), same float epilogue. Covers dims
+    /// that are not multiples of 8 or 5 (the transcoded stream is always
+    /// 8-aligned) and the `edim == MAX_DIM` boundary (dim 160).
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn ternary_simd_matches_scalar_bitwise() {
+        let mut rng = StdRng::seed_from_u64(29);
+        for &nq in &[3usize, 9, 32] {
+            for &dim in &[5usize, 7, 10, 40, 48, 64, 128, 130, 160] {
+                let k = 12;
+                let codec = toy_ternary_codec(dim, k, &mut rng);
+                let lut = quantize_lut(&codec).unwrap();
+                if !lut.simd_available(dim) {
+                    return; // this host has no fused kernel; nothing to compare
+                }
+                let query = Array2::from_shape_fn((nq, dim), |_| rng.gen_range(-1.0f32..1.0));
+                let q8 = crate::binary::quantize_query_i8(&query.view());
+                let planes = build_query_planes(&q8, &lut, dim);
+                let res = Array2::from_shape_fn((13, dim), |_| rng.gen_range(-0.4f32..0.4));
+                let packed = codec.quantize_residuals(&res).unwrap();
+                let codes: Vec<i64> = (0..13).map(|_| rng.gen_range(0..k as i64)).collect();
+                let cdot_t = Array2::from_shape_fn((k, nq), |_| rng.gen_range(-1.0f32..1.0));
+                let inv: Vec<f32> = (0..13).map(|_| rng.gen_range(0.5f32..1.5)).collect();
+
+                let scalar = maxsim_residual_lut_scalar(
+                    &q8,
+                    &packed.view(),
+                    &codes,
+                    &cdot_t.view(),
+                    &lut,
+                    &inv,
+                    dim,
+                );
+                let simd = maxsim_residual_lut_i8(
+                    &q8,
+                    Some(&planes),
+                    &packed.view(),
+                    &codes,
+                    &cdot_t.view(),
+                    &lut,
+                    &inv,
+                    dim,
+                );
+                assert_eq!(
+                    scalar.to_bits(),
+                    simd.to_bits(),
+                    "nq={nq} dim={dim}: scalar {scalar} != transcoded simd {simd}"
+                );
             }
         }
     }

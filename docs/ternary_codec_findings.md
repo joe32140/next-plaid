@@ -1,94 +1,85 @@
 # Ternary residual codec — cross-model fidelity, storage & latency
 
-*Measured 2026-08-16 on `integration/ternary-asym` (merge of `main` + ternary + #170 stage-1 pipeline + #169 asymmetric residual LUT). All runs local, $0.*
+*Measured 2026-08-16/17 on `integration/ternary-asym` (merge of `main` + ternary + #170 stage-1 pipeline + #169 asymmetric residual LUT). Quality local ($0); latency on CI, per-ISA.*
 
 ## TL;DR
 
 - **Storage.** Ternary is a real rung between 2-bit and 1-bit: `ceil(dim/5)` bytes/token
   — **26 B @ dim128** (vs 2-bit 32 B, 1-bit 16 B) and **20 B @ dim96**. ~19 % smaller
   than 2-bit at dim128, ~17 % at dim96.
-- **Fidelity (7 model×corpus cells).** Ternary does **not** collapse on low-retention
-  models and **clears 1-bit in every cell**. The two fragility axes split: on
-  *capacity*-limited `mxbai` (D=48) it matches/beats 2-bit (nfcorpus +0.0019, scifact
-  −0.0004 — the dead-zone nails near-degenerate residuals); on the *multilingual-basis*
-  `mLateOn` (lowest-retention fleet ckpt) it's the one model clearly sub-2-bit but only by
-  −0.0036…−0.0065. Worst case anywhere is −0.0065 vs 2-bit for a 19 % shrink.
-- **#169 asym is now ternary-native, SIMD included.** A base-3 fused LUT gives ternary
-  indexes #169's no-reconstruction rescoring (NDCG bit-for-bit vs the float path; parity
-  test + real-search NDCG agree to ≤0.0005), and a 2-bit *transcode* puts it on the same
-  fused SIMD kernels as the scalar rungs. **No new intrinsics** — `neon`/`avx2`/`avx512`
-  are untouched, and the per-arch dispatch is now shared by both routes.
-- **Latency.** Measured contention-free on CI per-ISA (`asym-bench` workflow; local
-  end-to-end runs were noisy under a shared machine). At the **Stage-2 rescore kernel**
-  (what #169 changes), asym is a **2.6–5.5× speedup for every codec on both** x86 (`avx2`)
-  and arm (`neon-sdot`). Ternary reaches SIMD by **transcoding base-3 bytes into
-  nibble-aligned 2-bit codes** and reusing the existing kernels — no new intrinsics — which
-  turned its x86 result from a 0.67× *loss* into a 3.23× win (asym 610.8 → 138.5 ns/tok).
-  Enable `residual_asym` everywhere. End-to-end this dilutes because search is
-  stage-1-bound (unchanged by #169, #170's territory). See
-  [CI rescore ratios](#ci-rescore-ratios-contention-free).
+- **The dead-zone width is the whole ballgame.** `create_with_kmeans` used to split at the
+  1/3 and 2/3 residual quantiles — equal-mass buckets, ~⅓ of dims dead by construction,
+  which is *not* where a residual distribution wants its dead zone. Setting it explicitly
+  (`ternary_tau`, `|r| < τ·σ` stores 0) at **τ = 0.65** turns ternary from *losing* to 2-bit
+  in 4 of 5 measured cells into **beating it in 5 of 5** — and lands it at **4-bit's mean
+  retention for 40 % of 4-bit's bytes**. This was the single largest effect in the study.
+- **Fidelity.** At τ = 0.65, mean NDCG retention over the 5 re-measured cells is **99.56 %**
+  against 4-bit's 99.56 % and 2-bit's 98.86 %, at 26 B against 64 B and 32 B. Ternary clears
+  1-bit in every cell measured, at any τ.
+- **#169 asym is ternary-native, SIMD included, in one hop.** A base-3 fused LUT gives
+  ternary indexes #169's no-reconstruction rescoring, bit-for-bit against the scalar
+  reference. Base-3 cannot nibble-factor (243 values, and every SIMD byte-shuffle is
+  16-entry), so ternary expands via a **256-entry byte→weights table copied straight into
+  the kernel's weight buffer** — see [Making #169 ternary-compatible](#making-169-ternary-compatible).
+- **Latency.** `residual_asym` is a **2.7–5.3× rescore win for every codec on both ISAs**.
+  Ternary costs a little more than 2-bit to expand, and *how much* is strongly
+  microarchitecture-dependent: end-to-end at probe 8, **+1.7 % on arm (Neoverse-N2)** and
+  **+7.2 % on x86 (EPYC 7763, avx2)**. Without asym, ternary is the **fastest** of the four
+  codecs *and* the second smallest. Enable `residual_asym` everywhere regardless.
 
 ## r=1 vs r=2 vs ternary — head to head
 
-Everything below is one table: storage is exact, NDCG is the 7-cell mean over
-model×corpus cells (codec-isolated, fixed k-means seed), rescore is CI ns/token at dim 128.
+Storage is exact. NDCG is codec-isolated (fixed k-means seed, exhaustive float MaxSim over
+reconstructions, so no stage-1 confound). Latency is CI, all four codecs **in one process**
+— see the [measurement note](#ci-rescore-ratios-contention-free) for why that matters.
 
-| | **r=1** (1-bit) | **ternary** | **r=2** (2-bit) |
-|---|--:|--:|--:|
-| bits / dim | 1.000 | 1.585 | 2.000 |
-| **B/token @ dim128** | **16** | **26** | **32** |
-| B/token @ dim96 | 12 | 20 | 24 |
-| vs r=2 storage | −50 % | **−19 %** | — |
-| **mean NDCG retention** (7 cells) | **96.86 %** | **98.31 %** | **98.84 %** |
-| worst cell | 93.91 % | 95.85 % | 97.58 % |
-| best cell | 99.01 % | 99.79 % | 100.00 % |
-| cells where it beats r=2 | 0 / 7 | 1 / 7 (+1 tie) | — |
-| cells where it beats r=1 | — | **7 / 7** | 7 / 7 |
-| mean reconCos | 0.9678 | 0.9792 | 0.9847 |
-| rescore ns/tok — x86 `avx2` | 102.5 | 138.5 | 123.3 |
-| rescore ns/tok — arm `neon-sdot` | 70.3 | 96.6 | 70.3 |
-| asym vs float — x86 / arm | 5.44× / 2.90× | 3.23× / 2.58× | 4.06× / 4.53× |
-
-**Retention per cell** (NDCG@10 ÷ float ceiling; raw NDCG in parentheses):
-
-| bundle (fragility axis) | float | **r=1** | **ternary** | **r=2** |
+| | **r=1** (1-bit) | **ternary** @ τ=0.65 | **r=2** (2-bit) | r=4 (4-bit) |
 |---|--:|--:|--:|--:|
-| scifact / ColBERTv2 | 0.6464 | 99.01 % (.6400) | 99.18 % (.6411) | 100.00 % (.6464) |
-| nfcorpus / ColBERTv2 | 0.3324 | 98.62 % (.3278) | 99.79 % (.3317) | 99.79 % (.3317) |
-| scifact / mxbai (capacity) | 0.6309 | 97.18 % (.6131) | 99.03 % (.6248) | 99.10 % (.6252) |
-| nfcorpus / mxbai (capacity) | 0.3092 | 98.25 % (.3038) | **99.26 % (.3069)** | 98.64 % (.3050) |
-| scifact / mLateOn (basis) | 0.7533 | 96.20 % (.7247) | 97.96 % (.7379) | 98.43 % (.7415) |
-| nfcorpus / mLateOn (basis) | 0.3759 | 93.91 % (.3530) | 95.85 % (.3603) | 97.58 % (.3668) |
-| nfcorpus / answerai (dim96) | 0.3725 | 94.84 % (.3533) | 97.10 % (.3617) | 98.31 % (.3662) |
+| bits / dim | 1.000 | 1.585 | 2.000 | 4.000 |
+| **B/token @ dim128** | **16** | **26** | **32** | 64 |
+| B/token @ dim96 | 12 | 20 | 24 | 48 |
+| vs r=2 storage | −50 % | **−19 %** | — | +100 % |
+| **mean NDCG retention** (5 cells) | 96.93 % | **99.56 %** | 98.86 % | 99.56 % |
+| worst cell | 93.91 % | **98.71 %** | 97.58 % | 98.93 % |
+| cells where it beats r=2 | 0 / 5 | **5 / 5** | — | 4 / 5 |
+| rescore ns/tok — x86 `avx2` | 93.8 | 108.1 | 93.8 | 96.4 |
+| rescore ns/tok — arm `neon-sdot` | 55.9 | 56.3 | 52.4 | 56.6 |
+| asym vs float — x86 / arm | 4.47× / 3.61× | 2.68× / 3.24× | 4.74× / 4.26× | 5.27× / 4.12× |
+
+**NDCG@10 per cell, and Δ vs 2-bit** (the number that decides whether 19 % fewer bytes is
+free). Positive = ternary wins at less storage:
+
+| bundle (fragility axis) | dim | float | r=2 | tern (default τ) | **tern @ τ=0.65** | Δ vs r=2 |
+|---|--:|--:|--:|--:|--:|--:|
+| nfcorpus / mLateOn (basis) | 128 | .3759 | .3668 | .3603 | **.3723** | **+0.0055** |
+| nfcorpus / mxbai (capacity) | 128 | .3092 | .3050 | .3069 | **.3093** | **+0.0043** |
+| nfcorpus / answerai | 96 | .3725 | .3662 | .3617 | **.3677** | **+0.0015** |
+| nfcorpus / ColBERTv2 | 128 | .3324 | .3317 | .3317 | **.3323** | **+0.0006** |
+| scifact / ColBERTv2 | 128 | .6464 | .6464 | .6411 | **.6466** | **+0.0002** |
+| *mean Δ vs r=2* | | | — | *−0.0029* | | ***+0.0024*** |
 
 **Reading it:**
 
-1. **Ternary beats r=1 in 7/7 cells** — never a reason to prefer r=1 on quality, only on
-   size (16 B vs 26 B).
-2. **Ternary does *not* beat r=2 here** (1 win, 1 tie, 5 losses; −0.53 pp mean). It buys
-   19 % of the bytes back for about half a point of retention.
-3. **But it's the more efficient step down from r=2**: ternary costs 0.088 pp of retention
-   per byte saved, r=1 costs 0.124 pp — the marginal price of dropping bits accelerates,
-   and ternary sits on the good side of that knee.
-4. **Where it lands depends on the fragility axis** (the finding this study added):
-   ties/beats r=2 on *capacity*-limited mxbai, clearly below r=2 on *basis*-fragile
-   mLateOn and small-dim answerai.
-5. **Rescore cost is now in the same class for all three** (previous versions of this doc
-   had ternary at 611 ns/tok on x86 — 5× the others — before the transcode landed). Ternary
-   pays ~12 % over r=2 on x86 and ~37 % on arm, the 8/5 lane-occupancy tax.
+1. **τ = 0.65 is the setting.** Mean Δ vs 2-bit by τ: default **−0.0029**, τ=0.50 −0.0002,
+   **τ=0.65 +0.0024**, τ=0.80 +0.0021. τ=0.80 has a comparable mean but goes negative in 2
+   of 5 cells; **τ=0.65 is the only setting positive in all five**, which is why it is the
+   pick rather than the marginally-higher-mean alternative.
+2. **The default was the problem, not the codec.** Every earlier "ternary loses to r=2"
+   statement in this document was measured at the equal-mass split. It is retracted.
+3. **Ternary beats r=1 everywhere** — never a reason to prefer r=1 on quality, only on size.
+4. **The fragility axes stopped mattering once τ was tuned.** The two cells that most needed
+   help — *basis*-fragile mLateOn and *capacity*-limited mxbai — are now the two biggest
+   wins (+0.0055, +0.0043). At the bad default they were the extremes in both directions.
 
-> ⚠️ **Ternary's dead-zone is untuned here.** `create_with_kmeans` sets its cutoffs at the
-> 1/3 and 2/3 residual quantiles — equal-mass buckets, so ~⅓ of dims land in the dead zone
-> by construction. An earlier 14-cell TACET sweep that *tuned* the dead-zone width (τ ≈
-> 0.5–0.65) had ternary beating r=2 on average retention; this study, with the fixed
-> tertile split, has it 0.53 pp below. **The gap between those two results is most likely
-> the missing τ tuning, and closing it is the open lever** — a wider dead zone spends its
-> three levels where the residual distribution actually is. Until that is measured, read
-> row 2 above as "ternary at its default τ", not "ternary at its best".
+> **Scope.** τ was swept on 5 of the 7 model×corpus cells (`scifact/mxbai` and
+> `scifact/mLateOn` were not re-run, so every mean above is over the same 5 cells for every
+> codec, not over 7). The two unmeasured cells were mid-pack at the default τ, so they are
+> unlikely to overturn the ranking — but they have not been checked, and the τ default
+> should not be considered settled on 7 cells until they are.
 
-**Pick:** r=2 when quality is the binding constraint; **ternary when footprint is** (19 %
-smaller, ~0.5 pp, and free on capacity-bound checkpoints); r=1 only when 16 B/token is a
-hard requirement, since ternary dominates it on quality everywhere for 10 more bytes.
+**Pick:** **ternary at τ=0.65** as the default rung — it is 19 % smaller than r=2 and beat it
+in every cell measured. Use r=4 when quality is the only constraint and bytes are free; r=1
+only when 16 B/token is a hard requirement.
 
 ## What shipped (integration)
 
@@ -115,15 +106,28 @@ keep #170's per-doc `par_iter` exact scoring **and** #169's asym dispatch.
    the last byte (dim128 → 26 B, last byte holds 3 pad trits).
 2. **inv_norms** got a matching base-3 branch (#169 builds the sidecar for every
    non-binary index; without it, ternary index creation panicked).
-3. **SIMD, without a new kernel.** The fused SIMD paths require `nibble.is_some()`, and
-   trits genuinely don't align to nibbles — so ternary additionally builds a
-   [`TernarySimd`] transcode that rewrites each stored byte as two nibble-aligned 2-bit
-   bytes and scores them on the *existing* kernels. Details and measured effect under
-   [CI rescore ratios](#ci-rescore-ratios-contention-free).
+3. **SIMD, in one hop.** The fused SIMD paths require `nibble.is_some()`, and trits
+   genuinely don't align to nibbles: a byte carries 243 values and every SIMD byte-shuffle
+   (`tbl`, `pshufb`) is 16-entry, while any packing that *does* factor costs ≥2 bits/dim —
+   which is 2-bit exactly, storage win gone. So a scalar pre-pass is the price of sub-2-bit
+   packing, not a defect. Ternary therefore builds a [`TernaryDirect`] table: each stored
+   byte's five weights, padded to eight, copied straight into the kernel's weight buffer at
+   `5i`. The copies overlap by three bytes but every one is a *pure* store — the next
+   iteration overwrites the slack — so there is no read-modify-write. Output is natural dim
+   order, so ternary queries need no permutation at all.
 
-Verified by `ternary_fused_table_matches_packing` and `ternary_transcode_matches_fused`
+   *This replaced a two-hop route* (repack base-3 into a 2-bit stream, then run the nibble
+   `tbl`). Measured in isolation by `examples/ternary_expand_bench`, one process, dim 128:
+   two hops **20.62** ns/token on x86 and **15.32** on arm, against one hop's **12.20** and
+   **10.79** — −40.8 % and −29.6 %. End-to-end on arm (the ISA where the runner CPU held
+   constant across runs, so the comparison is sound) the ternary-vs-2-bit gap went from
+   **+7.1…+9.0 %** to **+0.3…+1.9 %** across probe depths 1/8/32/128.
+
+Verified by `ternary_fused_table_matches_packing` and `ternary_direct_table_matches_fused`
 (unit), `ternary_simd_matches_scalar_bitwise` (SIMD accumulator bit-equal to the scalar
-base-3 reference across dims 5…160, run natively on aarch64 with `dotprod`), and
+base-3 reference across dims 5…256 — multiples of neither 8 nor 5, and walked ascending
+*then descending* with alternating document lengths, so a short row lands on a longer one's
+leftovers in the reused weight buffer; run natively on aarch64 with `dotprod`), and
 `ternary_asymmetric_scoring_agrees_with_float` (integration: asym top-1 == float top-1,
 top-10 overlap ≥ 9/10). Full suite green on both targets, clippy + fmt clean. Pushed:
 [`feat/ternary-residual`], [`integration/ternary-asym`].
@@ -179,6 +183,12 @@ and 2 bits exactly as expected.
 `float` = decompress-then-score; `asym-LUT` = #169 int8×fused-LUT, no reconstruction.
 Real-search NDCG shown to confirm asym preserves quality.
 
+> ⛔ **Superseded — kept only as a record of how the measurement went wrong.** These runs
+> predate both the one-hop expansion and the CI e2e ladder. A later run of this same
+> harness on the same box reported ternary asym at **0.80×** — i.e. *slower* than float,
+> which the contention-free CI ladder puts at 2.4–3.3×. Use
+> [CI rescore ratios](#ci-rescore-ratios-contention-free) and the CI e2e ladder instead.
+>
 > ⚠️ **These end-to-end numbers were measured on a shared/contended workstation** — a
 > second workload was running, so absolute µs and even some ratios are noisy (a stray
 > nfcorpus/mLateOn run showed a spurious 1.60× that did not reproduce). Treat the
@@ -241,83 +251,74 @@ is owned by stage-1 and, secondarily, by the float-path footprint effect below.
 
 ### CI rescore ratios (contention-free)
 
-End-to-end timing above is stage-1-bound *and* was measured under contention, so it can't
-cleanly isolate what #169 actually changes: **Stage-2 rescore** (float decompress+MaxSim
-vs asym fused-LUT over packed codes). The `asym_rescore_check` harness times exactly that
-arm on seeded synthetic shapes (data-independent), and the `asym-bench` workflow runs it on
-dedicated per-ISA runners — `ubuntu-latest` (x86_64 `avx2`/`avx512-vnni`) and
-`ubuntu-24.04-arm` (`neon-sdot`). Scalar rungs (1/2/4-bit) take the SIMD kernel; ternary
-takes the scalar kernel (`nibble = None`) by design.
+> **Measurement note — read before comparing anything here.** Two rules, both learned the
+> hard way in this study:
+>
+> 1. **Only compare numbers produced inside one process.** The same benchmark on
+>    *unchanged* code moves ±30 % between CI runners. An earlier version of this harness
+>    ran one codec per invocation, and its cross-codec deltas were noise — on one run it
+>    reported ternary *faster* than 2-bit, which cannot happen, since ternary does
+>    everything 2-bit does and expands from a wider alphabet. `asym_rescore_check … all`
+>    now runs every codec interleaved in one process.
+> 2. **Check the runner CPU before comparing across runs.** GitHub's `ubuntu-latest` served
+>    an Intel Xeon 8573C, an AMD EPYC 9V74 (`avx512-vnni`) and an AMD EPYC 7763 (`avx2`) on
+>    three consecutive runs of this workflow. `ubuntu-24.04-arm` has been Neoverse-N2
+>    throughout, so arm is the axis on which run-over-run comparison is currently sound.
 
-Stage-2 rescore only, **ns/token**, median of 9 reps, 4096 docs × 230 tokens, dim 128.
-Every codec now takes a fused SIMD kernel — ternary via the transcode route described
-below (run [31965979173](https://github.com/joe32140/next-plaid/actions/runs/31965979173)):
+Stage-2 rescore only, **ns/token**, median of 5 interleaved reps, 4096 docs × 230 tokens,
+dim 128, all four codecs in one process
+(run [31978074468](https://github.com/joe32140/next-plaid/actions/runs/31978074468)):
 
-| codec | kernel | x86_64 float | x86_64 asym | **x86_64 ratio** | arm64 float | arm64 asym | **arm64 ratio** |
-|---|---|--:|--:|--:|--:|--:|--:|
-| 4-bit | SIMD | 672.2 | 123.1 | **5.46×** | 235.3 | 71.2 | **3.31×** |
-| 2-bit | SIMD | 500.5 | 123.3 | **4.06×** | 318.7 | 70.3 | **4.53×** |
-| 1-bit | SIMD | 557.4 | 102.5 | **5.44×** | 203.7 | 70.3 | **2.90×** |
-| **ternary** | SIMD (transcoded) | 448.0 | **138.5** | **3.23×** | 249.3 | **96.6** | **2.58×** |
+| codec | x86 float | x86 asym | **x86 ratio** | arm float | arm asym | **arm ratio** |
+|---|--:|--:|--:|--:|--:|--:|
+| 4-bit | 508.2 | 96.4 | **5.27×** | 233.1 | 56.6 | **4.12×** |
+| 2-bit | 444.6 | 93.8 | **4.74×** | 223.1 | 52.4 | **4.26×** |
+| **ternary** | 289.2 | **108.1** | **2.68×** | 182.4 | **56.3** | **3.24×** |
+| 1-bit | 419.4 | 93.8 | **4.47×** | 201.8 | 55.9 | **3.61×** |
 
-*(x86_64 = `avx2`; arm64 = `neon-sdot`.)*
+*(x86 = EPYC 7763 / `avx2`; arm = Neoverse-N2 / `neon-sdot`.)*
 
-**At the rescore kernel #169 is a 2.6–5.5× win for every codec on both ISAs** — float
-decompresses to f32 then MaxSims, asym scores int8 straight over packed codes under SIMD.
-The end-to-end dilution is entirely stage-1 (which is what #170 attacks).
+**Asym is a 2.7–5.3× win for every codec on both ISAs.** Two things about the ternary row:
 
-> **Comparing across CI runs:** the *float* baselines drift substantially between runs
-> (2-bit x86 float measured 690.9 ns/tok on the earlier run vs 500.5 here) — GitHub's
-> runners are not identical hardware, so **ratios are only comparable within a run**. The
-> `asym` columns are stable across runs and are the right basis for before/after claims.
+- Its low *ratio* is not weakness — it is a fast float baseline (289 / 182 ns/tok, the
+  fastest of the four) divided into a normal endpoint. Ternary's byte→5-values decode is
+  cheaper than scalar bit-unpacking, so **without asym ternary is both the smallest useful
+  rung and the fastest**.
+- Its asym cost over 2-bit is the expansion, and nothing else: after expansion both occupy
+  the same lane count and run an identical dot. That cost is **+3.86 ns/token on arm
+  (+7.4 %) and +14.29 on x86 (+15.2 %)**.
 
-**Ternary got SIMD by transcoding, not by a new kernel.** Base-3 bytes genuinely don't
-nibble-factor (no trit is a function of a single nibble), which is why ternary previously
-scored on the scalar kernel and *lost* to float on x86 (0.67×, 610.8 ns/tok asym). Rather
-than hand-write base-3 NEON + AVX2 + AVX-512 kernels, `quantize_lut` now also builds a
-[`TernarySimd`]: a 256-entry table mapping each stored byte to **two nibble-aligned bytes**
-carrying its five trits as 2-bit codes (0/1/2 = trit, 3 = a dead slot weighted 0), plus a
-companion LUT (`keys_per_byte = 4`, weights `[w₋, w₀, w₊, 0]`). Query planes are built
-*gapped* over that layout so dead slots — and the padding trits past `dim` — get a 0 lane.
-Every real dim then contributes the same product the base-3 scalar reference computes and
-every dead slot contributes `0·w = 0`, so the integer accumulator is **bit-equal** to the
-scalar kernel (asserted over dims 5…160, including non-multiples of 8 *and* 5 and the
-`edim == MAX_DIM` boundary, verified on native aarch64 with `dotprod`).
+End-to-end (`search_latency`, synthetic 4000×180, probe 8) the same gap reads **+1.7 % arm,
++7.2 % x86** — smaller, because stage 1 is common to both and unchanged by #169.
 
-Effect, reading the stable `asym` column: **x86 610.8 → 138.5 ns/tok (4.4× faster), arm
-170.8 → 96.6 (1.77× faster)** — the x86 loss becomes a 3.23× win. Ternary asym now lands
-within ~1.2× of 2-bit asym on both ISAs (138.5 vs 123.3 on x86; 96.6 vs 70.3 on arm), and
-that residual gap is precisely the expected **8/5 lane occupancy**: five trits ride in
-eight 2-bit slots. The on-disk index is untouched (still `ceil(dim/5)` B/token) — the
-26 → 52 byte expansion lives in per-thread scratch.
-
-**Maintenance:** zero new intrinsics; `neon`/`avx2`/`avx512` are unchanged. The three
-per-arch dispatch arms were also factored into one `dispatch_simd` shared by both routes,
-and `ResidualLut::{wants_planes, kernel_name, simd_available}` now answer the shape
-questions per-route so call sites stop re-deriving `nibble.is_some()` conditions. A
-dedicated base-3 kernel could recover the remaining ~20 %, at the cost of a fourth kernel
-family per ISA — deliberately not taken.
+**Why x86 pays more.** The one-hop expansion writes 8 bytes to place 5 weights, so it issues
+26 stores/token at dim 128 against the nibble path's 8 wide ones. On a store-port-limited
+core that shows up directly; on a wider one it hides under the dot. This is a hypothesis
+consistent with the arm/x86 split and with the local Apple-silicon reading (+2.2 %), **not a
+verified cause** — confirming it means either a PMU counter or a variant that stores 15
+weights at a time, and neither has been done.
 
 ## How far can we push latency — bottom line
 
 Separate the two stages:
 
-- **Stage-2 rescore (what the codec + #169 own):** asym is a **2.6–5.5× kernel speedup for
-  every codec**, clean on both x86 and arm (CI) — ternary included, now that it transcodes
-  onto the shared nibble kernels (its x86 asym cost dropped 4.4×, from 610.8 to 138.5
-  ns/tok). Stage-2 rescore is therefore pushed near its floor for *all* codecs; the ceiling
-  that remains is stage-1.
+- **Stage-2 rescore (what the codec + #169 own):** asym is a **2.7–5.3× kernel speedup for
+  every codec**, clean on both x86 and arm (CI), ternary included. Stage-2 is therefore
+  pushed near its floor for *all* codecs; what remains is stage-1.
 - **Stage-1 (candidate generation):** owns end-to-end latency at BEIR scale — unchanged by
-  #169, targeted by #170. This is why the end-to-end asym speedup is small even though the
-  kernel speedup is 7–9×.
-- **Storage:** ternary is a clean ~19 % index shrink over 2-bit with **≤ 0.0065 NDCG cost**
-  (free on capacity-bound models, and it clears 1-bit everywhere). If footprint-bound,
-  ternary is the better default than 2-bit; and its smaller float-path footprint also helps
-  the float rescore path on bandwidth-bound corpora.
+  #169, targeted by #170. This is why the end-to-end asym speedup is well below the kernel
+  speedup. Probe depth 1→128 moves e2e asym latency ~25–29 %, so it is the lever that
+  decides how much of a search the codec choice can touch at all.
+- **Storage and quality together:** at τ=0.65 ternary is a **~19 % index shrink over 2-bit
+  that also scores better than 2-bit in every cell measured** — the trade that used to exist
+  was an artifact of the equal-mass default. Its smaller footprint also makes it the fastest
+  codec on the *float* rescore path.
 
-**Deployment recipe:** 2-bit or ternary for footprint; enable `residual_asym`
-unconditionally — every codec now reaches a fused SIMD kernel on both ISAs and gains
-2.6–5.5× at rescore, with NDCG parity.
+**Deployment recipe:** **ternary at `ternary_tau = 0.65`** for footprint-bound deployments —
+smaller than 2-bit and better than it on quality. Enable `residual_asym` unconditionally;
+every codec reaches a fused SIMD kernel on both ISAs and gains 2.7–5.3× at rescore with NDCG
+parity. Budget ternary ~+2 % (arm) to ~+7 % (x86) e2e over 2-bit for that 19 %; if e2e
+latency is the binding constraint on x86 specifically, 2-bit remains the safer pick.
 
 ## Repro
 

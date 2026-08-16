@@ -44,5 +44,12 @@ jobs:
         run: ./target/release/examples/asym_rescore_check 4096 2
       - name: Rescore ratio — 1-bit (SIMD)
         run: ./target/release/examples/asym_rescore_check 4096 1
-      - name: Rescore ratio — ternary (scalar kernel)
+      - name: Rescore ratio — ternary (transcoded onto the SIMD kernels)
         run: ./target/release/examples/asym_rescore_check 4096 t
+      # Both repack arms in ONE process: the ~15% effect here is smaller than
+      # the +/-30% swing the same benchmark shows on *unchanged* code across
+      # two runners, so it can only be resolved within a single process.
+      - name: Build repack A/B
+        run: cargo build --release -p next-plaid --example ternary_repack_bench --features openblas
+      - name: Ternary repack — per-byte vs batched
+        run: ./target/release/examples/ternary_repack_bench 4096 15

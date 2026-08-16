@@ -13,17 +13,19 @@
   −0.0004 — the dead-zone nails near-degenerate residuals); on the *multilingual-basis*
   `mLateOn` (lowest-retention fleet ckpt) it's the one model clearly sub-2-bit but only by
   −0.0036…−0.0065. Worst case anywhere is −0.0065 vs 2-bit for a 19 % shrink.
-- **#169 asym is now ternary-native.** A base-3 fused LUT gives ternary indexes #169's
-  no-reconstruction rescoring, with NDCG bit-for-bit matching the float path
-  (parity test + real-search NDCG agree to ≤0.0005). No new SIMD kernel: ternary
-  routes to the scalar kernel whose `d == dim` break already masks the padded byte.
+- **#169 asym is now ternary-native, SIMD included.** A base-3 fused LUT gives ternary
+  indexes #169's no-reconstruction rescoring (NDCG bit-for-bit vs the float path; parity
+  test + real-search NDCG agree to ≤0.0005), and a 2-bit *transcode* puts it on the same
+  fused SIMD kernels as the scalar rungs. **No new intrinsics** — `neon`/`avx2`/`avx512`
+  are untouched, and the per-arch dispatch is now shared by both routes.
 - **Latency.** Measured contention-free on CI per-ISA (`asym-bench` workflow; local
   end-to-end runs were noisy under a shared machine). At the **Stage-2 rescore kernel**
-  (what #169 changes), asym is a **7–9× speedup** on the SIMD rungs (1/2/4-bit) on both
-  x86 (`avx2`) and arm (`neon-sdot`). Ternary takes the *scalar* kernel, so it splits:
-  **1.49× on arm64, 0.67× on x86_64** — enable `residual_asym` for ternary on arm, keep it
-  on float rescore on x86 until a base-3 SIMD kernel lands. End-to-end this dilutes because
-  search is stage-1-bound (unchanged by #169, #170's territory). See
+  (what #169 changes), asym is a **2.6–5.5× speedup for every codec on both** x86 (`avx2`)
+  and arm (`neon-sdot`). Ternary reaches SIMD by **transcoding base-3 bytes into
+  nibble-aligned 2-bit codes** and reusing the existing kernels — no new intrinsics — which
+  turned its x86 result from a 0.67× *loss* into a 3.23× win (asym 610.8 → 138.5 ns/tok).
+  Enable `residual_asym` everywhere. End-to-end this dilutes because search is
+  stage-1-bound (unchanged by #169, #170's territory). See
   [CI rescore ratios](#ci-rescore-ratios-contention-free).
 
 ## What shipped (integration)
@@ -44,18 +46,24 @@ keep #170's per-doc `par_iter` exact scoring **and** #169's asym dispatch.
 
 `quantize_lut` gained a base-3 branch (`residual_lut.rs`): for a ternary codec it emits a
 `fused[256 * 5]` int8 table — row `b` = the five trit weights packed in byte `b` — with
-`keys_per_byte = 5`, `nibble = None`. Two consequences fall out for free:
+`keys_per_byte = 5`, `nibble = None`. Three consequences:
 
-1. **No new kernel.** The SIMD paths require `nibble.is_some()` (nibble-factored
-   16-entry tables); trits don't align to nibbles, so `nibble = None` routes ternary to
-   the **scalar** reference kernel, whose existing `if d == dim { break }` already stops
-   before the padded trits in the last byte (dim128 → 26 B, last byte holds 3 pad trits).
+1. **Correct scoring for free.** The fused table is consumed by the **scalar** reference
+   kernel, whose existing `if d == dim { break }` already stops before the padded trits in
+   the last byte (dim128 → 26 B, last byte holds 3 pad trits).
 2. **inv_norms** got a matching base-3 branch (#169 builds the sidecar for every
    non-binary index; without it, ternary index creation panicked).
+3. **SIMD, without a new kernel.** The fused SIMD paths require `nibble.is_some()`, and
+   trits genuinely don't align to nibbles — so ternary additionally builds a
+   [`TernarySimd`] transcode that rewrites each stored byte as two nibble-aligned 2-bit
+   bytes and scores them on the *existing* kernels. Details and measured effect under
+   [CI rescore ratios](#ci-rescore-ratios-contention-free).
 
-Verified by `ternary_fused_table_matches_packing` (unit) and
+Verified by `ternary_fused_table_matches_packing` and `ternary_transcode_matches_fused`
+(unit), `ternary_simd_matches_scalar_bitwise` (SIMD accumulator bit-equal to the scalar
+base-3 reference across dims 5…160, run natively on aarch64 with `dotprod`), and
 `ternary_asymmetric_scoring_agrees_with_float` (integration: asym top-1 == float top-1,
-top-10 overlap ≥ 9/10). Full suite green, clippy + fmt clean. Pushed:
+top-10 overlap ≥ 9/10). Full suite green on both targets, clippy + fmt clean. Pushed:
 [`feat/ternary-residual`], [`integration/ternary-asym`].
 
 ## Storage ladder (bytes / token)
@@ -179,43 +187,64 @@ dedicated per-ISA runners — `ubuntu-latest` (x86_64 `avx2`/`avx512-vnni`) and
 `ubuntu-24.04-arm` (`neon-sdot`). Scalar rungs (1/2/4-bit) take the SIMD kernel; ternary
 takes the scalar kernel (`nibble = None`) by design.
 
-Stage-2 rescore only, **ns/token**, median of 9 reps, 4096 docs × 230 tokens, dim 128
-(run [31964951628](https://github.com/joe32140/next-plaid/actions/runs/31964951628)):
+Stage-2 rescore only, **ns/token**, median of 9 reps, 4096 docs × 230 tokens, dim 128.
+Every codec now takes a fused SIMD kernel — ternary via the transcode route described
+below (run [31965979173](https://github.com/joe32140/next-plaid/actions/runs/31965979173)):
 
 | codec | kernel | x86_64 float | x86_64 asym | **x86_64 ratio** | arm64 float | arm64 asym | **arm64 ratio** |
 |---|---|--:|--:|--:|--:|--:|--:|
-| 4-bit | SIMD | 708.0 | 100.2 | **7.06×** | 388.7 | 45.7 | **8.50×** |
-| 2-bit | SIMD | 690.9 | 99.9 | **6.92×** | 348.5 | 45.7 | **7.62×** |
-| 1-bit | SIMD | 612.5 | 69.1 | **8.86×** | 308.4 | 37.6 | **8.21×** |
-| **ternary** | scalar | 387.9 | 575.5 | **0.67×** | 239.4 | 161.0 | **1.49×** |
+| 4-bit | SIMD | 672.2 | 123.1 | **5.46×** | 235.3 | 71.2 | **3.31×** |
+| 2-bit | SIMD | 500.5 | 123.3 | **4.06×** | 318.7 | 70.3 | **4.53×** |
+| 1-bit | SIMD | 557.4 | 102.5 | **5.44×** | 203.7 | 70.3 | **2.90×** |
+| **ternary** | SIMD (transcoded) | 448.0 | **138.5** | **3.23×** | 249.3 | **96.6** | **2.58×** |
 
-*(x86_64 = `avx2`; arm64 = `neon-sdot`; ternary = `scalar` on both.)*
+*(x86_64 = `avx2`; arm64 = `neon-sdot`.)*
 
-**This is the result the contended end-to-end table buried.** At the rescore kernel #169
-is a **7–9× win on the scalar rungs (1/2/4-bit) on both ISAs** — float decompresses to f32
-then MaxSims, asym scores int8 straight over packed codes under SIMD. So the asym LUT is
-emphatically worth it *at Stage 2*; the end-to-end dilution is entirely stage-1 (which is
-what #170 attacks, and which the local numbers were dominated by).
+**At the rescore kernel #169 is a 2.6–5.5× win for every codec on both ISAs** — float
+decompresses to f32 then MaxSims, asym scores int8 straight over packed codes under SIMD.
+The end-to-end dilution is entirely stage-1 (which is what #170 attacks).
 
-**Ternary splits on ISA — the one caveat.** Because ternary factors to `nibble = None` it
-takes the *scalar* asym kernel, and that races the (well-vectorized) float path
-differently per arch: on **arm64 asym still wins 1.49×** (scalar-int accumulation beats
-float reconstruct+MaxSim), but on **x86_64 it loses 0.67×** (avx2 makes the float path
-faster than the non-SIMD integer LUT walk). Concretely, ternary-asym costs 575 ns/tok on
-x86 vs 2-bit-asym's 100 — the missing SIMD, not the codec. **Deployment:** for ternary,
-prefer `residual_asym` on arm64 and the float rescore on x86_64. **Future work:** a
-vectorized base-3 expand (pack 5 trits → SIMD lanes) would give ternary the same 7–9× on
-x86 that the nibble rungs already get — the single highest-value follow-up here.
+> **Comparing across CI runs:** the *float* baselines drift substantially between runs
+> (2-bit x86 float measured 690.9 ns/tok on the earlier run vs 500.5 here) — GitHub's
+> runners are not identical hardware, so **ratios are only comparable within a run**. The
+> `asym` columns are stable across runs and are the right basis for before/after claims.
+
+**Ternary got SIMD by transcoding, not by a new kernel.** Base-3 bytes genuinely don't
+nibble-factor (no trit is a function of a single nibble), which is why ternary previously
+scored on the scalar kernel and *lost* to float on x86 (0.67×, 610.8 ns/tok asym). Rather
+than hand-write base-3 NEON + AVX2 + AVX-512 kernels, `quantize_lut` now also builds a
+[`TernarySimd`]: a 256-entry table mapping each stored byte to **two nibble-aligned bytes**
+carrying its five trits as 2-bit codes (0/1/2 = trit, 3 = a dead slot weighted 0), plus a
+companion LUT (`keys_per_byte = 4`, weights `[w₋, w₀, w₊, 0]`). Query planes are built
+*gapped* over that layout so dead slots — and the padding trits past `dim` — get a 0 lane.
+Every real dim then contributes the same product the base-3 scalar reference computes and
+every dead slot contributes `0·w = 0`, so the integer accumulator is **bit-equal** to the
+scalar kernel (asserted over dims 5…160, including non-multiples of 8 *and* 5 and the
+`edim == MAX_DIM` boundary, verified on native aarch64 with `dotprod`).
+
+Effect, reading the stable `asym` column: **x86 610.8 → 138.5 ns/tok (4.4× faster), arm
+170.8 → 96.6 (1.77× faster)** — the x86 loss becomes a 3.23× win. Ternary asym now lands
+within ~1.2× of 2-bit asym on both ISAs (138.5 vs 123.3 on x86; 96.6 vs 70.3 on arm), and
+that residual gap is precisely the expected **8/5 lane occupancy**: five trits ride in
+eight 2-bit slots. The on-disk index is untouched (still `ceil(dim/5)` B/token) — the
+26 → 52 byte expansion lives in per-thread scratch.
+
+**Maintenance:** zero new intrinsics; `neon`/`avx2`/`avx512` are unchanged. The three
+per-arch dispatch arms were also factored into one `dispatch_simd` shared by both routes,
+and `ResidualLut::{wants_planes, kernel_name, simd_available}` now answer the shape
+questions per-route so call sites stop re-deriving `nibble.is_some()` conditions. A
+dedicated base-3 kernel could recover the remaining ~20 %, at the cost of a fourth kernel
+family per ISA — deliberately not taken.
 
 ## How far can we push latency — bottom line
 
 Separate the two stages:
 
-- **Stage-2 rescore (what the codec + #169 own):** asym is a **7–9× kernel speedup** on the
-  SIMD rungs (1/2/4-bit), clean on both x86 and arm (CI). Ternary gets the same idea but on
-  the scalar kernel, so it wins on arm (1.49×) and loses on x86 (0.67×) — vectorizing the
-  base-3 expand is the fix. So Stage-2 rescore is *already* pushed near its floor for the
-  nibble codecs; the ceiling that remains is stage-1.
+- **Stage-2 rescore (what the codec + #169 own):** asym is a **2.6–5.5× kernel speedup for
+  every codec**, clean on both x86 and arm (CI) — ternary included, now that it transcodes
+  onto the shared nibble kernels (its x86 asym cost dropped 4.4×, from 610.8 to 138.5
+  ns/tok). Stage-2 rescore is therefore pushed near its floor for *all* codecs; the ceiling
+  that remains is stage-1.
 - **Stage-1 (candidate generation):** owns end-to-end latency at BEIR scale — unchanged by
   #169, targeted by #170. This is why the end-to-end asym speedup is small even though the
   kernel speedup is 7–9×.
@@ -224,9 +253,9 @@ Separate the two stages:
   ternary is the better default than 2-bit; and its smaller float-path footprint also helps
   the float rescore path on bandwidth-bound corpora.
 
-**Deployment recipe:** 2-bit or ternary for footprint; enable `residual_asym` for the
-7–9× rescore win on the nibble rungs (all ISAs) and for ternary **on arm64**; keep ternary
-on float rescore on x86_64 until the base-3 kernel is vectorized.
+**Deployment recipe:** 2-bit or ternary for footprint; enable `residual_asym`
+unconditionally — every codec now reaches a fused SIMD kernel on both ISAs and gains
+2.6–5.5× at rescore, with NDCG parity.
 
 ## Repro
 

@@ -903,21 +903,34 @@ impl MmapNpyArray1I64 {
         self.len == 0
     }
 
-    /// Get a slice of the data as &[i64].
-    ///
-    /// Returns a `Vec<i64>` instead of &[i64] to handle unaligned data safely.
-    ///
-    /// # Safety
-    /// The caller must ensure start <= end <= len.
-    pub fn slice(&self, start: usize, end: usize) -> Vec<i64> {
-        let count = end - start;
-        let mut result = Vec::with_capacity(count);
-
-        for i in start..end {
-            result.push(self.get(i));
+    /// Borrow the mapped codes without copying when the target and NPY data
+    /// layout permit it. NPY data starts on a 64-byte boundary, but retain the
+    /// runtime alignment check for files produced by other writers.
+    pub fn as_slice(&self) -> Option<&[i64]> {
+        if !cfg!(target_endian = "little") {
+            return None;
         }
 
-        result
+        let bytes = &self._mmap[self.data_offset..self.data_offset + self.len * 8];
+        if bytes.as_ptr().align_offset(std::mem::align_of::<i64>()) != 0 {
+            return None;
+        }
+
+        // SAFETY: the alignment is checked above, the mapped byte range is
+        // bounds-checked, and its length is exactly `self.len * size_of::<i64>()`.
+        Some(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<i64>(), self.len) })
+    }
+
+    /// Copy a range of codes into an owned vector.
+    ///
+    /// The zero-copy stage-1 path uses [`Self::as_slice`]. This owned form is
+    /// retained for callers that need a standalone buffer and as a portable
+    /// fallback for unaligned or big-endian mappings.
+    pub fn slice(&self, start: usize, end: usize) -> Vec<i64> {
+        if let Some(codes) = self.as_slice() {
+            return codes[start..end].to_vec();
+        }
+        (start..end).map(|i| self.get(i)).collect()
     }
 
     /// Get a value at an index.
@@ -2091,6 +2104,7 @@ pub fn convert_fastplaid_to_nextplaid(index_path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray_npy::WriteNpyExt;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -2145,6 +2159,34 @@ mod tests {
         let owned = mmap.to_owned();
         assert_eq!(owned[1], 20);
         assert_eq!(owned[2], 30);
+    }
+
+    #[test]
+    fn test_mmap_npy_array1_i64_zero_copy_slice() {
+        let mut file = NamedTempFile::new().unwrap();
+        Array1::from_vec(vec![10i64, 20, 30, 40])
+            .write_npy(&mut file)
+            .unwrap();
+        file.flush().unwrap();
+
+        let mmap = MmapNpyArray1I64::from_npy_file(file.path()).unwrap();
+        assert_eq!(mmap.as_slice().unwrap(), &[10, 20, 30, 40]);
+        assert_eq!(mmap.slice(1, 3), vec![20, 30]);
+    }
+
+    #[test]
+    fn test_mmap_npy_array1_i64_unaligned_header_uses_safe_fallback() {
+        let mut file = NamedTempFile::new().unwrap();
+        let header_size = write_npy_header_1d(&mut file, 4, "<i8").unwrap();
+        assert_ne!(header_size % std::mem::align_of::<i64>(), 0);
+        for value in [10i64, 20, 30, 40] {
+            file.write_all(&value.to_le_bytes()).unwrap();
+        }
+        file.flush().unwrap();
+
+        let mmap = MmapNpyArray1I64::from_npy_file(file.path()).unwrap();
+        assert!(mmap.as_slice().is_none());
+        assert_eq!(mmap.slice(1, 3), vec![20, 30]);
     }
 
     #[test]

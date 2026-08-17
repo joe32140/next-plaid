@@ -3,10 +3,46 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, SystemTime};
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::paths::get_state_path;
+
+/// Coordinates state reads and replacements within one process. Windows does
+/// not allow replacing a file while another handle has it open, so the lock
+/// prevents a local reader from transiently denying the writer's rename.
+/// Separate processes are handled by the retry in `replace_state_file`.
+static STATE_FILE_LOCK: OnceLock<RwLock<()>> = OnceLock::new();
+
+fn state_file_lock() -> &'static RwLock<()> {
+    STATE_FILE_LOCK.get_or_init(|| RwLock::new(()))
+}
+
+fn replace_state_file(tmp_path: &Path, state_path: &Path) -> std::io::Result<()> {
+    // `MoveFileEx` (which backs `fs::rename`) can reject a replace on Windows
+    // while another process has state.json open. Retrying is safe: the temp
+    // file is complete and the target remains the previous valid JSON until a
+    // replacement succeeds. The total backoff is below 160 ms.
+    const RETRIES: u32 = 12;
+    for attempt in 0..RETRIES {
+        match fs::rename(tmp_path, state_path) {
+            Ok(()) => return Ok(()),
+            Err(err)
+                if cfg!(windows)
+                    && matches!(
+                        err.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AlreadyExists
+                    )
+                    && attempt + 1 < RETRIES =>
+            {
+                std::thread::sleep(Duration::from_millis(1 << attempt.min(4)));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("the final retry either returned or failed")
+}
 
 /// Version of the on-disk index format (chunk layout, embedding pipeline,
 /// metadata schema). Bump ONLY for incompatible changes: a mismatch discards
@@ -65,6 +101,9 @@ impl FileInfo {
 impl IndexState {
     /// Load state from the given index directory
     pub fn load(index_dir: &Path) -> Result<Self> {
+        let _guard = state_file_lock()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let state_path = get_state_path(index_dir);
         if state_path.exists() {
             let content = fs::read_to_string(&state_path)?;
@@ -81,6 +120,9 @@ impl IndexState {
     /// Without this, `fs::write` truncates the file before writing, so a
     /// concurrent reader can see an empty file and fail with a parse error.
     pub fn save(&self, index_dir: &Path) -> Result<()> {
+        let _guard = state_file_lock()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         fs::create_dir_all(index_dir)?;
 
         // Stamp the writing binary's CLI version and index format before saving
@@ -99,7 +141,10 @@ impl IndexState {
         let tmp_name = format!("state.{}.{}.json.tmp", std::process::id(), tid);
         let tmp_path = index_dir.join(tmp_name);
         fs::write(&tmp_path, content)?;
-        fs::rename(&tmp_path, &state_path)?;
+        if let Err(err) = replace_state_file(&tmp_path, &state_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
         Ok(())
     }
 

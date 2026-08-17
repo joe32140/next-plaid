@@ -21,8 +21,8 @@ fn main() {
         2,
         centroids,
         Array1::zeros(dim),
-        Some(array![-0.05f32, 0.05]),      // cutoffs
-        Some(array![-0.1f32, 0.0, 0.1]),   // weights = {-m, 0, +m}
+        Some(array![-0.05f32, 0.05]),    // cutoffs
+        Some(array![-0.1f32, 0.0, 0.1]), // weights = {-m, 0, +m}
     )
     .unwrap();
 
@@ -31,12 +31,22 @@ fn main() {
 
     let packed = codec.quantize_residuals(&residual).unwrap();
     println!("residual      = {:?}", residual.row(0).to_vec());
-    println!("packed bytes  = {:?}   ({} bytes for {} dims)",
-        packed.row(0).to_vec(), packed.ncols(), dim);
+    println!(
+        "packed bytes  = {:?}   ({} bytes for {} dims)",
+        packed.row(0).to_vec(),
+        packed.ncols(),
+        dim
+    );
 
     let codes = Array1::from_vec(vec![0usize]);
     let recon = codec.decompress(&packed, &codes.view()).unwrap();
     println!("centroid      = {:?}", c);
-    println!("reconstructed = {:?}   (L2-normalized, the codec's last step)",
-        recon.row(0).iter().map(|v| (v * 10000.0).round() / 10000.0).collect::<Vec<_>>());
+    println!(
+        "reconstructed = {:?}   (L2-normalized, the codec's last step)",
+        recon
+            .row(0)
+            .iter()
+            .map(|v| (v * 10000.0).round() / 10000.0)
+            .collect::<Vec<_>>()
+    );
 }

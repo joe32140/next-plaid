@@ -198,3 +198,75 @@ fn ternary_metadata_round_trips_through_load() {
     let result = reloaded.search(&docs[5], &params(), None).unwrap();
     assert_eq!(result.passage_ids.first(), Some(&5));
 }
+
+/// The dead-zone width ships enabled, and a config that predates the field
+/// must deserialize to the same value `Default` constructs.
+///
+/// This is the regression worth guarding: `ternary_tau` changes what gets
+/// written into the index, so a persisted config silently reverting to the
+/// equal-mass split would quietly cost ~0.006 NDCG@10 against the shipped
+/// default, with nothing in the API to show for it.
+#[test]
+fn ternary_tau_defaults_to_the_measured_setting() {
+    assert_eq!(IndexConfig::default().ternary_tau, Some(0.65));
+
+    // nbits/batch_size/seed carry no serde default, so even a config written
+    // before ternary_tau existed names them; ternary_tau is the only omission.
+    let legacy: IndexConfig =
+        serde_json::from_str(r#"{"nbits":2,"batch_size":64,"seed":42,"ternary":true}"#)
+            .expect("legacy config parses");
+    assert_eq!(
+        legacy.ternary_tau,
+        Some(0.65),
+        "a config written before ternary_tau existed must land on the default, \
+         not on the equal-mass split"
+    );
+
+    let explicit: IndexConfig = serde_json::from_str(
+        r#"{"nbits":2,"batch_size":64,"seed":42,"ternary":true,"ternary_tau":null}"#,
+    )
+    .expect("explicit null parses");
+    assert_eq!(
+        explicit.ternary_tau, None,
+        "explicit null still selects equal-mass"
+    );
+}
+
+/// The dead zone must actually widen the zero bucket relative to the
+/// equal-mass split, and stay bit-identical across a rebuild.
+#[test]
+fn ternary_tau_widens_the_dead_zone() {
+    let dim = 32usize;
+    let docs = random_docs(24, 8, dim);
+
+    let mass = TempDir::new().unwrap();
+    let tau = TempDir::new().unwrap();
+    let mut mass_cfg = ternary_config();
+    mass_cfg.ternary_tau = None;
+    let mut tau_cfg = ternary_config();
+    tau_cfg.ternary_tau = Some(0.65);
+
+    MmapIndex::create_with_kmeans(&docs, mass.path().to_str().unwrap(), &mass_cfg).unwrap();
+    MmapIndex::create_with_kmeans(&docs, tau.path().to_str().unwrap(), &tau_cfg).unwrap();
+
+    let mass_idx = MmapIndex::load(mass.path().to_str().unwrap()).unwrap();
+    let tau_idx = MmapIndex::load(tau.path().to_str().unwrap()).unwrap();
+
+    let width = |i: &MmapIndex| {
+        let c = i.codec.bucket_cutoffs.as_ref().expect("ternary has cutoffs");
+        c[1] - c[0]
+    };
+    // tau=0.65 zeroes ~48% of Gaussian residuals against equal-mass's exact 1/3.
+    assert!(
+        width(&tau_idx) > width(&mass_idx),
+        "tau=0.65 dead zone ({}) should be wider than equal-mass ({})",
+        width(&tau_idx),
+        width(&mass_idx)
+    );
+
+    // Deterministic: same seed, same residuals, same buckets.
+    let again = TempDir::new().unwrap();
+    MmapIndex::create_with_kmeans(&docs, again.path().to_str().unwrap(), &tau_cfg).unwrap();
+    let again_idx = MmapIndex::load(again.path().to_str().unwrap()).unwrap();
+    assert_eq!(width(&tau_idx), width(&again_idx));
+}

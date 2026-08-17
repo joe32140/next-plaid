@@ -164,12 +164,25 @@ fn scalar_cfg(nbits: usize) -> IndexConfig {
     }
 }
 
+/// Ternary with the *equal-mass* bucket split (cutoffs at the 1/3 and 2/3
+/// residual quantiles). This was the default until the tau sweep; it stays in
+/// the ladder as the control the shipped default has to beat.
 fn ternary_cfg() -> IndexConfig {
     IndexConfig {
         nbits: 2, // nominal; the ternary codec supersedes it
         seed: Some(42),
         ternary: true,
+        ternary_tau: None,
         ..Default::default()
+    }
+}
+
+/// Ternary with an explicit dead-zone width (`|r| < tau*sigma` stores 0)
+/// instead of the equal-mass 1/3–2/3 quantile split.
+fn ternary_tau_cfg(tau: f32) -> IndexConfig {
+    IndexConfig {
+        ternary_tau: Some(tau),
+        ..ternary_cfg()
     }
 }
 
@@ -202,8 +215,8 @@ fn main() {
         dim
     );
     println!(
-        "\n{:<9} {:>8} {:>10} {:>11}  {}",
-        "profile", "B/token", "NDCG@10", "reconCos", "notes"
+        "\n{:<9} {:>8} {:>10} {:>11}  notes",
+        "profile", "B/token", "NDCG@10", "reconCos"
     );
     println!("{}", "-".repeat(60));
 
@@ -211,14 +224,20 @@ fn main() {
     let (flat_float, dindex) = flatten(&docs, dim);
     let float_ndcg = eval_ndcg(&flat_float, &dindex, &qs, &query_ids, &corpus_ids, &qrels);
     println!(
-        "{:<9} {:>7}B {:>10.4} {:>11}  {}",
-        "float", dim * 4, float_ndcg, "1.0000", "lossless ceiling"
+        "{:<9} {:>7}B {:>10.4} {:>11}  lossless ceiling",
+        "float",
+        dim * 4,
+        float_ndcg,
+        "1.0000"
     );
 
     let profiles: Vec<(&str, IndexConfig, usize)> = vec![
         ("4-bit", scalar_cfg(4), dim / 2),
         ("2-bit", scalar_cfg(2), dim / 4),
-        ("ternary", ternary_cfg(), dim.div_ceil(5)),
+        ("tern-mass", ternary_cfg(), dim.div_ceil(5)),
+        ("tern@.50", ternary_tau_cfg(0.50), dim.div_ceil(5)),
+        ("tern@.65*", ternary_tau_cfg(0.65), dim.div_ceil(5)), // * = shipped default
+        ("tern@.80", ternary_tau_cfg(0.80), dim.div_ceil(5)),
         ("1-bit", scalar_cfg(1), dim / 8),
     ];
 

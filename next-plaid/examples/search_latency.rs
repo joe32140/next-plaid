@@ -266,13 +266,7 @@ fn main() {
                 "—".to_string()
             };
 
-            rows.push((
-                label,
-                bytes_per_token(label, dim),
-                n_ivf_probe,
-                us,
-                ndcg,
-            ));
+            rows.push((label, bytes_per_token(label, dim), n_ivf_probe, us, ndcg));
         }
     }
 

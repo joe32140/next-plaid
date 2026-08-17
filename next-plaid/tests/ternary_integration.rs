@@ -253,7 +253,11 @@ fn ternary_tau_widens_the_dead_zone() {
     let tau_idx = MmapIndex::load(tau.path().to_str().unwrap()).unwrap();
 
     let width = |i: &MmapIndex| {
-        let c = i.codec.bucket_cutoffs.as_ref().expect("ternary has cutoffs");
+        let c = i
+            .codec
+            .bucket_cutoffs
+            .as_ref()
+            .expect("ternary has cutoffs");
         c[1] - c[0]
     };
     // tau=0.65 zeroes ~48% of Gaussian residuals against equal-mass's exact 1/3.

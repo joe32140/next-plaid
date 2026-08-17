@@ -240,6 +240,7 @@ Controls index creation.
 IndexConfig {
     nbits: 4,                    // Quantization bits (1, 2, or 4)
     ternary: false,              // Base-3 residual codec (~1.585 bit; supersedes nbits)
+    ternary_tau: Some(0.65),     // Ternary dead-zone width, in sigma; None = equal-mass
     batch_size: 50_000,          // Documents per indexing chunk
     seed: Some(42),              // Random seed for K-means
     kmeans_niters: 4,            // K-means iterations

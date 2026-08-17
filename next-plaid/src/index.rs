@@ -174,10 +174,10 @@ pub struct IndexConfig {
     /// That figure is pooled over 8 model×corpus cells and 4,240 judged
     /// queries — 6 corpora spanning biomedical, finance, argument, multi-hop,
     /// citation and code, against 4 encoder families including a dim-48 model —
-    /// and is positive in 8 of 8. `tau = 0.80` measures as a dead tie
-    /// (−0.0001, 4 of 8), so the default is the incumbent, which also
-    /// reconstructs marginally better. See `docs/ternary_codec_findings.md`.
-    /// Ignored unless `ternary`.
+    /// and is positive in 8 of 8. `tau = 0.80` is close behind (+0.0027, 6 of 8)
+    /// and in fact edges 0.65 head-to-head by +0.0005; 0.65 ships because it is
+    /// the setting that never loses, not the one with the higher mean. See
+    /// `docs/ternary_codec.md`. Ignored unless `ternary`.
     #[serde(default = "default_ternary_tau")]
     pub ternary_tau: Option<f32>,
 }

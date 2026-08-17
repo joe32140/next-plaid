@@ -214,7 +214,6 @@ pub async fn search(
             n_full_scores: req.params.n_full_scores.unwrap_or(4096),
             batch_size: 2000,
             centroid_score_threshold: req.params.centroid_score_threshold.unwrap_or_default(),
-            residual_asym: req.params.residual_asym.unwrap_or(defaults.residual_asym),
             ..defaults
         };
 
@@ -317,7 +316,6 @@ pub async fn search(
                 n_full_scores: req.params.n_full_scores.unwrap_or(4096),
                 batch_size: 2000,
                 centroid_score_threshold: req.params.centroid_score_threshold.unwrap_or_default(),
-                residual_asym: req.params.residual_asym.unwrap_or(defaults.residual_asym),
                 ..defaults
             };
             let r = idx.search(&query, &params, subset.as_deref())?;

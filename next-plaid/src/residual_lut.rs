@@ -20,9 +20,9 @@
 //! New residual indexes also persist one `f32` inverse reconstruction norm per
 //! token. Search memory-maps that sidecar, so it adds file-backed storage but
 //! no whole-index heap allocation. Legacy indexes without the sidecar remain
-//! supported and compute norms for shortlisted documents on demand. The path
-//! is selected per-search via
-//! [`crate::search::SearchParameters::residual_asym`].
+//! supported and compute norms for shortlisted documents on demand. This is
+//! the residual scoring path — the float decompress→MaxSim code remains only
+//! as the automatic fallback for shapes the kernels cannot serve.
 //!
 //! The float path L2-normalizes each decompressed token; this path applies
 //! the identical normalization via `1/||recon||` values — measured as

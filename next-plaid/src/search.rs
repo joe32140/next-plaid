@@ -40,17 +40,6 @@ pub struct SearchParameters {
     /// Default: Some(0.4)
     #[serde(default = "default_centroid_score_threshold")]
     pub centroid_score_threshold: Option<f32>,
-    /// Score residual candidates asymmetrically — int8 query × int8 LUT over
-    /// the stored codes plus the centroid term from the IVF probe matrix —
-    /// instead of decompress→f32 MaxSim. New indexes memory-map a per-token
-    /// inverse-norm sidecar; legacy indexes compute those norms for shortlisted
-    /// documents. The two modes can still be A/B'd per search. Honored on both
-    /// the dense and batched-centroid search paths (the batched path packs
-    /// its sparse centroid scores into a compact matrix); ignored for
-    /// binary indexes and for dims the fused kernels don't support
-    /// (> 256), which fall back to the float path. Default off.
-    #[serde(default)]
-    pub residual_asym: bool,
 }
 
 fn default_centroid_batch_size() -> usize {
@@ -70,7 +59,6 @@ impl Default for SearchParameters {
             n_ivf_probe: 8,
             centroid_batch_size: default_centroid_batch_size(),
             centroid_score_threshold: default_centroid_score_threshold(),
-            residual_asym: false,
         }
     }
 }
@@ -128,7 +116,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// What a `residual_asym` request actually resolved to for this index/CPU.
+/// What asymmetric residual scoring resolved to for this index/CPU.
 #[derive(Clone, Copy)]
 enum AsymDispatch {
     /// The fused SIMD kernel — the path the flag exists for.
@@ -139,25 +127,23 @@ enum AsymDispatch {
     NotEngaged,
 }
 
-fn should_report_asym_dispatch(got: AsymDispatch, report_success: bool) -> bool {
-    report_success || !matches!(got, AsymDispatch::Simd)
+fn should_report_asym_dispatch(_got: AsymDispatch, report_requested: bool) -> bool {
+    report_requested
 }
 
-/// Report, once per process, what `residual_asym` actually got.
+/// Report, once per process, what residual scoring actually dispatched to.
 ///
-/// Every fallback below is silent and still returns correct scores, so the
-/// only symptom of landing on one is that a rescore advertised at ~5x
-/// measures ~1.2x — which reads as "the optimization does not work" rather
-/// than "the optimization did not run". Warn when the caller asked for the
-/// fused kernel and will not get it. `NEXT_PLAID_REPORT_KERNEL=1` also
-/// reports the success case, so a benchmark can record which kernel produced
-/// its numbers.
+/// Asymmetric scoring is the default, so a fallback is normal operation for
+/// the indexes and CPUs it covers — not a broken request — and stays silent.
+/// Set `NEXT_PLAID_REPORT_KERNEL=1` to print the resolved kernel (fused
+/// SIMD, scalar LUT, or float fallback), so a benchmark or a deployment
+/// checklist can record which kernel produced its numbers.
 fn report_asym_dispatch(index: &crate::index::MmapIndex, got: AsymDispatch) {
-    let report_success = std::env::var_os("NEXT_PLAID_REPORT_KERNEL").is_some();
+    let report_requested = std::env::var_os("NEXT_PLAID_REPORT_KERNEL").is_some();
     // A normal SIMD success is silent by default. Do not spend the process-wide
     // warning slot on that no-op: a later request may hit a real fallback on a
     // different index or shape and must still be reported.
-    if !should_report_asym_dispatch(got, report_success) {
+    if !should_report_asym_dispatch(got, report_requested) {
         return;
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -165,17 +151,17 @@ fn report_asym_dispatch(index: &crate::index::MmapIndex, got: AsymDispatch) {
         let dim = index.codec.embedding_dim();
         match got {
             AsymDispatch::Simd => eprintln!(
-                "[next-plaid] residual_asym: {} kernel (dim={dim})",
+                "[next-plaid] residual scoring: {} kernel (dim={dim})",
                 crate::residual_lut::active_kernel_name(dim, true)
             ),
             AsymDispatch::Scalar => eprintln!(
-                "[next-plaid] residual_asym: no SIMD dispatch (dim={dim}) — running the \
+                "[next-plaid] residual scoring: no SIMD dispatch (dim={dim}) — running the \
                  scalar kernel. Scores are correct, but only marginally faster than float \
                  rescoring. An x86_64 build under Rosetta, an x86_64 container on Apple \
                  Silicon, or an ARM CPU without `dotprod` lands here."
             ),
             AsymDispatch::NotEngaged => eprintln!(
-                "[next-plaid] residual_asym requested but not applicable to this index \
+                "[next-plaid] asymmetric residual scoring not applicable to this index \
                  (binary={}, dim={dim}, max supported {}) — scoring in float.",
                 index.metadata.binary,
                 crate::residual_lut::MAX_DIM,
@@ -185,18 +171,23 @@ fn report_asym_dispatch(index: &crate::index::MmapIndex, got: AsymDispatch) {
 }
 
 /// Prepare the query for the index's Stage-2 scoring path, once per search.
+///
+/// Residual indexes score asymmetrically (int8 query × fused LUT) — the only
+/// scoring path next-plaid exposes. The float decompress→MaxSim code remains
+/// strictly as the automatic fallback for what the kernels cannot serve
+/// (dims > MAX_DIM, codecs without norm tables), plus one undocumented
+/// emergency escape: `NEXT_PLAID_FLOAT_RESCORE=1` forces the float path
+/// process-wide so a field-discovered quality issue can be mitigated without
+/// a release. It is not public API; do not build on it.
 fn prepare_score_query<'a>(
     index: &crate::index::MmapIndex,
     query: &'a Array2<f32>,
-    residual_asym: bool,
 ) -> ScoreQuery<'a> {
     if index.metadata.binary {
-        if residual_asym {
-            report_asym_dispatch(index, AsymDispatch::NotEngaged);
-        }
         return ScoreQuery::Binary(crate::binary::quantize_query_i8(&query.view()));
     }
-    if residual_asym && index.codec.embedding_dim() <= crate::residual_lut::MAX_DIM {
+    let float_forced = std::env::var_os("NEXT_PLAID_FLOAT_RESCORE").is_some_and(|v| v != "0");
+    if !float_forced && index.codec.embedding_dim() <= crate::residual_lut::MAX_DIM {
         if let Some(lut) = crate::residual_lut::quantize_lut(&index.codec) {
             let dim = index.codec.embedding_dim();
             let q8 = crate::binary::quantize_query_i8(&query.view());
@@ -218,9 +209,7 @@ fn prepare_score_query<'a>(
             };
         }
     }
-    if residual_asym {
-        report_asym_dispatch(index, AsymDispatch::NotEngaged);
-    }
+    report_asym_dispatch(index, AsymDispatch::NotEngaged);
     ScoreQuery::Float(query)
 }
 
@@ -826,7 +815,7 @@ pub fn search_one_mmap(
 
     // Compute exact scores. Binary indexes score against an int8 query; the
     // full-precision query is used for the float (residual) path.
-    let exact_query = prepare_score_query(index, query, params.residual_asym);
+    let exact_query = prepare_score_query(index, query);
     let cdot_t = if matches!(&exact_query, ScoreQuery::ResidualLut { .. }) {
         // One transpose pass per query: stage-1 needs [nq, K] row-major for
         // per-token probing, the exact kernels want centroid-major [K, nq]
@@ -1253,7 +1242,7 @@ fn search_one_mmap_batched(
     // into a compact centroid-major [distinct, nq] matrix (one contiguous
     // row per centroid, the kernels' fold layout) plus a per-doc code remap
     // feeds the same fused kernels the dense path uses.
-    let exact_query = prepare_score_query(index, query, params.residual_asym);
+    let exact_query = prepare_score_query(index, query);
     let asym_compact = if matches!(&exact_query, ScoreQuery::ResidualLut { .. }) {
         let mut ids: Vec<usize> = sparse_scores.keys().copied().collect();
         ids.sort_unstable();
@@ -1564,11 +1553,18 @@ mod tests {
     }
 
     #[test]
-    fn silent_simd_success_does_not_take_the_reporting_slot() {
+    fn dispatch_reporting_is_opt_in() {
+        // Asym is the default: fallbacks are normal operation, silent unless
+        // NEXT_PLAID_REPORT_KERNEL asks for the resolved kernel.
         assert!(!should_report_asym_dispatch(AsymDispatch::Simd, false));
+        assert!(!should_report_asym_dispatch(AsymDispatch::Scalar, false));
+        assert!(!should_report_asym_dispatch(
+            AsymDispatch::NotEngaged,
+            false
+        ));
         assert!(should_report_asym_dispatch(AsymDispatch::Simd, true));
-        assert!(should_report_asym_dispatch(AsymDispatch::Scalar, false));
-        assert!(should_report_asym_dispatch(AsymDispatch::NotEngaged, false));
+        assert!(should_report_asym_dispatch(AsymDispatch::Scalar, true));
+        assert!(should_report_asym_dispatch(AsymDispatch::NotEngaged, true));
     }
 }
 

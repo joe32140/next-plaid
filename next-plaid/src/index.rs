@@ -1287,7 +1287,7 @@ impl MmapIndex {
             }
         }
 
-        Ok(Self {
+        let mut index = Self {
             path: index_path.to_string(),
             metadata,
             codec,
@@ -1299,7 +1299,24 @@ impl MmapIndex {
             mmap_codes,
             mmap_residuals,
             mmap_inv_norms,
-        })
+        };
+        // Default-on asymmetric scoring only pays off with the inverse-norm
+        // sidecar; upgrade pre-sidecar indexes once, here, so the win arrives
+        // with the load rather than requiring a provisioning step. Failure
+        // (for example a read-only index directory) is degradation, not an
+        // error: search falls back to per-document norm computation, which is
+        // correct but forfeits most of the asymmetric speedup.
+        if let Err(err) = index.prewarm_residual_lut_sidecar() {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                eprintln!(
+                    "[next-plaid] could not build the inverse-norm sidecar for {}: {} — \
+                     asymmetric searches will recompute norms per query (correct, slower)",
+                    index.path, err
+                );
+            });
+        }
+        Ok(index)
     }
 
     /// Borrow precomputed inverse norms when the index contains the optional
@@ -2414,7 +2431,6 @@ mod tests {
         }
 
         let params = crate::search::SearchParameters {
-            residual_asym: true,
             n_full_scores: embeddings.len(),
             n_ivf_probe: index.metadata.num_partitions,
             centroid_score_threshold: None,
@@ -2424,34 +2440,60 @@ mod tests {
         let num_chunks = index.metadata.num_chunks;
         drop(index);
 
+        // Deleting the sidecar no longer strands the index on the fallback:
+        // load() rebuilds it automatically (auto-prewarm) and rankings match.
         for chunk_idx in 0..num_chunks {
             std::fs::remove_file(temp_dir.path().join(format!("{}.inv_norms.npy", chunk_idx)))
                 .unwrap();
         }
         crate::mmap::clear_merged_files(temp_dir.path()).unwrap();
-        let mut legacy = MmapIndex::load(index_path).unwrap();
-        assert!(legacy.mmap_inv_norms.is_none());
-        let fallback = legacy.search(&embeddings[0], &params, None).unwrap();
-        assert_eq!(with_sidecar.passage_ids, fallback.passage_ids);
-        assert_eq!(with_sidecar.scores.len(), fallback.scores.len());
-        for (&actual, &want) in with_sidecar.scores.iter().zip(fallback.scores.iter()) {
-            assert!((actual - want).abs() <= 1e-6, "{actual} != {want}");
-        }
-
-        assert!(legacy.prewarm_residual_lut_sidecar().unwrap());
-        assert!(legacy.mmap_inv_norms.is_some());
-        assert!(!legacy.prewarm_residual_lut_sidecar().unwrap());
+        let mut healed = MmapIndex::load(index_path).unwrap();
+        assert!(healed.mmap_inv_norms.is_some(), "load must auto-prewarm");
+        assert!(!healed.prewarm_residual_lut_sidecar().unwrap());
         for chunk_idx in 0..num_chunks {
             assert!(temp_dir
                 .path()
                 .join(format!("{}.inv_norms.npy", chunk_idx))
                 .exists());
         }
-        let prewarmed = legacy.search(&embeddings[0], &params, None).unwrap();
+        let prewarmed = healed.search(&embeddings[0], &params, None).unwrap();
         assert_eq!(with_sidecar.passage_ids, prewarmed.passage_ids);
         assert_eq!(with_sidecar.scores.len(), prewarmed.scores.len());
         for (&actual, &want) in with_sidecar.scores.iter().zip(prewarmed.scores.iter()) {
             assert!((actual - want).abs() <= 1e-6, "{actual} != {want}");
+        }
+
+        // The per-document fallback still exists for indexes that cannot be
+        // upgraded in place (for example a read-only directory): auto-prewarm
+        // must degrade gracefully and searches must still match.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            drop(healed);
+            for chunk_idx in 0..num_chunks {
+                std::fs::remove_file(temp_dir.path().join(format!("{}.inv_norms.npy", chunk_idx)))
+                    .unwrap();
+            }
+            for name in ["merged_inv_norms.npy", "merged_inv_norms.manifest.json"] {
+                let p = temp_dir.path().join(name);
+                if p.exists() {
+                    std::fs::remove_file(p).unwrap();
+                }
+            }
+            std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+            let readonly = MmapIndex::load(index_path).unwrap();
+            assert!(
+                readonly.mmap_inv_norms.is_none(),
+                "read-only dir: prewarm must fail gracefully into the fallback"
+            );
+            let fallback = readonly.search(&embeddings[0], &params, None).unwrap();
+            assert_eq!(with_sidecar.passage_ids, fallback.passage_ids);
+            for (&actual, &want) in with_sidecar.scores.iter().zip(fallback.scores.iter()) {
+                assert!((actual - want).abs() <= 1e-6, "{actual} != {want}");
+            }
+            std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
         }
     }
 }

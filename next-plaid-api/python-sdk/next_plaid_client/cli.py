@@ -590,12 +590,6 @@ def document_delete(ctx, index_name, condition, param, yes, dry_run):
     type=int,
     help="Restrict search to these document IDs. Repeatable.",
 )
-@click.option(
-    "--residual-asym/--no-residual-asym",
-    default=None,
-    help="Rescore residual candidates with the fused int8xLUT kernel instead of "
-    "decompressing to float. Omit to use the server default.",
-)
 @click.pass_context
 def search(
     ctx,
@@ -612,7 +606,6 @@ def search(
     alpha,
     fusion,
     subset,
-    residual_asym,
 ):
     """Search an index with text queries, keyword queries, or both (hybrid).
 
@@ -671,9 +664,6 @@ def search(
         params.centroid_score_threshold = (
             centroid_threshold if centroid_threshold > 0 else None
         )
-    if residual_asym is not None:
-        params.residual_asym = residual_asym
-
     filter_parameters = _parse_params(filter_param)
 
     try:

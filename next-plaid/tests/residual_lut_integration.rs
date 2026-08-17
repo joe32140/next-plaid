@@ -1,8 +1,10 @@
-//! End-to-end tests for asymmetric int8×LUT residual scoring: same index,
-//! `residual_asym` toggled per search — retrieval must agree with the float
-//! path. Both paths apply the identical per-token renormalize (the asym path
-//! via cached inverse norms — load-bearing, not optional), so the only
-//! remaining difference is int8 quantization of the residual term.
+//! End-to-end tests for asymmetric int8×LUT residual scoring — the residual
+//! scoring path. Retrieval must agree with a float reference computed from
+//! the public decompression API (`get_document_embeddings` + MaxSim), which
+//! is exactly what the internal float fallback runs. Both apply the identical
+//! per-token renormalize (the asym path via cached inverse norms —
+//! load-bearing, not optional), so the only remaining difference is int8
+//! quantization of the residual term.
 
 use ndarray::{Array2, Axis};
 use ndarray_rand::rand::SeedableRng;
@@ -28,13 +30,40 @@ fn random_docs(num_docs: usize, tokens: usize, dim: usize) -> Vec<Array2<f32>> {
         .collect()
 }
 
-fn params(asym: bool) -> SearchParameters {
+fn params() -> SearchParameters {
     SearchParameters {
         top_k: 5,
         n_ivf_probe: 16,
-        residual_asym: asym,
         ..Default::default()
     }
+}
+
+/// Lossless variant: probe every cell and decompress every candidate, so a
+/// search ranks all documents and pruning cannot mask scoring differences.
+fn lossless_params(num_docs: usize) -> SearchParameters {
+    SearchParameters {
+        top_k: 5,
+        n_ivf_probe: 1 << 20,
+        n_full_scores: 4 * num_docs,
+        centroid_score_threshold: None,
+        ..Default::default()
+    }
+}
+
+/// The float reference: decompress through the public API and MaxSim — the
+/// exact computation the internal float fallback performs per document.
+fn float_rescore(index: &MmapIndex, query: &Array2<f32>, doc_id: usize) -> f32 {
+    let doc = index.get_document_embeddings(doc_id).unwrap();
+    next_plaid::maxsim::maxsim_score(&query.view(), &doc.view())
+}
+
+/// Rank every document by the float reference, best first.
+fn float_ranking(index: &MmapIndex, query: &Array2<f32>, num_docs: usize) -> Vec<(i64, f32)> {
+    let mut scored: Vec<(i64, f32)> = (0..num_docs)
+        .map(|d| (d as i64, float_rescore(index, query, d)))
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    scored
 }
 
 /// Every document must retrieve itself at rank 1 through the LUT path, for
@@ -53,7 +82,7 @@ fn lut_path_retrieves_the_query_document() {
         let index =
             MmapIndex::create_with_kmeans(&docs, dir.path().to_str().unwrap(), &config).unwrap();
         for (i, doc) in docs.iter().enumerate() {
-            let res = index.search(doc, &params(true), None).unwrap();
+            let res = index.search(doc, &params(), None).unwrap();
             assert_eq!(
                 res.passage_ids[0], i as i64,
                 "nbits={nbits}: doc {i} did not self-retrieve via LUT path"
@@ -79,16 +108,19 @@ fn lut_path_agrees_with_float_path() {
 
     let mut overlap_total = 0usize;
     for doc in docs.iter().take(30) {
-        let float = index.search(doc, &params(false), None).unwrap();
-        let lut = index.search(doc, &params(true), None).unwrap();
+        let float = float_ranking(&index, doc, docs.len());
+        let lut = index
+            .search(doc, &lossless_params(docs.len()), None)
+            .unwrap();
         assert_eq!(
-            float.passage_ids[0], lut.passage_ids[0],
-            "top-1 disagreement between float and LUT paths"
+            float[0].0, lut.passage_ids[0],
+            "top-1 disagreement between float reference and LUT path"
         );
+        let float_top5: Vec<i64> = float.iter().take(5).map(|(id, _)| *id).collect();
         overlap_total += lut
             .passage_ids
             .iter()
-            .filter(|id| float.passage_ids.contains(id))
+            .filter(|id| float_top5.contains(id))
             .count();
     }
     // ≥ 4 of 5 average overlap: the paths differ only by int8 rounding of
@@ -116,16 +148,16 @@ fn lut_scores_track_float_scores() {
         MmapIndex::create_with_kmeans(&docs, dir.path().to_str().unwrap(), &config).unwrap();
 
     for doc in docs.iter().take(10) {
-        let float = index.search(doc, &params(false), None).unwrap();
-        let lut = index.search(doc, &params(true), None).unwrap();
-        // Compare the top-1 scores (same doc per the agreement test). Docs are
+        let lut = index.search(doc, &params(), None).unwrap();
+        // Score the same top-1 document through the float reference. Docs are
         // 8 tokens of unit vectors → MaxSim ∈ [-8, 8]; the two paths should
         // agree within a few percent of that range.
-        let diff = (float.scores[0] - lut.scores[0]).abs();
+        let float_top1 = float_rescore(&index, doc, lut.passage_ids[0] as usize);
+        let diff = (float_top1 - lut.scores[0]).abs();
         assert!(
             diff < 0.4,
             "top-1 score diverged: float {} vs lut {}",
-            float.scores[0],
+            float_top1,
             lut.scores[0]
         );
     }
@@ -149,7 +181,7 @@ fn lut_path_handles_non_byte_aligned_dims() {
         let index =
             MmapIndex::create_with_kmeans(&docs, dir.path().to_str().unwrap(), &config).unwrap();
         for (i, doc) in docs.iter().enumerate().step_by(5) {
-            let res = index.search(doc, &params(true), None).unwrap();
+            let res = index.search(doc, &params(), None).unwrap();
             assert_eq!(
                 res.passage_ids[0], i as i64,
                 "nbits={nbits} dim=44: doc {i} did not self-retrieve via scalar LUT path"
@@ -158,9 +190,9 @@ fn lut_path_handles_non_byte_aligned_dims() {
     }
 }
 
-/// Dims above the fused path's MAX_DIM fall back to the float path:
-/// `residual_asym` on such an index must be a no-op, not an error — same
-/// ranking, same scores.
+/// Dims above the fused path's MAX_DIM fall back to the float path
+/// automatically: search on such an index must reproduce the float reference
+/// exactly — same ranking, bit-identical scores.
 #[test]
 fn oversize_dim_falls_back_to_float_path() {
     let docs = random_docs(20, 6, 272);
@@ -174,22 +206,27 @@ fn oversize_dim_falls_back_to_float_path() {
     let index =
         MmapIndex::create_with_kmeans(&docs, dir.path().to_str().unwrap(), &config).unwrap();
     for (i, doc) in docs.iter().enumerate().step_by(4) {
-        let asym = index.search(doc, &params(true), None).unwrap();
-        let float = index.search(doc, &params(false), None).unwrap();
+        let got = index
+            .search(doc, &lossless_params(docs.len()), None)
+            .unwrap();
         assert_eq!(
-            asym.passage_ids[0], i as i64,
+            got.passage_ids[0], i as i64,
             "dim=272: doc {i} did not self-retrieve"
         );
-        assert_eq!(
-            asym.passage_ids, float.passage_ids,
-            "dim=272: rankings diverged"
-        );
-        assert_eq!(asym.scores, float.scores, "dim=272: fallback scores differ");
+        let reference = float_ranking(&index, doc, docs.len());
+        for (rank, (&id, &score)) in got.passage_ids.iter().zip(got.scores.iter()).enumerate() {
+            assert_eq!(id, reference[rank].0, "dim=272: ranking diverged at {rank}");
+            assert_eq!(
+                score.to_bits(),
+                reference[rank].1.to_bits(),
+                "dim=272: fallback score differs at rank {rank}"
+            );
+        }
     }
 }
 
 /// The batched-centroid path (num_centroids > centroid_batch_size) must
-/// honor `residual_asym` and agree with the dense path. This is the scale
+/// score asymmetrically and agree with the dense path. This is the scale
 /// cliff regression test: before the fix, any index with more than
 /// `centroid_batch_size` centroids (~67M tokens at the default 100k)
 /// silently reverted asym scoring to float decompress+GEMM. Forcing a tiny
@@ -209,10 +246,10 @@ fn batched_path_asym_matches_dense_path() {
         };
         let index =
             MmapIndex::create_with_kmeans(&docs, dir.path().to_str().unwrap(), &config).unwrap();
-        let dense = params(true);
+        let dense = params();
         let batched = SearchParameters {
             centroid_batch_size: 8,
-            ..params(true)
+            ..params()
         };
         for (i, doc) in docs.iter().enumerate().step_by(9) {
             let rd = index.search(doc, &dense, None).unwrap();
@@ -267,7 +304,7 @@ fn parallel_batch_on_cold_index_does_not_deadlock() {
                 }
             }
             eprintln!(
-                "DEADLOCK: search_many_mmap(parallel=true) with residual_asym did not \
+                "DEADLOCK: search_many_mmap(parallel=true) did not \
                  finish within 60s on a cold index"
             );
             std::process::exit(101);
@@ -278,7 +315,7 @@ fn parallel_batch_on_cold_index_does_not_deadlock() {
     // normalization path simultaneously.
     let queries: Vec<Array2<f32>> = docs.iter().take(128).cloned().collect();
     let results =
-        next_plaid::search::search_many_mmap(&index, &queries, &params(true), true, None).unwrap();
+        next_plaid::search::search_many_mmap(&index, &queries, &params(), true, None).unwrap();
     finished.store(true, Ordering::SeqCst);
 
     assert_eq!(results.len(), queries.len());

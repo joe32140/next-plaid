@@ -750,7 +750,9 @@ fn stage1_shortlist(
             };
             scaled.max(params.n_ivf_probe).min(eligible.len())
         }
-        _ => params.n_ivf_probe,
+        // An oversized value means "probe every cell": clamp before it is
+        // trusted to size the probe scratch below.
+        _ => params.n_ivf_probe.min(num_centroids),
     };
 
     // Find top IVF cells to probe using per-token top-k selection.
@@ -1138,6 +1140,52 @@ mod tests {
         top_val.sort_by(|a, b| a.total_cmp(b));
         assert_eq!(top_val, vec![2.0, 3.0, 4.0]);
         assert!(top_idx.iter().all(|&i| row[i as usize].is_finite()));
+    }
+
+    /// An oversized n_ivf_probe means "probe every cell" (accepted by every
+    /// release through v1.6.5, and reachable unclamped through colgrep's
+    /// COLGREP_N_IVF_PROBE); it must be clamped before sizing the probe
+    /// scratch, not fed to Vec::with_capacity as-is.
+    #[test]
+    fn oversized_n_ivf_probe_probes_everything() {
+        let mut s = 0xFEED_u64;
+        let mut next = move || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+        let docs: Vec<Array2<f32>> = (0..40)
+            .map(|_| {
+                let mut d = Array2::from_shape_fn((6, 16), |_| next());
+                for mut row in d.rows_mut() {
+                    let n = row.dot(&row).sqrt().max(1e-12);
+                    row /= n;
+                }
+                d
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::IndexConfig {
+            nbits: 4,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let index = crate::index::MmapIndex::create_with_kmeans(
+            &docs,
+            dir.path().to_str().unwrap(),
+            &config,
+        )
+        .unwrap();
+        let params = SearchParameters {
+            top_k: 5,
+            n_full_scores: 32,
+            n_ivf_probe: usize::MAX / 2,
+            centroid_score_threshold: None,
+            ..Default::default()
+        };
+        let result = index.search(&docs[2], &params, None).unwrap();
+        assert!(!result.passage_ids.is_empty());
     }
 
     #[test]

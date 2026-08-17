@@ -1050,7 +1050,9 @@ fn stage1_shortlist(
                     idx_buf.clear();
                     idx_buf.extend(eligible.iter().map(|&c| c as u32));
                     let n_probe = effective_n_ivf_probe.min(idx_buf.len());
-                    if idx_buf.len() > n_probe {
+                    // n_probe == 0 must skip the select: `n_probe - 1`
+                    // underflows (the no-subset scan handles 0 internally).
+                    if n_probe > 0 && idx_buf.len() > n_probe {
                         idx_buf.select_nth_unstable_by(n_probe - 1, |&a, &b| {
                             cmp_score_descending(row[a as usize], row[b as usize])
                         });
@@ -1486,6 +1488,19 @@ mod tests {
         };
         let result = index.search(&docs[2], &params, None).unwrap();
         assert!(!result.passage_ids.is_empty());
+
+        // n_ivf_probe = 0 selects no cells and must return empty on both
+        // probe paths, not underflow the subset arm's partial select
+        // (`select_nth_unstable_by(n_probe - 1, ..)` with n_probe == 0).
+        let zero_probe = SearchParameters {
+            n_ivf_probe: 0,
+            ..params
+        };
+        let no_subset = index.search(&docs[2], &zero_probe, None).unwrap();
+        assert!(no_subset.passage_ids.is_empty());
+        let all_ids: Vec<i64> = (0..docs.len() as i64).collect();
+        let with_subset = index.search(&docs[2], &zero_probe, Some(&all_ids)).unwrap();
+        assert!(with_subset.passage_ids.is_empty());
     }
 
     #[test]

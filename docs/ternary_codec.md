@@ -60,7 +60,7 @@ Pooled over the 8 cells with enough judged queries to resolve the effect —
 |---|--:|--:|--:|--:|--:|--:|--:|--:|
 | POJ-104 / LateOn-Code-edge | 48 | 3,965 | 1000 | .3120 | .3102 | .3113 | **.3138** | **+0.0036** |
 | POJ-104 / LFM2.5-ColBERT | 128 | 3,965 | 1000 | .3933 | .3848 | .3838 | **.3875** | **+0.0027** |
-| FiQA / LFM2.5-ColBERT | 128 | 20,000 | 648 | .5847 | .5830 | .5793 | **.5867** | **+0.0037** |
+| FiQA / LFM2.5-ColBERT | 128 | 57,638 | 648 | .4862 | .4846 | .4794 | **.4872** | **+0.0026** |
 | nfcorpus / mLateOn | 128 | 3,633 | 323 | .3759 | .3668 | .3603 | **.3723** | **+0.0055** |
 | nfcorpus / answerai | 96 | 3,633 | 323 | .3725 | .3662 | .3617 | **.3677** | **+0.0015** |
 | nfcorpus / mxbai | 128 | 3,633 | 323 | .3092 | .3050 | .3069 | **.3093** | **+0.0043** |
@@ -75,30 +75,85 @@ encoders — so the first three rows are the out-of-distribution check: finance 
 code, on a dim-48 edge model and a non-BERT hybrid. The margin reproduced at the
 same size it was fitted at.
 
-**τ = 0.80 is a dead tie**, not an improvement: head-to-head against 0.65 across
-these 8 cells it is −0.0001, positive in 4 of 8. The default is the incumbent,
-which also reconstructs marginally better.
+The FiQA row also settles corpus scale, the axis every other cell shares: at
+57,638 documents there are an order of magnitude more competitors than anywhere
+else here and ranking margins are correspondingly tighter — the regime where a
+quantizer's error should start flipping results. It returns +0.0026, in line with
+the pooled mean rather than below it.
+
+**τ = 0.80 is not a demonstrated improvement.** Head-to-head against 0.65 across
+these 8 cells it is +0.0005 (+0.0011 weighted by judged queries), positive in 5 of
+8 — while against 2-bit it wins 6 of 8 where τ = 0.65 wins 8 of 8. Worth stating
+honestly: the three highest-power cells all favour 0.80 by +0.0016 to +0.0023, so
+the direction is not random and more evidence could move it. The default is the
+setting that never loses, not the higher mean.
+
+## Query-time cost
+
+Ternary is not a quality-for-speed trade: it is the **fastest of the four codecs on
+both SIMD kernel families**, including faster than 1-bit, which reads 10 fewer bytes
+per token.
+
+Measured on dedicated CI runners — `ubuntu-24.04-arm` (Neoverse-N2) and
+`ubuntu-latest` (AMD EPYC 7763, avx2) — with every codec timed **within one
+process**, since the same benchmark moves ±30 % between runners.
+
+| codec | B/tok | decode¹ arm | decode¹ x86 | e2e² d128 arm | e2e² d128 x86 | e2e² d48 arm | e2e² d48 x86 |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| 4-bit | 64 | 3.40 | 2.68 | 0.98× | 0.88× | 0.98× | 0.92× |
+| **ternary** | **26** | **5.21** | **5.91** | **1.09×** | **1.41×** | **1.07×** | **1.23×** |
+| 2-bit | 32 | 3.93 | 3.11 | — | — | — | — |
+| 1-bit | 16 | 4.36 | 3.37 | 1.06× | 1.06× | 1.04× | 1.04× |
+
+¹ `benches/residual_decode.rs`, criterion, million tokens decoded per second.
+² `examples/search_latency.rs`, end-to-end `search_batch` relative to 2-bit at probe
+8; ratios hold across probe depths 1 / 8 / 32 / 128.
+
+**Why it is faster despite packing denser.** A scalar `nbits=b` codec walks per
+*dimension*: shift, mask, index the `2^b` weight table — 128 times per token at dim
+128, and 4-bit's are the widest, which is why 4-bit is the slowest rung end-to-end.
+Ternary resolves five dimensions with **one indexed load**: a byte holds five trits
+(3⁵ = 243 ≤ 256), so a 256-entry table turns it straight into five weights. That is
+26 lookups per token against 128 shift-mask-lookups. Versus 1-bit, the arithmetic
+saved outweighs the extra 10 bytes of traffic.
+
+**Quote the e2e column, not the decode column.** In isolation ternary reads 1.33×
+(arm) and 1.90× (x86) over 2-bit; in situ that attenuates to 1.09× and 1.41×,
+because decode overlaps the MaxSim dot products it hides under. The isolated number
+is the mechanism, not the claim.
+
+`ternary_tau` cannot appear in this table: it changes bucket *values*, not the
+packing format or the decode path, so every τ shares these numbers.
 
 ## Reading a codec ladder without fooling yourself
 
-Three things cost real time to learn while measuring this, and they generalize to
+Four things cost real time to learn while measuring this, and they generalize to
 any quantizer comparison:
 
-1. **A cell with ~50 judged queries cannot resolve a 0.002 effect, and the ladder
-   detects that for free.** 1-bit is strictly lossier than float, so *a cell
-   reporting 1-bit as better than float is reporting noise* — no extra
-   computation, the row is already there. Four of twelve NanoBEIR cells failed
-   that check. The gate does bias its survivors upward (it selects cells whose
-   noise happened to align with the true ordering), so use it to discard cells,
-   never to rescue them.
-2. **Buying queries can flip a sign, not just shrink an error bar.** One cell put
+1. **A cell can be unreadable, and the ladder detects it for free.** 1-bit is
+   strictly lossier than float, so *a cell reporting 1-bit as better than float is
+   reporting noise* — no extra computation, the row is already there. The gate does
+   bias its survivors upward (it selects cells whose noise happened to align with
+   the true ordering), so use it to discard cells, never to rescue them.
+2. **It catches two different pathologies, and only one is fixable with money.**
+   *Too few judged queries* — four of twelve NanoBEIR cells at 50 queries — is
+   cheap to fix, since queries cost one forward pass each and never touch the
+   corpus encode. *Too low a float ceiling* is not fixable at any budget: a code
+   encoder run over financial prose failed this gate with **648** judged queries
+   and all seven lossy profiles above float, because at a float NDCG@10 of 0.2492
+   the ranking is too weakly determined for quantization noise to be asymmetric.
+   Screen a candidate cell on its float NDCG before paying to encode it — judged
+   queries are necessary, not sufficient.
+3. **Buying queries can flip a sign, not just shrink an error bar.** One cell put
    τ = 0.65 *behind* 2-bit at −0.0008 with 130 queries; the same corpus and model
    at 1,000 queries gives +0.0027.
-3. **Reconstruction fidelity picks the wrong τ.** `reconCos` prefers 0.65 over
+4. **Reconstruction fidelity picks the wrong τ.** `reconCos` prefers 0.65 over
    0.80 in 15 of 17 cells while NDCG's mean prefers 0.80. It averages over
    millions of tokens instead of hundreds of queries and costs nothing extra —
-   exactly the cheap proxy one would reach for — and it disagrees with the
-   ranking metric on the knob being tuned. Tune τ on NDCG.
+   exactly the cheap proxy one would reach for — and it disagrees with the ranking
+   metric on the knob being tuned. It is also the more *robust* of the two: in the
+   cell that failed the gate above, `reconCos` stayed perfectly ordered while NDCG
+   was pure noise. Robust and wrong. Tune τ on NDCG.
 
 ## Usage
 

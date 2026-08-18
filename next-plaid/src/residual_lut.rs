@@ -66,7 +66,7 @@ pub struct ResidualLut {
 /// Ternary's route onto the SIMD kernels, in one hop.
 ///
 /// A ternary byte packs five trits in base 3, so no trit is a function of a
-/// single nibble and [`derive_nibble_lut`] rightly refuses it: no SIMD
+/// single nibble and `derive_nibble_lut` rightly refuses it: no SIMD
 /// byte-shuffle (`tbl`, `pshufb`) reaches past 16 entries, and 243 values need
 /// 256. Any packing that *is* nibble-factorable costs at least 2 bits/dim,
 /// which is 2-bit exactly, with the storage win gone. So a scalar pre-pass is

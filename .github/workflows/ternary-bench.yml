@@ -14,15 +14,20 @@ name: Ternary Codec Bench
 #     microbenchmark overstates any stage with heavy work to hide under, so the
 #     decode delta is only believable once it is sized in situ.
 #
-# Since #169 the e2e number is NOT a like-for-like codec comparison, and the
-# job prints the reason rather than hiding it. Asymmetric rescoring is the
-# default, and it dispatches per codec: the scalar rungs factor their fused
-# table into 16-entry nibble lookups and run in-register (`tbl` / `pshufb`),
-# while base-3 cannot (5 trits do not align to 4-bit boundaries, and 243 is not
-# a product of two 16-entry tables), so ternary takes the scalar kernel. The
-# ladder therefore measures SIMD-asym 2-bit against scalar-asym ternary. That
-# is the honest deployed comparison, but read it as a codec+kernel result, not
-# a codec result -- NEXT_PLAID_REPORT_KERNEL makes the split visible.
+# Since #169, asymmetric rescoring is the default and it dispatches per codec,
+# so this ladder is a codec+kernel result and the job prints which kernel each
+# rung took rather than leaving it to be assumed. The scalar rungs factor their
+# fused table into 16-entry nibble lookups and run in-register (`tbl` /
+# `pshufb`); base-3 cannot (5 trits do not align to 4-bit boundaries, and 243
+# is not a product of two 16-entry tables), so ternary reaches the same kernels
+# by a different expansion -- one 8-byte table copy per stored byte, straight
+# to weights. Every rung should therefore report the SAME kernel name. A rung
+# reporting "no SIMD dispatch" while its neighbours report neon-sdot / avx2 is
+# the bug this ladder exists to catch: it measured a fallback, not a codec.
+#
+# NEXT_PLAID_REPORT_KERNEL deduplicates by message, not once per process, which
+# is what makes it usable here -- a process-wide Once would print the first
+# index's line and silently drop every other rung's.
 #
 # Why CI and not a laptop: these are *latency* numbers, and latency measured on
 # a machine running anything else measures that other thing.

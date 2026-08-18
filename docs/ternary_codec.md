@@ -90,46 +90,63 @@ setting that never loses, not the higher mean.
 
 ## Query-time cost
 
-**This section is being re-measured against 1.7.0 and the numbers below are not
-yet updated.** They were taken before #169 landed, when every codec shared the
-float decode path. Asymmetric rescoring is now the default and it dispatches
-*per codec*, so the comparison is no longer like-for-like — see
-"How ternary interacts with asymmetric scoring" below.
-
-## How ternary interacts with asymmetric scoring
-
 Since 1.7.0, asymmetric rescoring — int8 query against a fused byte→weights
-table, no float decompression — is the default residual path. Ternary engages
-it: `quantize_lut` builds the fused table straight from the base-3 trit table,
-because a trit value *is* its weight index.
+table, no float decompression — is the default residual path, and it dispatches
+*per codec*. That makes the codec ladder a **codec + kernel** measurement, so
+the bench workflow sets `NEXT_PLAID_REPORT_KERNEL=1` and every rung prints the
+kernel it took. Read the kernel line before the numbers.
 
-What ternary cannot have is the in-register expansion. NEON `tbl` and AVX2
-`pshufb` index a **16-entry** table with a nibble, and that is why base 2 is so
-comfortable: a 2-bit or 4-bit byte factors into nibbles, each nibble indexes the
-shuffle, and the decode never leaves the vector unit. A base-3 byte carries 243
-values and does not factor — there is no way to split 243 into two 16-entry
-lookups. And any packing that *does* factor costs at least 2 bits per dimension,
-which is the 2-bit codec with the storage win gone.
+Ternary engages asymmetric scoring the same way the scalar rungs do —
+`quantize_lut` builds the fused table straight from the base-3 trit table,
+because a trit value *is* its weight index. What it cannot share is the
+in-register **nibble** expansion: NEON `tbl` and AVX2 `pshufb` index a 16-entry
+table with a nibble, which is exactly why base 2 is comfortable — a 2-bit or
+4-bit byte factors into nibbles, each nibble indexes the shuffle, and the decode
+never leaves the vector unit. A base-3 byte carries 243 values and does not
+factor; there is no way to split 243 into two 16-entry lookups, and any packing
+that *does* factor costs at least 2 bits/dim, which is the 2-bit codec with the
+storage win gone.
 
-**So a scalar expansion pass is the price of sub-2-bit packing, not a defect in
-the implementation.** Ternary takes `maxsim_residual_lut_scalar`, whose
-`d == dim` break already masks the padded tail byte. It keeps the substance of
-asymmetric scoring and gives up the vector unit.
+So ternary reaches the same kernels by a different expansion. The fused table is
+already `byte → [w(trit₀)…w(trit₄)]`; padded to eight, each row is one unaligned
+8-byte copy into the kernel's weight buffer at `5i`. The copies overlap by three
+bytes but every one is a *pure store* — the next iteration overwrites the slack
+— so there is no read-modify-write. Output is natural dim order, so ternary
+queries need no plane permutation at all. Everything after the expansion — the
+dot, the fold, the epilogue — is byte-for-byte the shared kernel, which is why
+this is a two-arm `match` inside one kernel rather than a second kernel family
+per ISA. Bit-parity with the scalar base-3 reference is asserted over dims that
+are multiples of neither 8 nor 5.
 
-The practical consequence is that any end-to-end latency comparison against
-2-bit is now a **codec + kernel** result, not a codec result: SIMD-asym 2-bit
-against scalar-asym ternary. Set `NEXT_PLAID_REPORT_KERNEL=1` to see which
-kernel each index dispatched to before reading a ladder.
+**Why this is in the codec's PR and not a follow-up.** It was measured as one.
+On 1.7.0 without it, ternary falls off SIMD onto the scalar expansion while
+every other rung keeps its kernel, and the ladder reads:
 
-How much that costs in practice is a measurement, not a deduction, and it is one
-this doc does not yet have on 1.7.0 — the pre-#169 ladder does not answer it,
-and a laptop cannot: local latency on a contended machine has already produced a
-ternary reading of 0.80× against CI's 2.4–3.3× for the same code. Take it from
-the bench workflow, on both ISAs, with the kernel reported.
+| dim 128, aarch64 (Neoverse-N2) | B/tok | probe 1 | probe 8 | probe 32 | probe 128 | vs 2-bit |
+|---|--:|--:|--:|--:|--:|--:|
+| 4-bit | 64 | 6825 µs | 7062 | 7285 | 8705 | 0.98× |
+| 2-bit | 32 | 6691 | 6926 | 7222 | 8545 | — |
+| ternary, **scalar expansion** | 26 | 26604 | 26857 | 27133 | 28499 | **0.25×** |
+| 1-bit | 16 | 6621 | 6904 | 7156 | 8602 | 1.01× |
 
-A one-hop 256×5 byte→weights expansion that rides the existing SIMD kernels does
-exist on an integration branch; whether it is worth landing depends on that
-measurement.
+Four times slower, and the same shape at dim 48 (0.25–0.32×). A 19 % storage
+saving does not buy that. Pre-#169, when every codec shared the float decode
+path, the same ladder had ternary as the *fastest* rung — the codec did not
+change, the default kernel did.
+
+That table is also the clearest case for reading the kernel line first. The
+isolated decode microbenchmark, on the same runner in the same job, still rates
+ternary the fastest decode of the four (1.573 ms against 2-bit's 2.084 ms). It
+measures the float path, which nothing takes any more, and it says the opposite
+of the truth by a factor of five.
+
+**With the one-hop expansion, ternary reports the same kernel as every other
+rung** (`neon-sdot` / `avx2` / `avx512-vnni`), and what it still owes 2-bit is
+the expansion itself: one 8-byte copy per stored byte against 2-bit's one `tbl`
+per key position per 16 bytes. Isolated, that gap is 12.03 against 5.00
+ns/token; in situ it is smaller, because the expansion overlaps the dot. The
+measured ladder goes here once CI reports it — from the bench workflow, on both
+ISAs, with the kernel line attached.
 
 ## Reading a codec ladder without fooling yourself
 

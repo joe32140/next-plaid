@@ -71,26 +71,41 @@ Ternary at τ = 0.65 reaches **mean NDCG retention equal to 4-bit's** at 26 B/to
 against 4-bit's 64, and **clears 1-bit in every cell measured, at every τ**.
 
 Those figures are **codec-isolated**: exhaustive float MaxSim over
-reconstructions. Since 1.7.0 a real search rescores asymmetrically instead
-(int8 query × fused LUT), so the deployed number is not automatically the
-measured one. Checked on scifact/ColBERTv2 — the weakest cell in the table, and
-so the one where asym noise had the best chance of flipping the sign — by
-running the same index down both paths (`NEXT_PLAID_FLOAT_RESCORE=1` for the
-float arm):
+reconstructions, which is what makes the codec the only variable per row. Since
+1.7.0 a real search rescores asymmetrically instead (int8 query × fused LUT), so
+the deployed number is not automatically the measured one — the int8 query
+quantization is a second lossy step, and nothing guarantees a 3-level weight
+table meets it the same way a 4-level one does.
 
-| | float | asym (default) | Δ |
-|---|--:|--:|--:|
-| 4-bit | .6459 | .6459 | 0.0000 |
-| 2-bit | .6464 | .6457 | **−0.0007** |
-| **ternary τ=0.65** | **.6466** | **.6466** | **0.0000** |
-| 1-bit | .6400 | .6400 | 0.0000 |
+Measured rather than assumed, on five cells: build one index, score it down both
+paths, `NEXT_PLAID_FLOAT_RESCORE=1` selecting the float arm. NDCG is
+deterministic, so the two runs are comparable even across processes.
 
-Asymmetric rescoring costs ternary nothing here, and the rung it does cost is
-the baseline: ternary's margin over 2-bit *widens* from +0.0002 to +0.0009. The
-float column also reproduces the codec-isolated row above exactly, which is a
-useful cross-check that the search path is not adding a confound at these probe
-depths. One cell, so read it as refuting "base-3's int8 path is systematically
-lossier", not as establishing asym-neutrality across all eight.
+| cell | dim | q | 2-bit float → asym | ternary float → asym | margin |
+|---|--:|--:|--:|--:|--:|
+| scifact / ColBERTv2 | 128 | 300 | .6464 → .6457 (−7e-4) | .6466 → **.6466** (0) | +0.0002 → **+0.0009** |
+| nfcorpus / ColBERTv2 | 128 | 323 | .3234 → .3232 (−2e-4) | .3242 → **.3246** (+4e-4) | +0.0008 → **+0.0014** |
+| nfcorpus / answerai | 96 | 323 | .3667 → .3664 (−3e-4) | .3673 → **.3677** (+4e-4) | +0.0006 → **+0.0013** |
+| nfcorpus / mLateOn | 128 | 323 | .3703 → .3697 (−6e-4) | .3772 → **.3769** (−3e-4) | +0.0069 → **+0.0072** |
+| nfcorpus / mxbai | 128 | 323 | .3050 → .3050 (0) | .3093 → **.3096** (+3e-4) | +0.0043 → **+0.0046** |
+
+Asymmetric rescoring costs 2-bit a mean −0.00036 and never helps it (0 of 5
+positive); it costs ternary a mean **+0.00016**, i.e. nothing, and the margin
+over 2-bit is wider on the deployed path than on float in **5 of 5**.
+
+The claim that carries weight here is the negative one — **asym does not
+penalize base-3** — and that is what the PR needs. The positive reading, that
+asym systematically *favours* it, is not supported: the per-cell deltas are
+3–7e-4 on 300-odd-query cells, which is inside what these cells resolve, and
+there is no mechanism on offer. Five same-signed margins is suggestive, not a
+result.
+
+Two scope notes. These bundles were re-encoded for this check and are **not** the
+bundles behind the table above — the absolute NDCGs differ per cell (nfcorpus /
+mLateOn reads .3772 here against .3723 there), so read each row's internal
+before→after, never a number across the two tables. And the probe-32 search
+path includes stage-1 candidate generation, which the codec-isolated harness
+excludes by design; that is the point of running it, since it is what deploys.
 
 τ was originally tuned on nfcorpus + scifact — both biomedical, all BERT-family
 encoders — so the first three rows are the out-of-distribution check: finance and
@@ -155,6 +170,18 @@ Four times slower, and the same shape at dim 48 (0.25–0.32×). A 19 % storage
 saving does not buy that. Pre-#169, when every codec shared the float decode
 path, the same ladder had ternary as the *fastest* rung — the codec did not
 change, the default kernel did.
+
+On x86 it is worse, and for a reason worth keeping: the wider the kernel the
+other rungs keep, the more falling off it costs. Same ladder on a Xeon
+6973P-C where the others run `avx512-vnni`:
+
+| dim | 4-bit | 2-bit | **ternary, scalar expansion** | 1-bit |
+|---|--:|--:|--:|--:|
+| 128 | 0.92–1.05× | — | **0.11–0.13×** | 1.00–1.07× |
+| 48 | 1.12–1.15× | — | **0.25–0.28×** | 1.10–1.16× |
+
+Nine times slower at dim 128. Any codec that cannot ride the fused kernels pays
+the full width of the ones that can.
 
 That table is also the clearest case for reading the kernel line first. The
 isolated decode microbenchmark, on the same runner in the same job, still rates

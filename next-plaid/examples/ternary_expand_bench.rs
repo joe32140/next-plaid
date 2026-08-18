@@ -78,19 +78,32 @@
 //! ```
 //! Args: `[n_tokens] [reps]` (defaults 4096, 15). Env: `DIM` (128).
 
+// Every arm is a NEON intrinsic, so the harness only exists on aarch64. The
+// gate is per-item rather than crate-level (`#![cfg]` at the root would remove
+// `main` along with everything else) and there is a stub `main` below for
+// other targets.
+#[cfg(target_arch = "aarch64")]
 mod common;
 
+#[cfg(target_arch = "aarch64")]
 use common::{median, Lcg};
+#[cfg(target_arch = "aarch64")]
 use ndarray::{Array1, Array2};
+#[cfg(target_arch = "aarch64")]
 use next_plaid::codec::ResidualCodec;
+#[cfg(target_arch = "aarch64")]
 use next_plaid::residual_lut::quantize_lut;
+#[cfg(target_arch = "aarch64")]
 use std::hint::black_box;
+#[cfg(target_arch = "aarch64")]
 use std::time::Instant;
 
+#[cfg(target_arch = "aarch64")]
 const TRITS: usize = 5;
 
 /// (A) The shipped one-hop: 256×8 table, one unaligned 8-byte copy per stored
 /// byte, natural dim order. `w` needs 8 bytes of slack past `5·nbytes`.
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn expand_one_hop(row: &[u8], nbytes: usize, table: &[[i8; 8]; 256], w: &mut [i8]) {
     let wp = w.as_mut_ptr();
@@ -103,6 +116,7 @@ fn expand_one_hop(row: &[u8], nbytes: usize, table: &[[i8; 8]; 256], w: &mut [i8
 
 /// Scalar reference for the planar arms, so the SIMD versions have something
 /// to be wrong against.
+#[cfg(target_arch = "aarch64")]
 fn expand_planar_scalar(row: &[u8], nbytes: usize, fused: &[i8], w: &mut [i8], pdim: usize) {
     for (i, &b) in row[..nbytes].iter().enumerate() {
         for k in 0..TRITS {
@@ -204,6 +218,7 @@ mod neon_arms {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn main() {
     // The magics are the whole correctness story; assert them exhaustively
     // before anything else runs.
@@ -287,7 +302,6 @@ fn main() {
     let mut wref = vec![0i8; 5 * pdim + 8];
 
     // ---- correctness, every token, before any timing ----
-    #[cfg(target_arch = "aarch64")]
     {
         use neon_arms::*;
         let wtab = unsafe { std::arch::aarch64::vld1q_s8(wtab_src.as_ptr()) };
@@ -323,7 +337,6 @@ fn main() {
     }
 
     // ---- timing, interleaved ----
-    #[cfg(target_arch = "aarch64")]
     {
         use neon_arms::*;
         let wtab = unsafe { std::arch::aarch64::vld1q_s8(wtab_src.as_ptr()) };
@@ -378,6 +391,11 @@ fn main() {
             c - 5.0
         );
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    println!("SIMD arms are aarch64-only; nothing to time here.");
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn main() {
+    println!(
+        "ternary_expand_bench: the arms are NEON intrinsics; nothing to measure on this target."
+    );
 }

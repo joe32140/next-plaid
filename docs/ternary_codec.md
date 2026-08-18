@@ -90,40 +90,40 @@ setting that never loses, not the higher mean.
 
 ## Query-time cost
 
-Ternary is not a quality-for-speed trade: it is the **fastest of the four codecs on
-both SIMD kernel families**, including faster than 1-bit, which reads 10 fewer bytes
-per token.
+**This section is being re-measured against 1.7.0 and the numbers below are not
+yet updated.** They were taken before #169 landed, when every codec shared the
+float decode path. Asymmetric rescoring is now the default and it dispatches
+*per codec*, so the comparison is no longer like-for-like — see
+"How ternary interacts with asymmetric scoring" below.
 
-Measured on dedicated CI runners — `ubuntu-24.04-arm` (Neoverse-N2) and
-`ubuntu-latest` (AMD EPYC 7763, avx2) — with every codec timed **within one
-process**, since the same benchmark moves ±30 % between runners.
+## How ternary interacts with asymmetric scoring
 
-| codec | B/tok | decode¹ arm | decode¹ x86 | e2e² d128 arm | e2e² d128 x86 | e2e² d48 arm | e2e² d48 x86 |
-|---|--:|--:|--:|--:|--:|--:|--:|
-| 4-bit | 64 | 3.40 | 2.68 | 0.98× | 0.88× | 0.98× | 0.92× |
-| **ternary** | **26** | **5.21** | **5.91** | **1.09×** | **1.41×** | **1.07×** | **1.23×** |
-| 2-bit | 32 | 3.93 | 3.11 | — | — | — | — |
-| 1-bit | 16 | 4.36 | 3.37 | 1.06× | 1.06× | 1.04× | 1.04× |
+Since 1.7.0, asymmetric rescoring — int8 query against a fused byte→weights
+table, no float decompression — is the default residual path. Ternary engages
+it: `quantize_lut` builds the fused table straight from the base-3 trit table,
+because a trit value *is* its weight index.
 
-¹ `benches/residual_decode.rs`, criterion, million tokens decoded per second.
-² `examples/search_latency.rs`, end-to-end `search_batch` relative to 2-bit at probe
-8; ratios hold across probe depths 1 / 8 / 32 / 128.
+What ternary cannot have is the in-register expansion. NEON `tbl` and AVX2
+`pshufb` index a **16-entry** table with a nibble, and that is why base 2 is so
+comfortable: a 2-bit or 4-bit byte factors into nibbles, each nibble indexes the
+shuffle, and the decode never leaves the vector unit. A base-3 byte carries 243
+values and does not factor — there is no way to split 243 into two 16-entry
+lookups. And any packing that *does* factor costs at least 2 bits per dimension,
+which is the 2-bit codec with the storage win gone.
 
-**Why it is faster despite packing denser.** A scalar `nbits=b` codec walks per
-*dimension*: shift, mask, index the `2^b` weight table — 128 times per token at dim
-128, and 4-bit's are the widest, which is why 4-bit is the slowest rung end-to-end.
-Ternary resolves five dimensions with **one indexed load**: a byte holds five trits
-(3⁵ = 243 ≤ 256), so a 256-entry table turns it straight into five weights. That is
-26 lookups per token against 128 shift-mask-lookups. Versus 1-bit, the arithmetic
-saved outweighs the extra 10 bytes of traffic.
+**So a scalar expansion pass is the price of sub-2-bit packing, not a defect in
+the implementation.** Ternary takes `maxsim_residual_lut_scalar`, whose
+`d == dim` break already masks the padded tail byte. It keeps the substance of
+asymmetric scoring and gives up the vector unit.
 
-**Quote the e2e column, not the decode column.** In isolation ternary reads 1.33×
-(arm) and 1.90× (x86) over 2-bit; in situ that attenuates to 1.09× and 1.41×,
-because decode overlaps the MaxSim dot products it hides under. The isolated number
-is the mechanism, not the claim.
+The practical consequence is that any end-to-end latency comparison against
+2-bit is now a **codec + kernel** result, not a codec result: SIMD-asym 2-bit
+against scalar-asym ternary. Set `NEXT_PLAID_REPORT_KERNEL=1` to see which
+kernel each index dispatched to before reading a ladder.
 
-`ternary_tau` cannot appear in this table: it changes bucket *values*, not the
-packing format or the decode path, so every τ shares these numbers.
+A one-hop 256×5 byte→weights expansion that rides the existing SIMD kernels
+does exist and closes most of this gap; it is a follow-up, not part of the
+codec.
 
 ## Reading a codec ladder without fooling yourself
 

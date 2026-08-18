@@ -70,6 +70,28 @@ Pooled over the 8 cells with enough judged queries to resolve the effect —
 Ternary at τ = 0.65 reaches **mean NDCG retention equal to 4-bit's** at 26 B/token
 against 4-bit's 64, and **clears 1-bit in every cell measured, at every τ**.
 
+Those figures are **codec-isolated**: exhaustive float MaxSim over
+reconstructions. Since 1.7.0 a real search rescores asymmetrically instead
+(int8 query × fused LUT), so the deployed number is not automatically the
+measured one. Checked on scifact/ColBERTv2 — the weakest cell in the table, and
+so the one where asym noise had the best chance of flipping the sign — by
+running the same index down both paths (`NEXT_PLAID_FLOAT_RESCORE=1` for the
+float arm):
+
+| | float | asym (default) | Δ |
+|---|--:|--:|--:|
+| 4-bit | .6459 | .6459 | 0.0000 |
+| 2-bit | .6464 | .6457 | **−0.0007** |
+| **ternary τ=0.65** | **.6466** | **.6466** | **0.0000** |
+| 1-bit | .6400 | .6400 | 0.0000 |
+
+Asymmetric rescoring costs ternary nothing here, and the rung it does cost is
+the baseline: ternary's margin over 2-bit *widens* from +0.0002 to +0.0009. The
+float column also reproduces the codec-isolated row above exactly, which is a
+useful cross-check that the search path is not adding a confound at these probe
+depths. One cell, so read it as refuting "base-3's int8 path is systematically
+lossier", not as establishing asym-neutrality across all eight.
+
 τ was originally tuned on nfcorpus + scifact — both biomedical, all BERT-family
 encoders — so the first three rows are the out-of-distribution check: finance and
 code, on a dim-48 edge model and a non-BERT hybrid. The margin reproduced at the
@@ -120,7 +142,7 @@ are multiples of neither 8 nor 5.
 
 **Why this is in the codec's PR and not a follow-up.** It was measured as one.
 On 1.7.0 without it, ternary falls off SIMD onto the scalar expansion while
-every other rung keeps its kernel, and the ladder reads:
+every other rung keeps its kernel, and the ladder reads (aarch64):
 
 | dim 128, aarch64 (Neoverse-N2) | B/tok | probe 1 | probe 8 | probe 32 | probe 128 | vs 2-bit |
 |---|--:|--:|--:|--:|--:|--:|
@@ -141,16 +163,32 @@ measures the float path, which nothing takes any more, and it says the opposite
 of the truth by a factor of five.
 
 **With the one-hop expansion, ternary reports the same kernel as every other
-rung** (`neon-sdot` / `avx2` / `avx512-vnni`), and what it still owes 2-bit is
-the expansion itself: one 8-byte copy per stored byte against 2-bit's one `tbl`
-per key position per 16 bytes. Isolated, that gap is 12.03 against 5.00
-ns/token; in situ it is smaller, because the expansion overlaps the dot. The
-measured ladder goes here once CI reports it — from the bench workflow, on both
-ISAs, with the kernel line attached.
+rung**, and the 4× is gone. Both ISAs, dedicated runners, `vs r=2` at four
+probe depths:
+
+| | B/tok | probe 1 | 8 | 32 | 128 |
+|---|--:|--:|--:|--:|--:|
+| **dim 128**, aarch64 `neon-sdot` (Neoverse-N2) | 26 | 0.98× | 0.99 | 0.99 | 0.99 |
+| **dim 128**, x86_64 `avx512-vnni` (Xeon 8573C) | 26 | 1.00× | 1.00 | 1.00 | 1.01 |
+| **dim 48**, aarch64 `neon-sdot` | 10 | 1.14× | 1.12 | 1.12 | 1.09 |
+| **dim 48**, x86_64 `avx512-vnni` | 10 | 1.15× | 1.14 | 1.13 | 1.11 |
+
+At dim 128 ternary lands within 1–2 % of 2-bit at 19 % fewer bytes; at dim 48 it
+is 9–15 % *faster* at 17 % fewer bytes, on both ISAs. What it still owes 2-bit
+is the expansion itself — one 8-byte copy per stored byte against 2-bit's one
+`tbl` per key position per 16 bytes — and the reason that costs 1–2 % rather
+than the isolated 12.03-vs-5.00 ns/token is that the expansion overlaps a dot
+that dwarfs it. Which is lesson 5 below, arriving on schedule.
+
+The dim-48 rows are not a rounding artifact: ternary packs `ceil(48/5) = 10`
+bytes against 2-bit's 12, and the ladder's own 1-bit row shows the byte count is
+not the whole story (1-bit is *smaller* still and loses on aarch64). Take the
+dim-48 win as measured on these two CPUs, not as a general claim about narrow
+dims.
 
 ## Reading a codec ladder without fooling yourself
 
-Four things cost real time to learn while measuring this, and they generalize to
+Five things cost real time to learn while measuring this, and they generalize to
 any quantizer comparison:
 
 1. **A cell can be unreadable, and the ladder detects it for free.** 1-bit is
@@ -177,6 +215,15 @@ any quantizer comparison:
    metric on the knob being tuned. It is also the more *robust* of the two: in the
    cell that failed the gate above, `reconCos` stayed perfectly ordered while NDCG
    was pure noise. Robust and wrong. Tune τ on NDCG.
+5. **An isolated stage benchmark can invert the sign of the answer, not just
+   its size.** In one CI job, on one runner, the criterion decode benchmark
+   rated ternary the *fastest* decode of the four rungs (1.573 ms against
+   2-bit's 2.084) while the e2e ladder in the same job had it at **0.25×**. Both
+   numbers were correct about what they timed; the microbenchmark timed the
+   float path, which the default no longer takes. A stage measured alone is
+   measured without the work it normally hides under, and without the question
+   of whether it still runs at all. Size a stage in situ, and print which kernel
+   answered.
 
 ## Usage
 

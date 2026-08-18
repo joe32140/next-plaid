@@ -121,9 +121,15 @@ The practical consequence is that any end-to-end latency comparison against
 against scalar-asym ternary. Set `NEXT_PLAID_REPORT_KERNEL=1` to see which
 kernel each index dispatched to before reading a ladder.
 
-A one-hop 256×5 byte→weights expansion that rides the existing SIMD kernels
-does exist and closes most of this gap; it is a follow-up, not part of the
-codec.
+How much that costs in practice is a measurement, not a deduction, and it is one
+this doc does not yet have on 1.7.0 — the pre-#169 ladder does not answer it,
+and a laptop cannot: local latency on a contended machine has already produced a
+ternary reading of 0.80× against CI's 2.4–3.3× for the same code. Take it from
+the bench workflow, on both ISAs, with the kernel reported.
+
+A one-hop 256×5 byte→weights expansion that rides the existing SIMD kernels does
+exist on an integration branch; whether it is worth landing depends on that
+measurement.
 
 ## Reading a codec ladder without fooling yourself
 

@@ -219,8 +219,8 @@ The obvious way to close it is to stop looking trits up and *compute* them. The
 243-entry wall blocks table shuffles, not arithmetic: `b / 3^k` is an exact
 multiply-shift on a byte, and the five quotients are independent of each other,
 so five trit planes fall out of 16 packed bytes with no memory traffic at all.
-`examples/ternary_expand_bench` builds that against the shipped route and times
-them interleaved, each verified against `lut.fused` first. It loses
+Building both against the shipped route and timing them interleaved, each
+verified against `lut.fused` first, the arithmetic path loses
 (aarch64, M4, ns/token):
 
 | pdim | tail | one-hop table copy | arithmetic + `tbl` |
@@ -305,16 +305,7 @@ let config = IndexConfig {
 `ternary_tau: None` selects the equal-mass split, which is retained for
 reproducing the pre-default behaviour. It is not recommended.
 
-## Repro
-
-```bash
-cargo run --release -p next-plaid --example ndcg_eval -- <bundle-dir>
-```
-
-prints the full ladder (float / 4-bit / 2-bit / equal-mass / τ ∈ {.50, .65, .80}
-/ 1-bit) with bytes per token, NDCG@10 and mean per-token reconstruction cosine.
-A bundle is `corpus.npy`, `corpus_lens.npy`, `queries.npy`, `query_lens.npy`,
-`corpus_ids.json`, `query_ids.json`, `qrels.json`.
+## Testing
 
 Correctness is covered by `next-plaid/tests/ternary_integration.rs` — on-disk size
 lands between the 1-bit and 2-bit rungs, search retrieves through the

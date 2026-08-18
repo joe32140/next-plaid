@@ -213,6 +213,45 @@ not the whole story (1-bit is *smaller* still and loses on aarch64). Take the
 dim-48 win as measured on these two CPUs, not as a general claim about narrow
 dims.
 
+### The 1–2 % at dim 128 is a floor, not slack
+
+The obvious way to close it is to stop looking trits up and *compute* them. The
+243-entry wall blocks table shuffles, not arithmetic: `b / 3^k` is an exact
+multiply-shift on a byte, and the five quotients are independent of each other,
+so five trit planes fall out of 16 packed bytes with no memory traffic at all.
+`examples/ternary_expand_bench` builds that against the shipped route and times
+them interleaved, each verified against `lut.fused` first. It loses
+(aarch64, M4, ns/token):
+
+| pdim | tail | one-hop table copy | arithmetic + `tbl` |
+|---|---|--:|--:|
+| 48 (3×16) | none | 16.24 | 17.40 (0.93×) |
+| 16 (1×16) | none | 4.77 | 5.17 (0.92×) |
+| **26** (16+10) | 10 B | **11.84** | 28.90 (**0.41×**) |
+| **10** (all tail) | 10 B | **2.97** | 14.96 (**0.20×**) |
+
+Two things, and the second generalizes. **With no tail at all it still loses by
+~8 %** — pdim 16 and 48 tile the register exactly — so ~0.93× is the ceiling
+however well the tail is written. The shipped route at pdim 16 does 16
+load/store pairs in 4.77 ns, about a cycle a byte: it is store-throughput-bound
+and there is nothing to take. And **base 3 is hostile to the layout, not only to
+the lookup**: planar output wants plane strides that are multiples of the vector
+width, and `ceil(dim/5)` essentially never is, so both shipping dims (128 → 26,
+48 → 10) are ragged-tail cases. Natural dim order dodges the 243-entry table and
+the ragged planes together. Padding the strides to a multiple of 16 fixes the
+tail and adds 25 % zero lanes to the dot — far more than the 1–2 % at stake.
+
+A tempting corollary dies with it. In τ-mode the weights are `{−m, 0, +m}`, so
+their int8 form is exactly `{−127, 0, +127}` and `w = 127·(t−1)`: fold the 127
+into the per-query `sqw` and the weight table disappears. The identity holds and
+buys nothing — `vqtbl1q` and `vsubq` are both one op, and the arm measures
+within 0.1 ns of the table version everywhere.
+
+So the expansion costs ~11.8 ns/token against 2-bit's ~5.0, and that ~6.8 ns
+amortized over the 32 query rows each expansion feeds *is* the 1–2 %. The
+number to improve is not the expansion; it is the 26-vs-32 bytes of traffic,
+which is already what wins dim 48.
+
 ## Reading a codec ladder without fooling yourself
 
 Five things cost real time to learn while measuring this, and they generalize to

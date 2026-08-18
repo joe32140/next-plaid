@@ -191,8 +191,13 @@ fn prepare_score_query<'a>(
         if let Some(lut) = crate::residual_lut::quantize_lut(&index.codec) {
             let dim = index.codec.embedding_dim();
             let q8 = crate::binary::quantize_query_i8(&query.view());
-            let planes = dim
-                .is_multiple_of(8)
+            // Planes are the SIMD kernels' pre-permuted query layout, and only
+            // the nibble-factored paths consume them. Ternary has no nibble
+            // table, so building planes would be wasted work -- and worse, the
+            // permutation assumes `dim` divides `keys_per_byte`, which 5 does
+            // not, so the result would be silently wrong if a future kernel
+            // ever read it. Build them only for the paths that use them.
+            let planes = (lut.nibble.is_some() && dim.is_multiple_of(8))
                 .then(|| crate::residual_lut::build_query_planes(&q8, &lut, dim));
             report_asym_dispatch(
                 index,

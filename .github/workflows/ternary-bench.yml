@@ -14,6 +14,16 @@ name: Ternary Codec Bench
 #     microbenchmark overstates any stage with heavy work to hide under, so the
 #     decode delta is only believable once it is sized in situ.
 #
+# Since #169 the e2e number is NOT a like-for-like codec comparison, and the
+# job prints the reason rather than hiding it. Asymmetric rescoring is the
+# default, and it dispatches per codec: the scalar rungs factor their fused
+# table into 16-entry nibble lookups and run in-register (`tbl` / `pshufb`),
+# while base-3 cannot (5 trits do not align to 4-bit boundaries, and 243 is not
+# a product of two 16-entry tables), so ternary takes the scalar kernel. The
+# ladder therefore measures SIMD-asym 2-bit against scalar-asym ternary. That
+# is the honest deployed comparison, but read it as a codec+kernel result, not
+# a codec result -- NEXT_PLAID_REPORT_KERNEL makes the split visible.
+#
 # Why CI and not a laptop: these are *latency* numbers, and latency measured on
 # a machine running anything else measures that other thing.
 #
@@ -29,6 +39,8 @@ name: Ternary Codec Bench
 on:
   push:
     branches: [feat/ternary-residual]
+    paths-ignore:
+      - "**.md"
   workflow_dispatch:
 
 env:
@@ -79,6 +91,7 @@ jobs:
           QTOKENS: "32"
           DIM: "128"
           CLUSTERS: "4096"
+          NEXT_PLAID_REPORT_KERNEL: "1"
         run: ./target/release/examples/search_latency synth 5 1,8,32,128
 
       # dim 48 is a real deployment regime (LateOn-Code-edge) and the one where
@@ -92,4 +105,5 @@ jobs:
           QTOKENS: "32"
           DIM: "48"
           CLUSTERS: "4096"
+          NEXT_PLAID_REPORT_KERNEL: "1"
         run: ./target/release/examples/search_latency synth 5 1,8,32,128

@@ -105,13 +105,42 @@ fn derive_nibble_lut(fused: &[i8], keys_per_byte: usize) -> Option<NibbleLut> {
 /// Returns `None` for codecs without bucket artifacts (binary indexes).
 pub fn quantize_lut(codec: &ResidualCodec) -> Option<ResidualLut> {
     let weights = codec.bucket_weights.as_ref()?;
-    let lookup = codec.bucket_weight_indices_lookup.as_ref()?;
     let max_abs = weights.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
     let scale = (max_abs / 127.0).max(1e-12);
     let vals: Vec<i8> = weights
         .iter()
         .map(|&w| (w / scale).round().clamp(-127.0, 127.0) as i8)
         .collect();
+
+    // Ternary is base-3 packed: five trits per byte, and a trit value (0..=2)
+    // *is* its weight index. So the fused row is byte -> [w(trit0)..w(trit4)],
+    // with no bit-reversal step -- arithmetic packing has no sub-byte bit order
+    // to undo. The table cannot nibble-factor (5 trits do not align to 4-bit
+    // boundaries, and 3^5 = 243 is not a product of two 16-entry lookups), so
+    // `nibble` is None and this dispatches to `maxsim_residual_lut_scalar`,
+    // whose `d == dim` break already masks the last byte's padding trits.
+    //
+    // That still buys the substance of asymmetric scoring -- int8 query against
+    // a fused byte->weights table, no float decompression -- it just does the
+    // expansion in scalar code rather than in-register.
+    if codec.ternary {
+        let trits = codec.trit_lookup.as_ref()?;
+        let keys_per_byte = crate::codec::TERNARY_TRITS_PER_BYTE;
+        let mut fused = vec![0i8; 256 * keys_per_byte];
+        for (byte, quintet) in trits.iter().enumerate() {
+            for (k, &trit) in quintet.iter().enumerate() {
+                fused[byte * keys_per_byte + k] = vals[trit as usize];
+            }
+        }
+        return Some(ResidualLut {
+            fused,
+            keys_per_byte,
+            scale,
+            nibble: None,
+        });
+    }
+
+    let lookup = codec.bucket_weight_indices_lookup.as_ref()?;
     let keys_per_byte = 8 / codec.nbits;
     let mut fused = vec![0i8; 256 * keys_per_byte];
     for byte in 0..256usize {
@@ -199,11 +228,37 @@ pub(crate) fn compute_inv_norms_into(
     out: &mut Vec<f32>,
 ) -> Option<()> {
     let weights = codec.bucket_weights.as_ref()?;
-    let lookup = codec.bucket_weight_indices_lookup.as_ref()?;
     let dim = codec.embedding_dim();
     assert_eq!(codes.len(), packed.nrows());
     out.clear();
     out.reserve(codes.len());
+
+    // Ternary reconstructs `centroid + weights[trit]` through the base-3 trit
+    // table -- there is no bit-reversal step, because a trit value *is* its
+    // weight index. Stopping at `dim` keeps the last byte's padding trits from
+    // contributing, so this is the same norm the float decode path computes.
+    if codec.ternary {
+        let trits = codec.trit_lookup.as_ref()?;
+        for (t, &code) in codes.iter().enumerate() {
+            let centroid = codec.centroids.row(code as usize);
+            let mut sq = 0.0f32;
+            let mut d = 0usize;
+            'row: for &byte in packed.row(t).iter() {
+                for &trit in trits[byte as usize].iter() {
+                    if d == dim {
+                        break 'row;
+                    }
+                    let v = centroid[d] + weights[trit as usize];
+                    sq += v * v;
+                    d += 1;
+                }
+            }
+            out.push(1.0 / sq.sqrt().max(1e-12));
+        }
+        return Some(());
+    }
+
+    let lookup = codec.bucket_weight_indices_lookup.as_ref()?;
     for (t, &code) in codes.iter().enumerate() {
         let centroid = codec.centroids.row(code as usize);
         let mut sq = 0.0f32;
@@ -1358,6 +1413,165 @@ mod tests {
                 assert!(
                     (got as f64 - expect).abs() < 1e-3,
                     "nbits={nbits} dim={dim}: got {got} expect {expect}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ternary_tests {
+    use super::*;
+    use crate::codec::ResidualCodec;
+    use ndarray::{Array1, Array2};
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    fn ternary_codec(dim: usize, k: usize, seed: u64) -> ResidualCodec {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let centroids = Array2::from_shape_fn((k, dim), |_| rng.gen_range(-0.5f32..0.5));
+        ResidualCodec::new_ternary(
+            2,
+            centroids,
+            Array1::zeros(dim),
+            Some(Array1::from_vec(vec![-0.12, 0.12])),
+            Some(Array1::from_vec(vec![-0.21, 0.0, 0.21])),
+        )
+        .unwrap()
+    }
+
+    /// The asymmetric path must engage for ternary, and must land on the
+    /// scalar kernel rather than a nibble one: 5 trits per byte cannot factor
+    /// into two 16-entry lookups, so `nibble` is necessarily `None`.
+    #[test]
+    fn ternary_engages_asym_on_the_scalar_kernel() {
+        let codec = ternary_codec(128, 16, 3);
+        let lut = quantize_lut(&codec).expect("ternary must produce a fused LUT");
+        assert_eq!(lut.keys_per_byte, crate::codec::TERNARY_TRITS_PER_BYTE);
+        assert!(
+            lut.nibble.is_none(),
+            "base-3 bytes must not claim a nibble factorization"
+        );
+        assert!(!simd_dispatch_available(128, lut.nibble.is_some()));
+        assert_eq!(lut.fused.len(), 256 * 5);
+
+        // Every fused row is the byte's five trits mapped through the weight
+        // table -- including the 13 bytes (243..=255) the encoder never emits.
+        let trits = codec.trit_lookup.as_ref().unwrap();
+        let weights = codec.bucket_weights.as_ref().unwrap();
+        for byte in 0..256usize {
+            for k in 0..5 {
+                let want = (weights[trits[byte][k] as usize] / lut.scale)
+                    .round()
+                    .clamp(-127.0, 127.0) as i8;
+                assert_eq!(lut.fused[byte * 5 + k], want, "byte {byte} key {k}");
+            }
+        }
+    }
+
+    /// The whole point of the asym path: it must agree with the float decode
+    /// path it replaces. Reference is `query · (centroid + weights[trit])`
+    /// renormalized -- exactly what `decompress` + float MaxSim computes.
+    #[test]
+    fn ternary_asym_matches_the_float_decode_reference() {
+        let mut rng = StdRng::seed_from_u64(17);
+        // 96 and 128 are byte-aligned in base 3 only by ceil(); 45 exercises a
+        // dim that is a clean multiple of 5, and 44 one that is neither.
+        for &dim in &[44usize, 45, 96, 128] {
+            let k = 16usize;
+            let codec = ternary_codec(dim, k, 5);
+            let lut = quantize_lut(&codec).unwrap();
+            let weights = codec.bucket_weights.as_ref().unwrap();
+            let trits = codec.trit_lookup.as_ref().unwrap();
+
+            let query = Array2::from_shape_fn((6, dim), |_| rng.gen_range(-1.0f32..1.0));
+            let q8 = crate::binary::quantize_query_i8(&query.view());
+            let res = Array2::from_shape_fn((9, dim), |_| rng.gen_range(-0.3f32..0.3));
+            let packed = codec.quantize_residuals(&res).unwrap();
+            assert_eq!(packed.ncols(), dim.div_ceil(5));
+            let codes: Vec<i64> = (0..9).map(|_| rng.gen_range(0..k as i64)).collect();
+            let cents = Array2::from_shape_fn((k, dim), |(i, d)| codec.centroids.row(i)[d]);
+            let cdot_t = cents.dot(&query.t());
+            let inv = compute_inv_norms(&codec, &codes, &packed.view()).unwrap();
+
+            // No planes: ternary never builds them (see `dispatch` in search).
+            let got = maxsim_residual_lut_i8(
+                &q8,
+                None,
+                &packed.view(),
+                &codes,
+                &cdot_t.view(),
+                &lut,
+                &inv,
+                dim,
+            );
+
+            let mut expect = 0.0f64;
+            for qi in 0..6 {
+                let mut best = f64::NEG_INFINITY;
+                for (t, &code) in codes.iter().enumerate() {
+                    let centroid = codec.centroids.row(code as usize);
+                    let mut recon = vec![0.0f64; dim];
+                    let mut d = 0usize;
+                    'r: for &byte in packed.row(t).iter() {
+                        for &trit in trits[byte as usize].iter() {
+                            if d == dim {
+                                break 'r;
+                            }
+                            recon[d] = centroid[d] as f64 + weights[trit as usize] as f64;
+                            d += 1;
+                        }
+                    }
+                    let norm = recon.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    let dot: f64 = (0..dim)
+                        .map(|d| query[[qi, d]] as f64 * recon[d] / norm)
+                        .sum();
+                    best = best.max(dot);
+                }
+                expect += best;
+            }
+            assert!(
+                (got as f64 - expect).abs() < 0.05,
+                "dim={dim}: asym {got} vs float decode {expect}"
+            );
+        }
+    }
+
+    /// `compute_inv_norms` must reproduce the float reconstruction's norm,
+    /// padding trits excluded -- the regression that broke every ternary index
+    /// when asymmetric scoring became the default.
+    #[test]
+    fn ternary_inv_norms_match_the_reconstruction() {
+        let mut rng = StdRng::seed_from_u64(23);
+        for &dim in &[44usize, 45, 128] {
+            let codec = ternary_codec(dim, 8, 9);
+            let weights = codec.bucket_weights.as_ref().unwrap();
+            let trits = codec.trit_lookup.as_ref().unwrap();
+            let res = Array2::from_shape_fn((12, dim), |_| rng.gen_range(-0.3f32..0.3));
+            let packed = codec.quantize_residuals(&res).unwrap();
+            let codes: Vec<i64> = (0..12).map(|_| rng.gen_range(0..8i64)).collect();
+            let got = compute_inv_norms(&codec, &codes, &packed.view())
+                .expect("ternary must produce inverse norms");
+
+            for (t, &code) in codes.iter().enumerate() {
+                let centroid = codec.centroids.row(code as usize);
+                let mut sq = 0.0f64;
+                let mut d = 0usize;
+                'r: for &byte in packed.row(t).iter() {
+                    for &trit in trits[byte as usize].iter() {
+                        if d == dim {
+                            break 'r;
+                        }
+                        let v = centroid[d] as f64 + weights[trit as usize] as f64;
+                        sq += v * v;
+                        d += 1;
+                    }
+                }
+                let want = 1.0 / sq.sqrt().max(1e-12);
+                assert!(
+                    (got[t] as f64 - want).abs() < 1e-4,
+                    "dim={dim} token {t}: {} vs {want}",
+                    got[t]
                 );
             }
         }

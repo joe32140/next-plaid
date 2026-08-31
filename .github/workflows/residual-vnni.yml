@@ -1,0 +1,41 @@
+name: Residual VNNI Bench
+
+# One-off A/B: the residual-LUT stage-2 kernel's AVX2 (pshufb+maddubs) path
+# vs its AVX-512 VNNI (vpdpbusd) path, same host. ubuntu-24.04 runner CPUs
+# are a lottery (Ice Lake Xeon / EPYC Milan / EPYC Genoa) so we take three
+# draws; the arm64 runner pins the NEON sdot number for context.
+
+on:
+  push:
+    branches: [ci/residual-vnni-bench]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  bench:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86-draw1, os: ubuntu-24.04 }
+          - { name: linux-x86-draw2, os: ubuntu-24.04 }
+          - { name: linux-x86-draw3, os: ubuntu-24.04 }
+          - { name: linux-arm64,     os: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - name: host CPU
+        run: |
+          grep -m1 "model name" /proc/cpuinfo || true
+          (grep -om1 "avx512_vnni" /proc/cpuinfo && echo "-> has AVX-512 VNNI") || echo "-> no avx512_vnni flag"
+          (grep -om1 "asimddp" /proc/cpuinfo && echo "-> has NEON dotprod") || true
+      - uses: dtolnay/rust-toolchain@stable
+      - name: correctness gate (kernels pinned bit-exact to scalar)
+        run: cargo test -p next-plaid --release residual_lut 2>&1 | tail -4
+      - name: bench
+        run: cargo run -p next-plaid --release --example residual_vnni_bench

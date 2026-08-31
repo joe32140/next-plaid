@@ -378,6 +378,118 @@ pub fn maxsim_residual_lut_i8(
     maxsim_residual_lut_scalar(q8, doc_packed, doc_codes, cdot_t, lut, inv_norms, dim)
 }
 
+/// Bench-only forced dispatch, mirroring `crate::binary`'s `force_*` hooks:
+/// run one specific SIMD path regardless of what the dispatcher would pick,
+/// or `None` when this host cannot run it. Same input contract as
+/// [`maxsim_residual_lut_i8`] — benches should call the safe dispatcher once
+/// in warmup so a malformed input panics on its asserts, not in a kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn maxsim_residual_lut_i8_force_avx2(
+    q8: &QueryI8,
+    planes: &QueryPlanes,
+    doc_packed: &ArrayView2<u8>,
+    doc_codes: &[i64],
+    cdot_t: &ArrayView2<f32>,
+    lut: &ResidualLut,
+    inv_norms: &[f32],
+    dim: usize,
+) -> Option<f32> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let nib = lut.nibble.as_ref()?;
+        if !dim.is_multiple_of(8) || dim > MAX_DIM || !is_x86_feature_detected!("avx2") {
+            return None;
+        }
+        return Some(SCRATCH.with(|s| {
+            let (best, accs) = &mut *s.borrow_mut();
+            unsafe {
+                avx2::maxsim_residual_lut_avx2(
+                    q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim, best,
+                    accs,
+                )
+            }
+        }));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (q8, planes, doc_packed, doc_codes, cdot_t, lut, inv_norms, dim);
+        None
+    }
+}
+
+/// See [`maxsim_residual_lut_i8_force_avx2`].
+#[allow(clippy::too_many_arguments)]
+pub fn maxsim_residual_lut_i8_force_avx512(
+    q8: &QueryI8,
+    planes: &QueryPlanes,
+    doc_packed: &ArrayView2<u8>,
+    doc_codes: &[i64],
+    cdot_t: &ArrayView2<f32>,
+    lut: &ResidualLut,
+    inv_norms: &[f32],
+    dim: usize,
+) -> Option<f32> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let nib = lut.nibble.as_ref()?;
+        if !dim.is_multiple_of(8) || dim > MAX_DIM || !has_avx512_vnni() {
+            return None;
+        }
+        return Some(SCRATCH.with(|s| {
+            let (best, accs) = &mut *s.borrow_mut();
+            unsafe {
+                avx512::maxsim_residual_lut_avx512(
+                    q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim, best,
+                    accs,
+                )
+            }
+        }));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (q8, planes, doc_packed, doc_codes, cdot_t, lut, inv_norms, dim);
+        None
+    }
+}
+
+/// See [`maxsim_residual_lut_i8_force_avx2`].
+#[allow(clippy::too_many_arguments)]
+pub fn maxsim_residual_lut_i8_force_neon(
+    q8: &QueryI8,
+    planes: &QueryPlanes,
+    doc_packed: &ArrayView2<u8>,
+    doc_codes: &[i64],
+    cdot_t: &ArrayView2<f32>,
+    lut: &ResidualLut,
+    inv_norms: &[f32],
+    dim: usize,
+) -> Option<f32> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let nib = lut.nibble.as_ref()?;
+        if !dim.is_multiple_of(8)
+            || dim > MAX_DIM
+            || !std::arch::is_aarch64_feature_detected!("dotprod")
+        {
+            return None;
+        }
+        return Some(SCRATCH.with(|s| {
+            let (best, accs) = &mut *s.borrow_mut();
+            unsafe {
+                neon::maxsim_residual_lut_neon(
+                    q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim, best,
+                    accs,
+                )
+            }
+        }));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (q8, planes, doc_packed, doc_codes, cdot_t, lut, inv_norms, dim);
+        None
+    }
+}
+
 /// Does this CPU have the full AVX-512 set the fused kernel needs?
 #[cfg(target_arch = "x86_64")]
 fn has_avx512_vnni() -> bool {

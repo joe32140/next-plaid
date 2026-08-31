@@ -14,6 +14,79 @@ use crate::error::{Error, Result};
 use crate::kmeans::{compute_kmeans, ComputeKmeansConfig};
 use crate::utils::{atomic_write_file, quantile, quantiles};
 
+/// Persist one chunk's inverse reconstruction norms next to its compressed
+/// data. Search merges and memory-maps these optional files; legacy indexes
+/// without them retain the on-demand compatibility path.
+fn write_inv_norms_chunk(
+    index_dir: &Path,
+    chunk_idx: usize,
+    codec: &ResidualCodec,
+    codes: &Array1<i64>,
+    residuals: &Array2<u8>,
+) -> Result<()> {
+    use ndarray_npy::WriteNpyExt;
+
+    let codes = codes
+        .as_slice()
+        .ok_or_else(|| Error::IndexCreation("inverse norm codes must be contiguous".to_string()))?;
+    let inv_norms = crate::residual_lut::compute_inv_norms(codec, codes, &residuals.view())
+        .ok_or_else(|| {
+            Error::IndexCreation("residual codec is missing inverse norm tables".to_string())
+        })?;
+    let inv_norms = Array1::from_vec(inv_norms);
+    atomic_write_file(
+        &index_dir.join(format!("{}.inv_norms.npy", chunk_idx)),
+        |file| {
+            inv_norms.write_npy(file)?;
+            Ok(())
+        },
+    )
+}
+
+/// Keep legacy-sidecar prewarm memory independent of the index's creation
+/// chunk size. At the default 128 dimensions and 4-bit residuals this touches
+/// about 4 MiB of residual payload plus small code/norm buffers per block.
+const INV_NORM_PREWARM_BLOCK_TOKENS: usize = 64 * 1024;
+
+fn write_inv_norms_chunk_from_mmap(
+    index_dir: &Path,
+    chunk_idx: usize,
+    codec: &ResidualCodec,
+    mmap_codes: &crate::mmap::MmapNpyArray1I64,
+    mmap_residuals: &crate::mmap::MmapNpyArray2U8,
+    chunk_start: usize,
+    chunk_end: usize,
+) -> Result<()> {
+    let chunk_len = chunk_end - chunk_start;
+    atomic_write_file(
+        &index_dir.join(format!("{}.inv_norms.npy", chunk_idx)),
+        |file| {
+            let mut writer = BufWriter::new(file);
+            crate::mmap::write_aligned_npy_header_1d(&mut writer, chunk_len, "<f4")?;
+            let mut inv_norms = Vec::with_capacity(INV_NORM_PREWARM_BLOCK_TOKENS);
+            for block_start in (chunk_start..chunk_end).step_by(INV_NORM_PREWARM_BLOCK_TOKENS) {
+                let block_end = (block_start + INV_NORM_PREWARM_BLOCK_TOKENS).min(chunk_end);
+                let codes = mmap_codes.slice(block_start, block_end);
+                let residuals = mmap_residuals.slice_rows(block_start, block_end);
+                crate::residual_lut::compute_inv_norms_into(
+                    codec,
+                    &codes,
+                    &residuals,
+                    &mut inv_norms,
+                )
+                .ok_or_else(|| {
+                    Error::IndexLoad("residual codec is missing inverse norm tables".into())
+                })?;
+                for &inv_norm in &inv_norms {
+                    writer.write_all(&inv_norm.to_le_bytes())?;
+                }
+            }
+            writer.flush()?;
+            Ok(())
+        },
+    )
+}
+
 /// CPU implementation of fused compress_into_codes + residual computation.
 fn compress_and_residuals_cpu(
     embeddings: &Array2<f32>,
@@ -503,6 +576,15 @@ pub fn write_index_from_encoded_chunks(
                 Ok(())
             },
         )?;
+        if !config.binary {
+            write_inv_norms_chunk(
+                index_dir,
+                chunk_idx,
+                &codec_artifacts.codec,
+                &chunk.codes,
+                &chunk.residuals,
+            )?;
+        }
 
         doc_lengths.extend_from_slice(&chunk.doclens);
         all_codes.extend(chunk.codes.iter().map(|&x| x as usize));
@@ -871,6 +953,15 @@ pub fn create_index_files(
             batch_packed.write_npy(file)?;
             Ok(())
         })?;
+        if !config.binary {
+            write_inv_norms_chunk(
+                index_dir,
+                chunk_idx,
+                &codec,
+                &chunk_codes_arr,
+                &batch_packed,
+            )?;
+        }
     }
 
     // Update chunk metadata with global offsets
@@ -1038,7 +1129,9 @@ pub fn create_index_with_kmeans_files(
 /// ```ignore
 /// use next_plaid::MmapIndex;
 ///
-/// let index = MmapIndex::load("/path/to/index")?;
+/// let mut index = MmapIndex::load("/path/to/index")?;
+/// // One-time, bounded-memory upgrade for indexes created before the LUT sidecar.
+/// index.prewarm_residual_lut_sidecar()?;
 /// let results = index.search(&query, &params, None)?;
 /// ```
 pub struct MmapIndex {
@@ -1062,6 +1155,9 @@ pub struct MmapIndex {
     pub mmap_codes: crate::mmap::MmapNpyArray1I64,
     /// Memory-mapped residuals array (public for search access)
     pub mmap_residuals: crate::mmap::MmapNpyArray2U8,
+    /// Optional memory-mapped inverse reconstruction norms. Absent for binary
+    /// and legacy residual indexes.
+    pub(crate) mmap_inv_norms: Option<crate::mmap::MmapNpyArray1F32>,
 }
 
 impl MmapIndex {
@@ -1167,13 +1263,31 @@ impl MmapIndex {
             crate::mmap::merge_codes_chunks(index_dir, metadata.num_chunks, padding_needed)?;
         let merged_residuals_path =
             crate::mmap::merge_residuals_chunks(index_dir, metadata.num_chunks, padding_needed)?;
+        let merged_inv_norms_path = if metadata.binary {
+            None
+        } else {
+            crate::mmap::merge_inv_norm_chunks(index_dir, metadata.num_chunks, padding_needed)?
+        };
 
         let (mmap_codes, mmap_residuals) = (
             crate::mmap::MmapNpyArray1I64::from_npy_file(&merged_codes_path)?,
             crate::mmap::MmapNpyArray2U8::from_npy_file(&merged_residuals_path)?,
         );
+        let mmap_inv_norms = merged_inv_norms_path
+            .as_deref()
+            .map(crate::mmap::MmapNpyArray1F32::from_npy_file)
+            .transpose()?;
+        if let Some(inv_norms) = mmap_inv_norms.as_ref() {
+            if inv_norms.len() != mmap_codes.len() {
+                return Err(Error::IndexLoad(format!(
+                    "inverse norm row count {} does not match codes row count {}",
+                    inv_norms.len(),
+                    mmap_codes.len()
+                )));
+            }
+        }
 
-        Ok(Self {
+        let mut index = Self {
             path: index_path.to_string(),
             metadata,
             codec,
@@ -1184,23 +1298,150 @@ impl MmapIndex {
             doc_offsets,
             mmap_codes,
             mmap_residuals,
-        })
+            mmap_inv_norms,
+        };
+        // Default-on asymmetric scoring only pays off with the inverse-norm
+        // sidecar; upgrade pre-sidecar indexes once, here, so the win arrives
+        // with the load rather than requiring a provisioning step. Failure
+        // (for example a read-only index directory) is degradation, not an
+        // error: search falls back to per-document norm computation, which is
+        // correct but forfeits most of the asymmetric speedup.
+        if let Err(err) = index.prewarm_residual_lut_sidecar() {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                eprintln!(
+                    "[next-plaid] could not build the inverse-norm sidecar for {}: {} — \
+                     asymmetric searches will recompute norms per query (correct, slower)",
+                    index.path, err
+                );
+            });
+        }
+        Ok(index)
+    }
+
+    /// Borrow precomputed inverse norms when the index contains the optional
+    /// sidecar. Legacy indexes return `None` and search computes them lazily.
+    pub(crate) fn inv_norms_slice(&self, start: usize, end: usize) -> Option<&[f32]> {
+        self.mmap_inv_norms
+            .as_ref()
+            .map(|inv_norms| inv_norms.slice(start, end))
+    }
+
+    /// Build and memory-map the inverse-norm sidecar for a legacy residual
+    /// index.
+    ///
+    /// New indexes persist this data while indexing. For an older index this
+    /// method streams its existing code and residual payload in fixed-size
+    /// token blocks, atomically writes the missing sidecar chunks, then maps
+    /// the merged result. No embeddings are required and no full-index or
+    /// full-chunk heap allocation is made. Call this during provisioning to
+    /// avoid the legacy per-query norm recomputation fallback on the first
+    /// asymmetric residual search.
+    ///
+    /// Returns `true` when a legacy index was upgraded, and `false` for binary
+    /// indexes or indexes whose sidecar is already mapped.
+    pub fn prewarm_residual_lut_sidecar(&mut self) -> Result<bool> {
+        if self.metadata.binary || self.mmap_inv_norms.is_some() {
+            return Ok(false);
+        }
+
+        let index_dir = Path::new(&self.path);
+        let mut chunk_start = 0usize;
+        for chunk_idx in 0..self.metadata.num_chunks {
+            let chunk_metadata_path = index_dir.join(format!("{}.metadata.json", chunk_idx));
+            let chunk_metadata: ChunkMetadata =
+                serde_json::from_reader(BufReader::new(File::open(&chunk_metadata_path)?))?;
+            let chunk_end = chunk_start + chunk_metadata.num_embeddings;
+            if chunk_end > self.mmap_codes.len() || chunk_end > self.mmap_residuals.nrows() {
+                return Err(Error::IndexLoad(format!(
+                    "chunk {} extends past the merged code or residual mapping",
+                    chunk_idx
+                )));
+            }
+            let inv_norms_path = index_dir.join(format!("{}.inv_norms.npy", chunk_idx));
+            let sidecar_is_current = if inv_norms_path.exists() {
+                crate::mmap::MmapNpyArray1F32::from_npy_file(&inv_norms_path)?.len()
+                    == chunk_metadata.num_embeddings
+            } else {
+                false
+            };
+
+            if !sidecar_is_current {
+                write_inv_norms_chunk_from_mmap(
+                    index_dir,
+                    chunk_idx,
+                    &self.codec,
+                    &self.mmap_codes,
+                    &self.mmap_residuals,
+                    chunk_start,
+                    chunk_end,
+                )?;
+            }
+            chunk_start = chunk_end;
+        }
+
+        if chunk_start != *self.doc_offsets.last().unwrap_or(&0) {
+            return Err(Error::IndexLoad(format!(
+                "chunk metadata covers {} tokens but document offsets cover {}",
+                chunk_start,
+                self.doc_offsets.last().unwrap_or(&0)
+            )));
+        }
+
+        let max_len = self.doc_lengths.iter().copied().max().unwrap_or(0) as usize;
+        let last_len = self.doc_lengths.last().copied().unwrap_or(0) as usize;
+        let padding_needed = max_len.saturating_sub(last_len);
+        let merged_path = crate::mmap::merge_inv_norm_chunks(
+            index_dir,
+            self.metadata.num_chunks,
+            padding_needed,
+        )?
+        .ok_or_else(|| {
+            Error::IndexLoad("inverse-norm sidecar is incomplete after prewarm".into())
+        })?;
+        let inv_norms = crate::mmap::MmapNpyArray1F32::from_npy_file(&merged_path)?;
+        if inv_norms.len() != self.mmap_codes.len() {
+            return Err(Error::IndexLoad(format!(
+                "inverse norm row count {} does not match codes row count {}",
+                inv_norms.len(),
+                self.mmap_codes.len()
+            )));
+        }
+        self.mmap_inv_norms = Some(inv_norms);
+        Ok(true)
     }
 
     /// Get candidate documents from IVF for given centroid indices.
+    ///
+    /// Doc ids are dense in `0..num_docs`, so a word bitmap dedups in
+    /// O(postings) and scanning its set bits emits the same sorted, deduped
+    /// list a `sort_unstable` + `dedup` of the concatenated postings would —
+    /// without the O(n log n) sort (measured 4–5x on this phase at 52k docs).
     pub fn get_candidates(&self, centroid_indices: &[usize]) -> Vec<i64> {
-        let mut candidates: Vec<i64> = Vec::new();
-
+        let num_docs = self.doc_lengths.len();
+        let mut words = vec![0u64; num_docs.div_ceil(64)];
+        let mut count = 0usize;
         for &idx in centroid_indices {
             if idx < self.ivf_lengths.len() {
                 let start = self.ivf_offsets[idx] as usize;
                 let len = self.ivf_lengths[idx] as usize;
-                candidates.extend(self.ivf.slice(s![start..start + len]).iter());
+                for &d in self.ivf.slice(s![start..start + len]).iter() {
+                    let d = d as usize;
+                    let w = &mut words[d / 64];
+                    let bit = 1u64 << (d % 64);
+                    count += usize::from(*w & bit == 0);
+                    *w |= bit;
+                }
             }
         }
-
-        candidates.sort_unstable();
-        candidates.dedup();
+        let mut candidates: Vec<i64> = Vec::with_capacity(count);
+        for (wi, &word) in words.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                candidates.push((wi * 64 + w.trailing_zeros() as usize) as i64);
+                w &= w - 1;
+            }
+        }
         candidates
     }
 
@@ -1381,6 +1622,7 @@ impl MmapIndex {
     fn release_mmaps(&mut self) {
         self.mmap_codes = crate::mmap::MmapNpyArray1I64::empty();
         self.mmap_residuals = crate::mmap::MmapNpyArray2U8::empty();
+        self.mmap_inv_norms = None;
         self.codec.centroids = crate::codec::CentroidStore::Owned(Array2::zeros((0, 0)));
     }
 
@@ -2133,5 +2375,125 @@ mod tests {
                 .expect("Failed to update index");
         assert_eq!(index2.metadata.num_documents, 8);
         assert_eq!(doc_ids2, vec![5, 6, 7]);
+        assert!(index2.mmap_inv_norms.is_some());
+        assert_eq!(
+            index2.mmap_inv_norms.as_ref().unwrap().len(),
+            index2.mmap_codes.len()
+        );
+    }
+
+    #[test]
+    fn test_inv_norm_sidecar_and_legacy_fallback_match() {
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let index_path = temp_dir.path().to_str().unwrap();
+        let mut embeddings = Vec::new();
+        for i in 0..6 {
+            let mut doc = Array2::<f32>::zeros((4 + i % 3, 32));
+            for ((token, dim), value) in doc.indexed_iter_mut() {
+                *value =
+                    0.02 * (i + 1) as f32 + 0.003 * (token + 1) as f32 + 0.0007 * (dim + 1) as f32;
+            }
+            for mut row in doc.rows_mut() {
+                let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+                row.iter_mut().for_each(|x| *x /= norm);
+            }
+            embeddings.push(doc);
+        }
+
+        let config = IndexConfig {
+            nbits: 2,
+            batch_size: 3,
+            seed: Some(7),
+            kmeans_niters: 2,
+            max_points_per_centroid: 256,
+            ..Default::default()
+        };
+        let index = MmapIndex::create_with_kmeans(&embeddings, index_path, &config).unwrap();
+        assert!(index.mmap_inv_norms.is_some());
+        for chunk_idx in 0..index.metadata.num_chunks {
+            assert!(temp_dir
+                .path()
+                .join(format!("{}.inv_norms.npy", chunk_idx))
+                .exists());
+        }
+
+        let total_rows = *index.doc_offsets.last().unwrap();
+        let codes = index.mmap_codes.slice(0, total_rows);
+        let packed = index.mmap_residuals.slice_rows(0, total_rows);
+        let expected = crate::residual_lut::compute_inv_norms(&index.codec, &codes, &packed)
+            .expect("residual index has norm tables");
+        let stored = index.inv_norms_slice(0, total_rows).unwrap();
+        assert_eq!(stored.len(), expected.len());
+        for (&actual, &want) in stored.iter().zip(expected.iter()) {
+            assert!((actual - want).abs() <= 1e-6, "{actual} != {want}");
+        }
+
+        let params = crate::search::SearchParameters {
+            n_full_scores: embeddings.len(),
+            n_ivf_probe: index.metadata.num_partitions,
+            centroid_score_threshold: None,
+            ..Default::default()
+        };
+        let with_sidecar = index.search(&embeddings[0], &params, None).unwrap();
+        let num_chunks = index.metadata.num_chunks;
+        drop(index);
+
+        // Deleting the sidecar no longer strands the index on the fallback:
+        // load() rebuilds it automatically (auto-prewarm) and rankings match.
+        for chunk_idx in 0..num_chunks {
+            std::fs::remove_file(temp_dir.path().join(format!("{}.inv_norms.npy", chunk_idx)))
+                .unwrap();
+        }
+        crate::mmap::clear_merged_files(temp_dir.path()).unwrap();
+        let mut healed = MmapIndex::load(index_path).unwrap();
+        assert!(healed.mmap_inv_norms.is_some(), "load must auto-prewarm");
+        assert!(!healed.prewarm_residual_lut_sidecar().unwrap());
+        for chunk_idx in 0..num_chunks {
+            assert!(temp_dir
+                .path()
+                .join(format!("{}.inv_norms.npy", chunk_idx))
+                .exists());
+        }
+        let prewarmed = healed.search(&embeddings[0], &params, None).unwrap();
+        assert_eq!(with_sidecar.passage_ids, prewarmed.passage_ids);
+        assert_eq!(with_sidecar.scores.len(), prewarmed.scores.len());
+        for (&actual, &want) in with_sidecar.scores.iter().zip(prewarmed.scores.iter()) {
+            assert!((actual - want).abs() <= 1e-6, "{actual} != {want}");
+        }
+
+        // The per-document fallback still exists for indexes that cannot be
+        // upgraded in place (for example a read-only directory): auto-prewarm
+        // must degrade gracefully and searches must still match.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            drop(healed);
+            for chunk_idx in 0..num_chunks {
+                std::fs::remove_file(temp_dir.path().join(format!("{}.inv_norms.npy", chunk_idx)))
+                    .unwrap();
+            }
+            for name in ["merged_inv_norms.npy", "merged_inv_norms.manifest.json"] {
+                let p = temp_dir.path().join(name);
+                if p.exists() {
+                    std::fs::remove_file(p).unwrap();
+                }
+            }
+            std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+            let readonly = MmapIndex::load(index_path).unwrap();
+            assert!(
+                readonly.mmap_inv_norms.is_none(),
+                "read-only dir: prewarm must fail gracefully into the fallback"
+            );
+            let fallback = readonly.search(&embeddings[0], &params, None).unwrap();
+            assert_eq!(with_sidecar.passage_ids, fallback.passage_ids);
+            for (&actual, &want) in with_sidecar.scores.iter().zip(fallback.scores.iter()) {
+                assert!((actual - want).abs() <= 1e-6, "{actual} != {want}");
+            }
+            std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
     }
 }

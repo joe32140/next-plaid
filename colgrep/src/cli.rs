@@ -241,13 +241,19 @@ EXAMPLES:
     # Clear all extra ignore patterns (revert to defaults only)
     colgrep settings --clear-ignore
 
-    # Force-include files/dirs that are normally ignored
+    # Force-include a directory the project's ignore rules exclude (e.g. a
+    # gitignored corpus); equivalent to running `colgrep init ./corpus`
+    colgrep settings --force-include ./corpus
+
+    # Force-include by pattern (global, applies to every project's walk;
+    # patterns cannot override .gitignore — use a directory path for that)
     colgrep settings --force-include .vscode --force-include vendor/internal
 
-    # Remove a force-include pattern
+    # Remove a force-include (directory registration or pattern)
+    colgrep settings --no-force-include ./corpus
     colgrep settings --no-force-include .vscode
 
-    # Clear all force-include patterns
+    # Clear all force-include patterns and directory registrations
     colgrep settings --clear-force-include
 
     # Show absolute paths in search output
@@ -748,21 +754,26 @@ pub enum Commands {
         #[arg(long = "no-ignore", value_name = "PATTERN")]
         remove_ignore: Vec<String>,
 
-        /// Add patterns to force-include even if normally ignored
-        /// Can be repeated. Examples: --force-include .vscode --force-include vendor/internal
-        #[arg(long = "force-include", value_name = "PATTERN")]
+        /// Force-include something the ignore rules exclude. An existing directory
+        /// inside an indexed project is registered for that project and indexed on
+        /// its next update — the only form that overrides .gitignore (`colgrep init
+        /// <dir>` does the same). Anything else is a global pattern applied to every
+        /// project's walk. Can be repeated.
+        /// Examples: --force-include ./corpus --force-include "*.gen.go"
+        #[arg(long = "force-include", value_name = "PATTERN_OR_DIR")]
         add_force_include: Vec<String>,
 
-        /// Remove patterns from the force-include list
-        /// Can be repeated. Examples: --no-force-include .vscode
-        #[arg(long = "no-force-include", value_name = "PATTERN")]
+        /// Remove a force-include registration: a directory path unregisters that
+        /// project's directory (its files leave the index on the next update),
+        /// anything else is removed from the global pattern list. Can be repeated.
+        #[arg(long = "no-force-include", value_name = "PATTERN_OR_DIR")]
         remove_force_include: Vec<String>,
 
         /// Clear all custom ignore patterns (revert to defaults only)
         #[arg(long = "clear-ignore")]
         clear_ignore: bool,
 
-        /// Clear all force-include patterns
+        /// Clear all force-include patterns and directory registrations
         #[arg(long = "clear-force-include")]
         clear_force_include: bool,
     },

@@ -207,13 +207,14 @@ pub async fn search(
             }
         }
 
+        let defaults = SearchParameters::default();
         let params = SearchParameters {
             top_k,
             n_ivf_probe: req.params.n_ivf_probe.unwrap_or(8),
             n_full_scores: req.params.n_full_scores.unwrap_or(4096),
             batch_size: 2000,
             centroid_score_threshold: req.params.centroid_score_threshold.unwrap_or_default(),
-            ..Default::default()
+            ..defaults
         };
 
         let index = &**idx;
@@ -308,13 +309,14 @@ pub async fn search(
                     actual: query.ncols(),
                 });
             }
+            let defaults = SearchParameters::default();
             let params = SearchParameters {
                 top_k: fetch_k,
                 n_ivf_probe: req.params.n_ivf_probe.unwrap_or(8),
                 n_full_scores: req.params.n_full_scores.unwrap_or(4096),
                 batch_size: 2000,
                 centroid_score_threshold: req.params.centroid_score_threshold.unwrap_or_default(),
-                ..Default::default()
+                ..defaults
             };
             let r = idx.search(&query, &params, subset.as_deref())?;
             Some((r.passage_ids, r.scores))

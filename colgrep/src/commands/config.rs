@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use anyhow::Result;
 
 use colgrep::{
@@ -265,10 +267,19 @@ pub fn cmd_config(
 
         // Force-include patterns
         let fi = config.get_force_include();
-        if fi.is_empty() {
+        if fi.is_empty() && config.force_include_dirs.is_empty() {
             println!("  force-incl:  (none)");
         } else {
-            println!("  force-incl:  {}", fi.join(", "));
+            if !fi.is_empty() {
+                println!("  force-incl:  {}", fi.join(", "));
+            }
+            // Per-project directory registrations (`colgrep init` on an
+            // excluded dir, or `--force-include <dir>`)
+            for (root, subs) in &config.force_include_dirs {
+                for sub in subs {
+                    println!("  force-incl:  {}", Path::new(root).join(sub).display());
+                }
+            }
         }
 
         println!();
@@ -287,7 +298,7 @@ pub fn cmd_config(
             "Use --alpha to set hybrid search balance (0=keyword, 1=semantic). Use 0 to reset."
         );
         println!("Use --ignore/--no-ignore to add/remove extra ignore patterns. --clear-ignore to reset.");
-        println!("Use --force-include/--no-force-include to add/remove force-include patterns. --clear-force-include to reset.");
+        println!("Use --force-include/--no-force-include to add/remove force-includes: an existing directory registers per-project (overrides .gitignore), anything else is a global pattern. --clear-force-include to reset.");
         return Ok(());
     }
 
@@ -483,22 +494,57 @@ pub fn cmd_config(
         changed = true;
     }
 
-    // Handle force-include patterns
+    // Handle force-includes. An argument that resolves to an existing directory
+    // inside an indexed project registers per-project (the only form that
+    // overrides .gitignore); anything else is a global walk pattern.
     if clear_force_include {
         config.clear_force_include();
-        println!("✅ Cleared all force-include patterns");
+        config.clear_force_include_dirs();
+        println!("✅ Cleared all force-include patterns and directory registrations");
         changed = true;
     }
-    for pattern in &add_force_include {
-        config.add_force_include(pattern);
-        println!("✅ Added force-include pattern: {}", pattern);
+    for raw in &add_force_include {
+        let abs = resolve_dir_argument(raw);
+        if abs.is_dir() {
+            match find_enclosing_project(&abs) {
+                Some((root, rel)) => {
+                    if config.add_force_include_dir(&root, &rel) {
+                        println!(
+                            "✅ Force-including directory {} (project: {})",
+                            rel.display(),
+                            root.display()
+                        );
+                        println!(
+                            "   Its files are indexed on the project's next update (e.g. colgrep init {}).",
+                            root.display()
+                        );
+                    } else {
+                        println!("✅ Directory already force-included: {}", abs.display());
+                    }
+                    changed = true;
+                    continue;
+                }
+                None => {
+                    println!(
+                        "⚠️  {} is a directory but no indexed project contains it; adding as a global pattern instead",
+                        abs.display()
+                    );
+                }
+            }
+        }
+        config.add_force_include(raw);
+        println!("✅ Added force-include pattern: {}", raw);
         changed = true;
     }
-    for pattern in &remove_force_include {
-        if config.remove_force_include(pattern) {
-            println!("✅ Removed force-include pattern: {}", pattern);
+    for raw in &remove_force_include {
+        let abs = resolve_dir_argument(raw);
+        if remove_force_included_dir(&mut config, &abs) {
+            println!("✅ Stopped force-including directory: {}", abs.display());
+            println!("   Its files leave the project's index on its next update.");
+        } else if config.remove_force_include(raw) {
+            println!("✅ Removed force-include pattern: {}", raw);
         } else {
-            println!("⚠️  Force-include pattern not found: {}", pattern);
+            println!("⚠️  Force-include not found: {}", raw);
         }
         changed = true;
     }
@@ -508,6 +554,65 @@ pub fn cmd_config(
     }
 
     Ok(())
+}
+
+/// Absolutize a force-include argument for directory resolution. Prefer
+/// canonicalization so the path matches the canonical roots registrations are
+/// keyed by; a directory that no longer exists falls back to a lexical join
+/// with the working directory.
+fn resolve_dir_argument(raw: &str) -> PathBuf {
+    std::fs::canonicalize(raw).unwrap_or_else(|_| {
+        let path = Path::new(raw);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
+}
+
+/// Resolve a `--cover` argument to (project root, root-relative subdir) against
+/// every indexed project, preferring the deepest containing root. Deliberately
+/// model-agnostic: coverage is a property of the project, not of one model's
+/// index, so every model's scan honors it.
+fn find_enclosing_project(abs: &Path) -> Option<(PathBuf, PathBuf)> {
+    let data_dir = colgrep::get_colgrep_data_dir().ok()?;
+    let mut best: Option<(PathBuf, PathBuf)> = None;
+    let mut best_depth = 0;
+    for entry in std::fs::read_dir(&data_dir).ok()?.filter_map(|e| e.ok()) {
+        let index_dir = entry.path();
+        if !index_dir.is_dir() {
+            continue;
+        }
+        if let Ok(meta) = colgrep::ProjectMetadata::load(&index_dir) {
+            if abs == meta.project_path {
+                continue; // the project root itself needs no coverage
+            }
+            if let Ok(rel) = abs.strip_prefix(&meta.project_path) {
+                let depth = meta.project_path.components().count();
+                if depth > best_depth {
+                    best_depth = depth;
+                    best = Some((meta.project_path, rel.to_path_buf()));
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Remove the force-included directory registration `abs` points into,
+/// matching it against every registered project root.
+fn remove_force_included_dir(config: &mut Config, abs: &Path) -> bool {
+    let roots: Vec<String> = config.force_include_dirs.keys().cloned().collect();
+    let mut removed = false;
+    for root in roots {
+        if let Ok(rel) = abs.strip_prefix(Path::new(&root)) {
+            removed |= config.remove_force_include_dir(Path::new(&root), rel);
+        }
+    }
+    removed
 }
 
 #[cfg(test)]

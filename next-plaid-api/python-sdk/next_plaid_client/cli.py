@@ -664,7 +664,6 @@ def search(
         params.centroid_score_threshold = (
             centroid_threshold if centroid_threshold > 0 else None
         )
-
     filter_parameters = _parse_params(filter_param)
 
     try:

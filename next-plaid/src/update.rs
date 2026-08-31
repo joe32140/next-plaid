@@ -972,6 +972,22 @@ pub fn update_index(
                 residuals_arr.write_npy(file)?;
                 Ok(())
             })?;
+
+            let inv_norms = crate::residual_lut::compute_inv_norms(
+                codec,
+                codes_arr.as_slice().ok_or_else(|| {
+                    Error::Update("inverse norm codes must be contiguous".to_string())
+                })?,
+                &residuals_arr.view(),
+            )
+            .ok_or_else(|| {
+                Error::Update("residual codec is missing inverse norm tables".to_string())
+            })?;
+            let inv_norms_path = index_dir.join(format!("{}.inv_norms.npy", global_chunk_idx));
+            atomic_write_file(&inv_norms_path, |file| {
+                Array1::from_vec(inv_norms).write_npy(file)?;
+                Ok(())
+            })?;
         }
 
         // Save doclens

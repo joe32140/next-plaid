@@ -5,8 +5,8 @@ name: LUT kernels
 #
 # These kernels are selected by runtime CPU feature detection, so a green test
 # on a runner that lacks the instruction proves nothing — the SIMD branch is
-# just skipped. Every job below therefore names the kernel the runner can
-# reach and FAILS if it can reach none.
+# just skipped. Every job below therefore asks the binary itself which kernel
+# will dispatch (examples/lut_kernel_name) and FAILS if the answer is scalar.
 #
 # Runner ISA coverage:
 #   ubuntu-24.04      x86_64   AVX2 guaranteed; AVX-512 VNNI is a runner
@@ -64,37 +64,22 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
 
-      - name: Kernels this runner can reach
+      - name: Which kernel will actually dispatch here
         run: |
           set -uo pipefail
           if [ "$RUNNER_OS" = "macOS" ]; then
-            sysctl -n machdep.cpu.brand_string
-            sysctl -n hw.optional.arm.FEAT_DotProd > /tmp/dp || echo 0 > /tmp/dp
-            if [ "$(cat /tmp/dp)" = "1" ]; then
-              echo "NEON sdot kernel: WILL RUN"
-            else
-              echo "::error::no FEAT_DotProd — the NEON kernel test would pass vacuously"; exit 1
-            fi
-            exit 0
-          fi
-          lscpu | grep -iE 'model name|vendor id|architecture' || true
-          grep -m1 -iE '^(flags|features)' /proc/cpuinfo | cut -d: -f2- | tr ' ' '\n' \
-            | sort -u > /tmp/all_feats
-          grep -xE 'avx2|avx512f|avx512bw|avx512vnni|avx_vnni|asimddp|i8mm' /tmp/all_feats \
-            | tee /tmp/feats || true
-          has() { grep -qx "$1" /tmp/feats; }
-          if [ "$RUNNER_ARCH" = "X64" ]; then
-            if has avx2; then echo "AVX2 tile kernel: WILL RUN"; else
-              echo "::error::no AVX2 — the x86 kernel test would pass vacuously"; exit 1; fi
-            if has avx512f && has avx512bw && has avx512vnni; then
-              echo "AVX-512 VNNI tile kernel: WILL RUN (this draw won the lottery)"
-            else
-              echo "::warning::no AVX-512 VNNI on this draw — only the AVX2 tile kernel is proven here"
-            fi
+            sysctl -n machdep.cpu.brand_string || true
           else
-            if has asimddp; then echo "NEON sdot kernel: WILL RUN"; else
-              echo "::error::no dotprod — the NEON kernel test would pass vacuously"; exit 1; fi
+            lscpu | grep -iE 'model name|vendor id|architecture' || true
           fi
+          # Authoritative, and deliberately not a /proc/cpuinfo grep: Linux
+          # spells the AVX-512 VNNI bit `avx512_vnni` while the Rust feature is
+          # `avx512vnni`, so a grep for either name silently misses the other
+          # and a job can report "no AVX-512" on a CPU whose dispatch is using
+          # it. This example asks the same runtime detection the dispatch asks,
+          # and exits non-zero if only the scalar fallback is reachable — which
+          # is what would make the kernel tests below pass vacuously.
+          cargo run -p next-plaid --release ${{ matrix.flags }} --example lut_kernel_name
 
       - name: Residual LUT kernel parity vs the scalar reference
         run: cargo test -p next-plaid --release ${{ matrix.flags }} --lib residual_lut -- --nocapture
@@ -128,18 +113,13 @@ jobs:
       - name: Install OpenBLAS
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
 
-      - name: Kernels this runner can reach
+      - name: Which kernel will actually dispatch here
         run: |
           set -uo pipefail
           lscpu | grep -iE 'model name|vendor id' || true
-          grep -m1 -iE '^(flags|features)' /proc/cpuinfo | cut -d: -f2- | tr ' ' '\n' \
-            | sort -u > /tmp/all_feats
-          grep -xE 'avx2|avx512vnni|asimddp|i8mm' /tmp/all_feats | tee /tmp/feats || true
-          if [ "$RUNNER_ARCH" = "X64" ]; then
-            grep -qx avx2 /tmp/feats || { echo "::error::no AVX2 — this would time two scalar fallbacks"; exit 1; }
-          else
-            grep -qx asimddp /tmp/feats || { echo "::error::no dotprod — this would time two scalar fallbacks"; exit 1; }
-          fi
+          # See the parity job: runtime detection, not a cpuinfo grep. An A/B
+          # between two scalar fallbacks would look like a kernel result.
+          cargo run -p next-plaid --release ${{ matrix.flags }} --example lut_kernel_name
 
       # Both arms are built and run on the SAME runner. GitHub's pools are
       # mixed, so a ratio stitched across two runs can be a hardware

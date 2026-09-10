@@ -9,10 +9,17 @@ name: LUT kernels
 # will dispatch (examples/lut_kernel_name) and FAILS if the answer is scalar.
 #
 # Runner ISA coverage:
-#   ubuntu-24.04      x86_64   AVX2 guaranteed; AVX-512 VNNI is a runner
-#                              lottery (Xeon: yes / EPYC 7763: no), hence two
-#                              independent draws — the same reason
-#                              kernel-matrix.yml takes two
+#   ubuntu-24.04      x86_64   AVX2 guaranteed. AVX-512 is NOT reachable here:
+#                              measured 2026-09-10, `is_x86_feature_detected!`
+#                              returned false for avx512f on all three draws
+#                              (EPYC 7763, EPYC 9V74 x2) — and the 9V74 is Zen 4,
+#                              which has AVX-512 in hardware, so the VM is not
+#                              enabling ZMM state rather than the pool lacking
+#                              capable parts. kernel-matrix.yml calls this a
+#                              lottery worth re-drawing; for AVX-512 on today's
+#                              pool it is not. Two draws are kept because they
+#                              do sample different cores (Zen 3 and Zen 4), and
+#                              the x86 gain is strongly core-dependent.
 #   ubuntu-24.04-arm  aarch64  NEON sdot on Neoverse
 #   macos-latest      aarch64  NEON sdot on Apple Silicon, a different core
 #                              from the Neoverse one and from the dev machine

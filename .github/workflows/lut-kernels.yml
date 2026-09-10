@@ -1,0 +1,225 @@
+name: LUT kernels
+
+# Correctness and A/B for the asymmetric residual LUT rescore kernels
+# (blocked NEON sdot; AVX2 and AVX-512 VNNI GEMM-tile forms).
+#
+# These kernels are selected by runtime CPU feature detection, so a green test
+# on a runner that lacks the instruction proves nothing — the SIMD branch is
+# just skipped. Every job below therefore names the kernel the runner can
+# reach and FAILS if it can reach none.
+#
+# Runner ISA coverage:
+#   ubuntu-24.04      x86_64   AVX2 guaranteed; AVX-512 VNNI is a runner
+#                              lottery (Xeon: yes / EPYC 7763: no), hence two
+#                              independent draws — the same reason
+#                              kernel-matrix.yml takes two
+#   ubuntu-24.04-arm  aarch64  NEON sdot on Neoverse
+#   macos-latest      aarch64  NEON sdot on Apple Silicon, a different core
+#                              from the Neoverse one and from the dev machine
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'next-plaid/src/residual_lut.rs'
+      - 'next-plaid/src/binary.rs'
+      - 'next-plaid/examples/lut_*.rs'
+      - '.github/workflows/lut-kernels.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # v1.7.0: the release whose kernels this change is measured against.
+  BASE_SHA: 00e26aae0006b322727db277672211d9a0e3ccec
+
+jobs:
+  parity:
+    name: Parity ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86-draw1
+            os: ubuntu-24.04
+            flags: --features openblas
+          - name: linux-x86-draw2
+            os: ubuntu-24.04
+            flags: --features openblas
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            flags: --features openblas
+          - name: macos-arm64
+            os: macos-latest
+            flags: --features accelerate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install OpenBLAS
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - name: Kernels this runner can reach
+        run: |
+          set -uo pipefail
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            sysctl -n machdep.cpu.brand_string
+            sysctl -n hw.optional.arm.FEAT_DotProd > /tmp/dp || echo 0 > /tmp/dp
+            if [ "$(cat /tmp/dp)" = "1" ]; then
+              echo "NEON sdot kernel: WILL RUN"
+            else
+              echo "::error::no FEAT_DotProd — the NEON kernel test would pass vacuously"; exit 1
+            fi
+            exit 0
+          fi
+          lscpu | grep -iE 'model name|vendor id|architecture' || true
+          grep -m1 -iE '^(flags|features)' /proc/cpuinfo | cut -d: -f2- | tr ' ' '\n' \
+            | sort -u > /tmp/all_feats
+          grep -xE 'avx2|avx512f|avx512bw|avx512vnni|avx_vnni|asimddp|i8mm' /tmp/all_feats \
+            | tee /tmp/feats || true
+          has() { grep -qx "$1" /tmp/feats; }
+          if [ "$RUNNER_ARCH" = "X64" ]; then
+            if has avx2; then echo "AVX2 tile kernel: WILL RUN"; else
+              echo "::error::no AVX2 — the x86 kernel test would pass vacuously"; exit 1; fi
+            if has avx512f && has avx512bw && has avx512vnni; then
+              echo "AVX-512 VNNI tile kernel: WILL RUN (this draw won the lottery)"
+            else
+              echo "::warning::no AVX-512 VNNI on this draw — only the AVX2 tile kernel is proven here"
+            fi
+          else
+            if has asimddp; then echo "NEON sdot kernel: WILL RUN"; else
+              echo "::error::no dotprod — the NEON kernel test would pass vacuously"; exit 1; fi
+          fi
+
+      - name: Residual LUT kernel parity vs the scalar reference
+        run: cargo test -p next-plaid --release ${{ matrix.flags }} --lib residual_lut -- --nocapture
+
+      - name: Full next-plaid suite
+        run: cargo test -p next-plaid --release ${{ matrix.flags }}
+
+      - name: Clippy for this target
+        run: cargo clippy -p next-plaid --release --all-targets ${{ matrix.flags }} -- -D warnings
+
+  ab:
+    name: A/B vs 1.7.0 ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86
+            os: ubuntu-24.04
+            flags: --features openblas
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            flags: --features openblas
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install OpenBLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - name: Kernels this runner can reach
+        run: |
+          set -uo pipefail
+          lscpu | grep -iE 'model name|vendor id' || true
+          grep -m1 -iE '^(flags|features)' /proc/cpuinfo | cut -d: -f2- | tr ' ' '\n' \
+            | sort -u > /tmp/all_feats
+          grep -xE 'avx2|avx512vnni|asimddp|i8mm' /tmp/all_feats | tee /tmp/feats || true
+          if [ "$RUNNER_ARCH" = "X64" ]; then
+            grep -qx avx2 /tmp/feats || { echo "::error::no AVX2 — this would time two scalar fallbacks"; exit 1; }
+          else
+            grep -qx asimddp /tmp/feats || { echo "::error::no dotprod — this would time two scalar fallbacks"; exit 1; }
+          fi
+
+      # Both arms are built and run on the SAME runner. GitHub's pools are
+      # mixed, so a ratio stitched across two runs can be a hardware
+      # difference wearing a kernel's clothes.
+      - name: Build both arms
+        run: |
+          set -euo pipefail
+          git worktree add "$RUNNER_TEMP/base" "$BASE_SHA"
+          mkdir -p "$RUNNER_TEMP/base/next-plaid/examples"
+          cp next-plaid/examples/lut_ab.rs "$RUNNER_TEMP/base/next-plaid/examples/"
+          cargo build -p next-plaid --release ${{ matrix.flags }} \
+            --example lut_ab --example lut_ci_index
+          cd "$RUNNER_TEMP/base"
+          cargo build -p next-plaid --release ${{ matrix.flags }} --example lut_ab
+
+      # Document length is not a free parameter: the rescore kernel's share of
+      # a query grows with tokens per document, so a corpus of short documents
+      # understates the change. 240 tokens is the SciFact/ColBERTv2 working
+      # point these kernels are tuned against.
+      - name: Cache the synthetic index
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/bench
+          key: lut-bench-${{ runner.arch }}-${{ hashFiles('next-plaid/examples/lut_ci_index.rs') }}-d2000-t240-q50
+      - name: Synthetic index, shared by both arms
+        env:
+          DOCS: 2000
+          TOKENS: 240
+          QUERIES: 50
+        run: ./target/release/examples/lut_ci_index "$RUNNER_TEMP/bench"
+
+      - name: Alternate the arms
+        env:
+          NQ: 50
+          ROUNDS: 3
+          WARMUP: 1
+        run: |
+          set -euo pipefail
+          IDX="$RUNNER_TEMP/bench/index"
+          Q="$RUNNER_TEMP/bench/queries.npy"
+          OUT="$RUNNER_TEMP/bench"
+          for C in 1024 4096; do
+            export NFULL=$C
+            for rep in 1 2 3; do
+              "$RUNNER_TEMP/base/target/release/examples/lut_ab" "$IDX" "$Q" "$OUT" base
+              ./target/release/examples/lut_ab "$IDX" "$Q" "$OUT" port
+            done
+            if diff -q "$OUT/top_base_c$C.tsv" "$OUT/top_port_c$C.tsv"; then
+              echo "PARITY c=$C: $(wc -l < "$OUT/top_base_c$C.tsv") rows bit-identical to 1.7.0"
+            else
+              echo "::error::PARITY c=$C: scores differ from 1.7.0"
+              diff "$OUT/top_base_c$C.tsv" "$OUT/top_port_c$C.tsv" | head -20
+              exit 1
+            fi
+          done 2>&1 | tee "$RUNNER_TEMP/ab.log"
+
+      - name: Summary
+        run: |
+          python3 - "$RUNNER_TEMP/ab.log" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import re, statistics, sys
+          rows, depth = {}, None
+          for line in open(sys.argv[1]):
+              m = re.search(r"n_full_scores (\d+)", line)
+              if m:
+                  depth = int(m.group(1))
+              m = re.match(r"\[(base|port)\] median ([\d.]+)", line)
+              if m and depth:
+                  rows.setdefault((depth, m.group(1)), []).append(float(m.group(2)))
+          print("### LUT kernel A/B vs next-plaid 1.7.0")
+          print()
+          print("| n_full_scores | 1.7.0 ms | this ms | ratio |")
+          print("|---|---|---|---|")
+          for d in sorted({k[0] for k in rows}):
+              b = statistics.median(rows[(d, "base")])
+              p = statistics.median(rows[(d, "port")])
+              print(f"| {d} | {b:.3f} | {p:.3f} | {b / p:.2f}x |")
+          print()
+          print("Synthetic corpus: 2000 docs x 240 tokens, dim 128, nbits 4,")
+          print("both arms alternated on this one runner. The ratio tracks how")
+          print("much of a query is rescoring, so it grows with document length")
+          print("and rescore depth; the absolute ms are not a production figure.")
+          print("Scores are asserted bit-identical to 1.7.0 in the step above.")
+          PY

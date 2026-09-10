@@ -135,8 +135,10 @@ pub fn quantize_lut(codec: &ResidualCodec) -> Option<ResidualLut> {
 /// interleaving back to dim order. A dot product is permutation-invariant
 /// and the integer accumulator is order-invariant, so scores stay bit-equal
 /// to the scalar reference. Rows are zero-padded to
-/// `crate::binary::padded_stride` lanes (a multiple of both the NEON
-/// 16-lane and AVX2 32-lane chunk widths); padding contributes `q·0 = 0`.
+/// `crate::binary::padded_stride` lanes, a multiple of every kernel's chunk
+/// width; padding contributes `q·0 = 0`. The NEON kernel reads this layout
+/// directly; on x86 it is the source the `tiles` rearrangement is built
+/// from.
 pub struct QueryPlanes {
     pub data: Vec<i8>,
     pub stride: usize,
@@ -144,6 +146,23 @@ pub struct QueryPlanes {
     /// factor the fold applies to each integer accumulator, built once per
     /// query rather than once per scored document.
     pub sqw: Vec<f32>,
+    /// The same plane-order codes as *unsigned* GEMM tiles, the layout the
+    /// x86 kernels' `u8 × s8` dot instructions want:
+    /// `[⌈nq/16⌉ tiles][stride/4 groups][16 rows][4 bytes]`, each byte
+    /// `code + 128`. One 64-byte load is then 16 query rows × 4 consecutive
+    /// plane dims, which the kernel multiplies against a 4-byte broadcast of
+    /// the token's weights — so an accumulator lane *is* one row's running
+    /// sum and no horizontal reduction is ever needed. Rows past `nq` hold
+    /// 128 (code 0) and contribute nothing.
+    ///
+    /// The `+128` offset is exact in integer arithmetic: AVX-512 subtracts
+    /// `128·Σw` once per token, and AVX2 recovers the signed code with
+    /// `xor 0x80` (so it needs no second query buffer).
+    ///
+    /// Built only on x86_64. Preparing a query is on the interactive latency
+    /// path, and an aarch64 host has no kernel that reads this.
+    #[cfg(target_arch = "x86_64")]
+    pub tiles: Vec<u8>,
 }
 
 /// Build [`QueryPlanes`] from already-quantized query codes. `dim` must be a
@@ -165,8 +184,28 @@ pub fn build_query_planes(q8: &QueryI8, lut: &ResidualLut, dim: usize) -> QueryP
             }
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    let tiles = {
+        let d4n = stride / 4;
+        let n16 = nq.div_ceil(16);
+        let mut tiles = vec![128u8; n16 * d4n * 64];
+        for qi in 0..nq {
+            let (t, r) = (qi / 16, qi % 16);
+            for d in 0..dim {
+                let v = data[qi * stride + d];
+                tiles[(t * d4n + d / 4) * 64 + r * 4 + (d % 4)] = (v as i16 + 128) as u8;
+            }
+        }
+        tiles
+    };
     let sqw = q8.scales.iter().map(|&s| s * lut.scale).collect();
-    QueryPlanes { data, stride, sqw }
+    QueryPlanes {
+        data,
+        stride,
+        sqw,
+        #[cfg(target_arch = "x86_64")]
+        tiles,
+    }
 }
 
 /// Per-token `1 / ||centroid + dequantized residual||` for a document —
@@ -292,11 +331,12 @@ pub fn maxsim_residual_lut_scalar(
 ///
 /// With `planes` (and a nibble-factorable table) byte-aligned dims ≤
 /// [`MAX_DIM`] take a fused SIMD path — `tbl`+SDOT on aarch64 with
-/// `dotprod`, `pshufb`+`maddubs` on x86_64 with AVX2; otherwise the scalar
-/// reference. `cdot_t` is centroid-major (see
-/// [`maxsim_residual_lut_scalar`]). All paths compute the identical integer
-/// accumulator and the identical float epilogue expression (the SIMD paths
-/// fold it four/eight query rows at a time), so results are bit-equal
+/// `dotprod`, `pshufb`+`maddubs` on x86_64 with AVX2, `vpdpbusd` with
+/// AVX-512 VNNI; otherwise the scalar reference. `cdot_t` is centroid-major
+/// (see [`maxsim_residual_lut_scalar`]). Each kernel blocks over several doc
+/// tokens at once and folds 4 (NEON), 8 (AVX2) or 16 (AVX-512) query rows
+/// per step, but every path computes the identical integer accumulator and
+/// applies the identical float epilogue expression, so results are bit-equal
 /// across dispatch.
 #[allow(clippy::too_many_arguments)]
 pub fn maxsim_residual_lut_i8(
@@ -345,6 +385,13 @@ pub fn maxsim_residual_lut_i8(
             "QueryPlanes stride/len too small for nq {nq} x dim {dim}"
         );
         assert_eq!(p.sqw.len(), nq, "QueryPlanes sqw/rows mismatch");
+        // The x86 kernels read the tile layout instead of `data`, so its
+        // extent is a precondition of its own.
+        #[cfg(target_arch = "x86_64")]
+        assert!(
+            p.tiles.len() >= nq.div_ceil(16) * (p.stride / 4) * 64,
+            "QueryPlanes tiles too small for nq {nq} x dim {dim}"
+        );
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let _ = planes;
@@ -354,11 +401,11 @@ pub fn maxsim_residual_lut_i8(
             #[cfg(target_arch = "aarch64")]
             if std::arch::is_aarch64_feature_detected!("dotprod") {
                 return SCRATCH.with(|s| {
-                    let (best, accs) = &mut *s.borrow_mut();
+                    let best = &mut *s.borrow_mut();
                     unsafe {
                         neon::maxsim_residual_lut_neon(
                             q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim,
-                            best, accs,
+                            best,
                         )
                     }
                 });
@@ -366,11 +413,11 @@ pub fn maxsim_residual_lut_i8(
             #[cfg(target_arch = "x86_64")]
             if has_avx512_vnni() {
                 return SCRATCH.with(|s| {
-                    let (best, accs) = &mut *s.borrow_mut();
+                    let best = &mut *s.borrow_mut();
                     unsafe {
                         avx512::maxsim_residual_lut_avx512(
                             q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim,
-                            best, accs,
+                            best,
                         )
                     }
                 });
@@ -378,11 +425,11 @@ pub fn maxsim_residual_lut_i8(
             #[cfg(target_arch = "x86_64")]
             if is_x86_feature_detected!("avx2") {
                 return SCRATCH.with(|s| {
-                    let (best, accs) = &mut *s.borrow_mut();
+                    let best = &mut *s.borrow_mut();
                     unsafe {
                         avx2::maxsim_residual_lut_avx2(
                             q8, planes, doc_packed, doc_codes, cdot_t, lut, nib, inv_norms, dim,
-                            best, accs,
+                            best,
                         )
                     }
                 });
@@ -451,14 +498,14 @@ pub fn simd_dispatch_available(dim: usize, nibble_ok: bool) -> bool {
     }
 }
 
-// Per-thread kernel scratch (best, accs), reused across the ~1024
-// per-candidate kernel calls of a search. Each rayon worker gets its own
-// copy, and the kernels size-and-initialize it on entry, so no state
-// leaks between calls.
+// Per-thread `best` buffer, reused across the ~1024 per-candidate kernel
+// calls of a search. Each rayon worker gets its own copy, and the kernels
+// size-and-initialize it on entry, so no state leaks between calls. The
+// integer accumulators live in registers (see the kernels' `block`), so this
+// is the only scratch they need.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 thread_local! {
-    static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<i32>)> =
-        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    static SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -466,9 +513,14 @@ mod neon {
     use super::*;
     use std::arch::aarch64::*;
 
-    /// Vectorized epilogue fold: for one doc token, fold
-    /// `best[i] = max(best[i], (sqw[i]·accs[i] + crow[i])·inv)`
-    /// four query rows per `vmaxq_f32` instead of one scalar compare each.
+    /// Document tokens held in registers per block. Four tokens × four query
+    /// rows is 16 accumulators, which sits well inside the 32 NEON registers
+    /// with four query chunks and one weight chunk live. Neighbouring widths
+    /// (2, 3, 6, 8) measure within ±8% of this one.
+    const NT: usize = 4;
+
+    /// Fold four query rows' final integer accumulators (lane `r` = row
+    /// `base + r`) through the shared float tail.
     ///
     /// Bit-identical to the scalar kernel's tail on purpose:
     /// `vcvtq_f32_s32` is the same round-to-nearest as `acc as f32`; the
@@ -477,38 +529,6 @@ mod neon {
     /// `(sqw·acc + crow) · inv` rounding-for-rounding; and for the finite
     /// scores this loop produces, `vmaxq_f32(best, s)` equals the scalar
     /// `if s > best` select.
-    #[inline(always)]
-    unsafe fn fold_block(accs: &[i32], sqw: &[f32], crow: *const f32, inv: f32, best: &mut [f32]) {
-        let nq = accs.len();
-        let invv = vdupq_n_f32(inv);
-        let mut i = 0usize;
-        while i + 4 <= nq {
-            let a = vcvtq_f32_s32(vld1q_s32(accs.as_ptr().add(i)));
-            let s = vmulq_f32(
-                vaddq_f32(
-                    vmulq_f32(vld1q_f32(sqw.as_ptr().add(i)), a),
-                    vld1q_f32(crow.add(i)),
-                ),
-                invv,
-            );
-            let b = vld1q_f32(best.as_ptr().add(i));
-            vst1q_f32(best.as_mut_ptr().add(i), vmaxq_f32(b, s));
-            i += 4;
-        }
-        while i < nq {
-            let s = (sqw[i] * accs[i] as f32 + *crow.add(i)) * inv;
-            if s > best[i] {
-                best[i] = s;
-            }
-            i += 1;
-        }
-    }
-
-    /// One 4-row block of the transpose-reduce fold: `accv` already holds
-    /// four query rows' final integer accumulators (lane `r` = row
-    /// `base + r`, delivered by a `vpaddq` tree instead of four per-row
-    /// `vaddvq` reduces), so this applies the shared float tail — same
-    /// ops, same order as [`fold_block`], hence bit-identical.
     #[inline(always)]
     unsafe fn fold4(
         accv: int32x4_t,
@@ -530,20 +550,186 @@ mod neon {
         vst1q_f32(best.as_mut_ptr().add(base), vmaxq_f32(b, s));
     }
 
-    /// Fused NEON path: expand each doc token's packed bytes through the
-    /// nibble tables with `tbl` — one lookup per key position per 16 packed
-    /// bytes, stored straight to that key's plane (no interleave) — then
-    /// score all query rows with SDOT against the matching
-    /// [`QueryPlanes`] rows (whose zero padding makes the buffer's padding
-    /// contribute nothing).
+    /// Scalar fold for the `nq % 4` leftover rows — same expression, same
+    /// order as [`fold4`] and the scalar kernel.
+    #[inline(always)]
+    unsafe fn fold_tail(accs: &[i32], sqw: &[f32], crow: *const f32, inv: f32, best: &mut [f32]) {
+        for (i, &acc) in accs.iter().enumerate() {
+            let s = (sqw[i] * acc as f32 + *crow.add(i)) * inv;
+            if s > best[i] {
+                best[i] = s;
+            }
+        }
+    }
+
+    /// Expand one stored token's `pdim` packed bytes into `kpb` planes of
+    /// int8 weights: one `tbl` per key position per 16 packed bytes, stored
+    /// straight to that key's plane (no interleave back to dim order).
     ///
-    /// Epilogue: query rows go 4 at a time, each block keeping four full
-    /// accumulator *vectors*; a `vpaddq` pairwise tree lands their four
-    /// horizontal sums in one register (integer adds — lane-for-lane the
-    /// values per-row `vaddvq` reduces would produce), which [`fold4`]
-    /// folds directly — no per-row horizontal reduce, no scratch
-    /// round-trip. Leftover rows (nq % 4) reduce scalar-wise into `accs`,
-    /// then [`fold_block`] folds the tail slice.
+    /// # Safety
+    /// `row.len() >= pdim`; `kpb * pdim <= MAX_DIM`; `tabs` holds the
+    /// nibble tables for `kpb` keys. Writes land strictly below
+    /// `kpb * pdim == dim`, which is what keeps `w`'s tail zero for the dot
+    /// loop's chunk over-read.
+    #[inline(always)]
+    unsafe fn expand(
+        row: &[u8],
+        tabs: &[int8x16_t; 8],
+        nib: &NibbleLut,
+        kpb: usize,
+        pdim: usize,
+        w: &mut [i8; MAX_DIM],
+    ) {
+        let low_mask = vdupq_n_u8(0x0F);
+        let wp = w.as_mut_ptr();
+        let mut i = 0usize;
+        while i + 16 <= pdim {
+            let v = vld1q_u8(row.as_ptr().add(i));
+            let hi = vshrq_n_u8(v, 4);
+            let lo = vandq_u8(v, low_mask);
+            for (k, tab) in tabs.iter().enumerate().take(kpb) {
+                let idx = if nib.from_hi[k] { hi } else { lo };
+                vst1q_s8(wp.add(k * pdim + i), vqtbl1q_s8(*tab, idx));
+            }
+            i += 16;
+        }
+        // Sub-16 tail: pad the remaining packed bytes into a zeroed 16-byte
+        // scratch, expand with the same tbl, and copy out only the valid
+        // lanes — a direct 16-lane store would clobber the next plane's
+        // already-written low bytes. This keeps narrow dims on the SIMD path
+        // (dim 48 at nbits 2/1 packs to 12/6 bytes, under one chunk).
+        // Bit-identical: the nibble tables are verified against the fused
+        // table over all 256 byte values, zero-pad included.
+        if i < pdim {
+            let rem = pdim - i;
+            let mut src = [0u8; 16];
+            src[..rem].copy_from_slice(&row[i..pdim]);
+            let v = vld1q_u8(src.as_ptr());
+            let hi = vshrq_n_u8(v, 4);
+            let lo = vandq_u8(v, low_mask);
+            let mut dst = [0i8; 16];
+            for k in 0..kpb {
+                let idx = if nib.from_hi[k] { hi } else { lo };
+                vst1q_s8(dst.as_mut_ptr(), vqtbl1q_s8(tabs[k], idx));
+                w[k * pdim + i..k * pdim + pdim].copy_from_slice(&dst[..rem]);
+            }
+        }
+    }
+
+    /// Score `N` already-expanded doc tokens against every query row,
+    /// updating `best`.
+    ///
+    /// Register blocking is what this buys over a token-at-a-time loop: with
+    /// one token live, every `sdot` needs two loads (a query chunk and a
+    /// weight chunk), which caps a three-load-per-cycle core near 1.5
+    /// `sdot`/cycle. Holding `N` tokens' expanded weights and four query
+    /// rows in registers shares each query load across `N` products and each
+    /// weight load across four rows — `4 + N` loads per `4·N` `sdot`s — and
+    /// hands the out-of-order core `4·N` independent accumulator chains
+    /// instead of four.
+    ///
+    /// The integer accumulator is unchanged: the same products are summed,
+    /// and integer addition is exact and associative, so a different
+    /// grouping cannot move a bit. The float epilogue is untouched. Hence
+    /// the blocked form is bit-identical to the unblocked one, and to
+    /// scalar.
+    ///
+    /// # Safety
+    /// Requires `dotprod`; `dim % 8 == 0 && dim <= MAX_DIM`; the query planes
+    /// zero-padded to a 16-lane multiple past `dim` (`padded_stride` is a
+    /// multiple of 64); `crows[j]` readable for `nq` f32s; `best.len() == nq`
+    /// and `sqw.len() == nq`.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn block<const N: usize>(
+        ws: &[[i8; MAX_DIM]; N],
+        dim: usize,
+        nq: usize,
+        qp_base: *const i8,
+        ps: usize,
+        sqw: &[f32],
+        crows: &[*const f32; N],
+        invs: &[f32; N],
+        best: &mut [f32],
+    ) {
+        let mut qi = 0usize;
+        while qi + 4 <= nq {
+            let mut acc = [[vdupq_n_s32(0); 4]; N];
+            let qp = [
+                qp_base.add(qi * ps),
+                qp_base.add((qi + 1) * ps),
+                qp_base.add((qi + 2) * ps),
+                qp_base.add((qi + 3) * ps),
+            ];
+            let mut k = 0usize;
+            // Partial tail chunks are exact: both sides zero-pad past dim.
+            while k < dim {
+                let q = [
+                    vld1q_s8(qp[0].add(k)),
+                    vld1q_s8(qp[1].add(k)),
+                    vld1q_s8(qp[2].add(k)),
+                    vld1q_s8(qp[3].add(k)),
+                ];
+                for j in 0..N {
+                    let wv = vld1q_s8(ws[j].as_ptr().add(k));
+                    for r in 0..4 {
+                        acc[j][r] = crate::binary::sdot_asm(acc[j][r], q[r], wv);
+                    }
+                }
+                k += 16;
+            }
+            for j in 0..N {
+                // Pairwise tree -> [Σrow0, Σrow1, Σrow2, Σrow3] in one
+                // register, instead of four per-row `vaddvq` reduces.
+                let accv = vpaddq_s32(
+                    vpaddq_s32(acc[j][0], acc[j][1]),
+                    vpaddq_s32(acc[j][2], acc[j][3]),
+                );
+                fold4(accv, qi, sqw, crows[j], invs[j], best);
+            }
+            qi += 4;
+        }
+        if qi < nq {
+            let rem = nq - qi;
+            let mut tail = [0i32; 4];
+            for j in 0..N {
+                for (r, slot) in tail.iter_mut().enumerate().take(rem) {
+                    let qp = qp_base.add((qi + r) * ps);
+                    let mut acc0 = vdupq_n_s32(0);
+                    let mut acc1 = vdupq_n_s32(0);
+                    let mut k = 0usize;
+                    while k < dim {
+                        acc0 = crate::binary::sdot_asm(
+                            acc0,
+                            vld1q_s8(qp.add(k)),
+                            vld1q_s8(ws[j].as_ptr().add(k)),
+                        );
+                        if k + 16 < dim {
+                            acc1 = crate::binary::sdot_asm(
+                                acc1,
+                                vld1q_s8(qp.add(k + 16)),
+                                vld1q_s8(ws[j].as_ptr().add(k + 16)),
+                            );
+                        }
+                        k += 32;
+                    }
+                    *slot = vaddvq_s32(vaddq_s32(acc0, acc1));
+                }
+                fold_tail(
+                    &tail[..rem],
+                    &sqw[qi..],
+                    crows[j].add(qi),
+                    invs[j],
+                    &mut best[qi..],
+                );
+            }
+        }
+    }
+
+    /// Fused NEON path: expand `NT` doc tokens' packed bytes through the
+    /// nibble tables, then score that block of tokens against every query
+    /// row with SDOT against the matching [`QueryPlanes`] rows (whose zero
+    /// padding makes the buffer's padding contribute nothing).
     ///
     /// # Safety
     /// Requires the `dotprod` CPU feature; `dim % 8 == 0 && dim <= MAX_DIM`;
@@ -562,10 +748,10 @@ mod neon {
         inv_norms: &[f32],
         dim: usize,
         best: &mut Vec<f32>,
-        accs: &mut Vec<i32>,
     ) -> f32 {
         let nq = q8.values.nrows();
-        if nq == 0 || doc_packed.nrows() == 0 {
+        let n_tokens = doc_packed.nrows();
+        if nq == 0 || n_tokens == 0 {
             return 0.0;
         }
         let kpb = lut.keys_per_byte;
@@ -579,151 +765,261 @@ mod neon {
         let sqw: &[f32] = &planes.sqw;
         best.clear();
         best.resize(nq, f32::NEG_INFINITY);
-        accs.clear();
-        accs.resize(nq, 0);
-        let mut w = [0i8; MAX_DIM];
         let mut tabs = [vdupq_n_s8(0); 8];
         for (tab, src) in tabs.iter_mut().zip(nib.tables.iter()).take(kpb) {
             *tab = vld1q_s8(src.as_ptr());
         }
-        let low_mask = vdupq_n_u8(0x0F);
 
-        for (t, &code) in doc_codes.iter().enumerate() {
-            let row = &d_all[t * pb..t * pb + pb];
-            let wp = w.as_mut_ptr();
-            let mut i = 0usize;
-            while i + 16 <= pdim {
-                let v = vld1q_u8(row.as_ptr().add(i));
-                let hi = vshrq_n_u8(v, 4);
-                let lo = vandq_u8(v, low_mask);
-                for (k, tab) in tabs.iter().enumerate().take(kpb) {
-                    let idx = if nib.from_hi[k] { hi } else { lo };
-                    vst1q_s8(wp.add(k * pdim + i), vqtbl1q_s8(*tab, idx));
-                }
-                i += 16;
+        // Zeroed once: `expand` writes only below `dim`, so the tail of each
+        // buffer stays zero for every token and the dot loop's over-read past
+        // `dim` contributes exactly nothing.
+        let mut ws = [[0i8; MAX_DIM]; NT];
+        let mut crows = [std::ptr::null::<f32>(); NT];
+        let mut invs = [0f32; NT];
+        let mut t = 0usize;
+        while t + NT <= n_tokens {
+            for j in 0..NT {
+                let tt = t + j;
+                expand(
+                    &d_all[tt * pb..tt * pb + pdim],
+                    &tabs,
+                    nib,
+                    kpb,
+                    pdim,
+                    &mut ws[j],
+                );
+                crows[j] = cd.as_ptr().add(doc_codes[tt] as usize * nq);
+                invs[j] = inv_norms[tt];
             }
-            // Sub-16 tail: pad the remaining packed bytes into a zeroed
-            // 16-byte scratch, expand with the same tbl, and copy out only
-            // the valid lanes — a direct 16-lane store would clobber the
-            // next plane's already-written low bytes. This keeps narrow
-            // dims on the SIMD path (dim 48 at nbits 2/1 packs to 12/6
-            // bytes — under one chunk — and previously fell to a scalar
-            // walk). Bit-identical: the nibble tables are verified against
-            // the fused table over all 256 byte values, zero-pad included.
-            if i < pdim {
-                let rem = pdim - i;
-                let mut src = [0u8; 16];
-                src[..rem].copy_from_slice(&row[i..pdim]);
-                let v = vld1q_u8(src.as_ptr());
-                let hi = vshrq_n_u8(v, 4);
-                let lo = vandq_u8(v, low_mask);
-                let mut dst = [0i8; 16];
-                for k in 0..kpb {
-                    let idx = if nib.from_hi[k] { hi } else { lo };
-                    vst1q_s8(dst.as_mut_ptr(), vqtbl1q_s8(tabs[k], idx));
-                    w[k * pdim + i..k * pdim + pdim].copy_from_slice(&dst[..rem]);
-                }
-            }
-            let cid = code as usize;
-            let wp = w.as_ptr();
-            let inv = inv_norms[t];
-            // Per-row SDOT accumulation over the shared expanded weights.
-            // Partial tail chunks are exact: both sides zero-pad past dim.
-            macro_rules! row_acc {
-                ($qi:expr) => {{
-                    let qp = qp_base.add($qi * ps);
-                    let mut a = vdupq_n_s32(0);
-                    let mut b = vdupq_n_s32(0);
-                    let mut k = 0usize;
-                    while k < dim {
-                        a = crate::binary::sdot_asm(a, vld1q_s8(qp.add(k)), vld1q_s8(wp.add(k)));
-                        if k + 16 < dim {
-                            b = crate::binary::sdot_asm(
-                                b,
-                                vld1q_s8(qp.add(k + 16)),
-                                vld1q_s8(wp.add(k + 16)),
-                            );
-                        }
-                        k += 32;
-                    }
-                    vaddq_s32(a, b)
-                }};
-            }
-            let crow = cd.as_ptr().add(cid * nq);
-            let mut qi = 0usize;
-            while qi + 4 <= nq {
-                let v0 = row_acc!(qi);
-                let v1 = row_acc!(qi + 1);
-                let v2 = row_acc!(qi + 2);
-                let v3 = row_acc!(qi + 3);
-                // Pairwise tree -> [Σv0, Σv1, Σv2, Σv3] in one register.
-                let accv = vpaddq_s32(vpaddq_s32(v0, v1), vpaddq_s32(v2, v3));
-                fold4(accv, qi, sqw, crow, inv, best);
-                qi += 4;
-            }
-            if qi < nq {
-                let rem = nq - qi;
-                for (r, acc) in accs.iter_mut().enumerate().take(rem) {
-                    *acc = vaddvq_s32(row_acc!(qi + r));
-                }
-                fold_block(&accs[..rem], &sqw[qi..], crow.add(qi), inv, &mut best[qi..]);
-            }
+            block::<NT>(&ws, dim, nq, qp_base, ps, sqw, &crows, &invs, best);
+            t += NT;
+        }
+        while t < n_tokens {
+            expand(
+                &d_all[t * pb..t * pb + pdim],
+                &tabs,
+                nib,
+                kpb,
+                pdim,
+                &mut ws[0],
+            );
+            let one_w = [ws[0]];
+            let one_c = [cd.as_ptr().add(doc_codes[t] as usize * nq)];
+            let one_i = [inv_norms[t]];
+            block::<1>(&one_w, dim, nq, qp_base, ps, sqw, &one_c, &one_i, best);
+            t += 1;
         }
         best.iter().sum()
     }
 }
 
+/// AVX2 path for the fused asym kernel, in GEMM-tile form.
+///
+/// The row-per-accumulator form pays an 8-lane horizontal reduction per
+/// *(query row, doc token)* — the most frequent event in the kernel. Putting
+/// the query *rows* into the lanes removes it entirely: a 32-byte load of the
+/// tile layout ([`QueryPlanes::tiles`]) is 8 rows × 4 consecutive plane dims,
+/// the token's expanded weights are broadcast 4 bytes at a time, and each
+/// accumulator lane then *is* one row's running sum — so the fold reads the
+/// lanes directly.
+///
+/// The only AVX2 `u8 × s8` dot is `vpmaddubsw`, whose pair sums saturate at
+/// i16, so the `+128` offset the AVX-512 path relies on is unavailable here
+/// (`(q+128)·w` pairs overflow). Instead the unsigned operand is `|q|` and
+/// q's sign is moved onto the broadcast weight with `vpsignb`:
+/// `|q| · sign(q)·w = q·w` exactly, and `|q|,|w| <= 127` keeps every pair sum
+/// under 32 767. The signed code is recovered from the stored `u8` tile by
+/// `xor 0x80`, so the query needs no second buffer; `-128` never appears
+/// (codes are clamped to ±127 at quantization, and padding rows store 128 =
+/// code 0), so `vpabsb` is exact.
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
     use super::*;
     use std::arch::x86_64::*;
 
-    /// Vectorized epilogue fold, eight query rows per iteration — the AVX2
-    /// twin of the NEON `fold_block`; see the exactness argument there
-    /// (`_mm256_cvtepi32_ps` rounds to nearest like `as f32`; separate
-    /// mul/add, `inv` last; `_mm256_max_ps` matches the scalar select for
-    /// finite scores).
+    /// Document tokens held in registers per block.
+    const NT: usize = 4;
+
+    /// Expand one stored token's `pdim` packed bytes into `kpb` planes of
+    /// int8 weights with `pshufb` — the x86 twin of the NEON `expand`.
+    ///
+    /// # Safety
+    /// `row.len() >= pdim`; `kpb * pdim <= MAX_DIM`; `tabs` holds the nibble
+    /// tables for `kpb` keys. Writes land strictly below `kpb * pdim == dim`.
     #[inline(always)]
-    unsafe fn fold_block(accs: &[i32], sqw: &[f32], crow: *const f32, inv: f32, best: &mut [f32]) {
-        let nq = accs.len();
-        let invv = _mm256_set1_ps(inv);
+    unsafe fn expand(
+        row: &[u8],
+        tabs: &[__m128i; 8],
+        nib: &NibbleLut,
+        kpb: usize,
+        pdim: usize,
+        w: &mut [i8; MAX_DIM],
+    ) {
+        let low_mask = _mm_set1_epi8(0x0F);
+        let wp = w.as_mut_ptr();
         let mut i = 0usize;
-        while i + 8 <= nq {
-            let a = _mm256_cvtepi32_ps(_mm256_loadu_si256(accs.as_ptr().add(i) as *const __m256i));
-            let s = _mm256_mul_ps(
-                _mm256_add_ps(
-                    _mm256_mul_ps(_mm256_loadu_ps(sqw.as_ptr().add(i)), a),
-                    _mm256_loadu_ps(crow.add(i)),
-                ),
-                invv,
-            );
-            let b = _mm256_loadu_ps(best.as_ptr().add(i));
-            _mm256_storeu_ps(best.as_mut_ptr().add(i), _mm256_max_ps(b, s));
-            i += 8;
-        }
-        while i < nq {
-            let s = (sqw[i] * accs[i] as f32 + *crow.add(i)) * inv;
-            if s > best[i] {
-                best[i] = s;
+        while i + 16 <= pdim {
+            let v = _mm_loadu_si128(row.as_ptr().add(i) as *const __m128i);
+            let hi = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
+            let lo = _mm_and_si128(v, low_mask);
+            for (k, tab) in tabs.iter().enumerate().take(kpb) {
+                let idx = if nib.from_hi[k] { hi } else { lo };
+                _mm_storeu_si128(
+                    wp.add(k * pdim + i) as *mut __m128i,
+                    _mm_shuffle_epi8(*tab, idx),
+                );
             }
-            i += 1;
+            i += 16;
+        }
+        // Sub-16 tail through a zero-padded scratch so the store cannot
+        // clobber the next plane's already-written low bytes; see the NEON
+        // `expand` for the full argument.
+        if i < pdim {
+            let rem = pdim - i;
+            let mut src = [0u8; 16];
+            src[..rem].copy_from_slice(&row[i..pdim]);
+            let v = _mm_loadu_si128(src.as_ptr() as *const __m128i);
+            let hi = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
+            let lo = _mm_and_si128(v, low_mask);
+            let mut dst = [0i8; 16];
+            for k in 0..kpb {
+                let idx = if nib.from_hi[k] { hi } else { lo };
+                _mm_storeu_si128(
+                    dst.as_mut_ptr() as *mut __m128i,
+                    _mm_shuffle_epi8(tabs[k], idx),
+                );
+                w[k * pdim + i..k * pdim + pdim].copy_from_slice(&dst[..rem]);
+            }
         }
     }
 
-    /// Fused AVX2 path, mirroring the NEON kernel: `pshufb` nibble-table
-    /// expansion into plane order, then a 32-lane `maddubs`/`madd` int8 dot
-    /// against the [`QueryPlanes`] rows, with the float epilogue folded
-    /// eight rows at a time through [`fold_block`] against the
-    /// centroid-major `cdot_t`.
-    ///
-    /// Exactness: both operands are clamped to ±127 at quantization, so
-    /// `_mm256_sign_epi8` never sees −128 and each `maddubs` pair-sum is
-    /// bounded by 2·127·127 < i16::MAX — the i32 accumulator is exact.
+    /// Mask selecting the first `rem` of 8 f32 lanes, for the last partial
+    /// row tile.
     ///
     /// # Safety
+    /// Requires AVX2.
+    #[inline(always)]
+    unsafe fn lane_mask(rem: usize) -> __m256i {
+        let idx = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        _mm256_cmpgt_epi32(_mm256_set1_epi32(rem as i32), idx)
+    }
+
+    /// One block: `RT` eight-row query tiles × `N` doc tokens over all `d4n`
+    /// dim groups, then the fold for exactly those rows and tokens.
+    ///
+    /// The float epilogue is the same expression in the same order as the
+    /// scalar kernel (`_mm256_cvtepi32_ps` rounds to nearest like `as f32`;
+    /// separate mul then add, never fused; `inv` last; `_mm256_max_ps`
+    /// matches the scalar select for finite scores), so results are
+    /// bit-identical.
+    ///
+    /// # Safety
+    /// Requires AVX2. `tile_ptrs[rt]` addresses 8-row tile `row0/8 + rt`
+    /// inside the query's tile array, which must carry `d4n` groups of 64
+    /// bytes past it; `row0 + 8·(RT−1) < nq`; `crows[j]` readable for `nq`
+    /// f32s; `sqw.len() == best.len() == nq`; `ws[j]` readable for `4·d4n`
+    /// bytes.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn block<const RT: usize, const N: usize>(
+        ws: &[[i8; MAX_DIM]; N],
+        crows: &[*const f32; N],
+        invs: &[f32; N],
+        tile_ptrs: &[*const u8; RT],
+        d4n: usize,
+        row0: usize,
+        nq: usize,
+        sqw: &[f32],
+        best: &mut [f32],
+    ) {
+        let zero = _mm256_setzero_si256();
+        let ones = _mm256_set1_epi16(1);
+        let flip = _mm256_set1_epi8(-128);
+        let mut acc = [[zero; RT]; N];
+        for g in 0..d4n {
+            let mut qs = [zero; RT];
+            let mut qa = [zero; RT];
+            for rt in 0..RT {
+                let qu = _mm256_loadu_si256(tile_ptrs[rt].add(g * 64) as *const __m256i);
+                qs[rt] = _mm256_xor_si256(qu, flip);
+                qa[rt] = _mm256_abs_epi8(qs[rt]);
+            }
+            for j in 0..N {
+                let wb =
+                    _mm256_set1_epi32((ws[j].as_ptr().add(g * 4) as *const i32).read_unaligned());
+                for rt in 0..RT {
+                    let prod = _mm256_maddubs_epi16(qa[rt], _mm256_sign_epi8(wb, qs[rt]));
+                    acc[j][rt] = _mm256_add_epi32(acc[j][rt], _mm256_madd_epi16(prod, ones));
+                }
+            }
+        }
+        for j in 0..N {
+            let invv = _mm256_set1_ps(invs[j]);
+            for (rt, acc_rt) in acc[j].iter().enumerate() {
+                let r0 = row0 + rt * 8;
+                let rem = (nq - r0).min(8);
+                let m = lane_mask(rem);
+                let a = _mm256_cvtepi32_ps(*acc_rt);
+                let s = _mm256_mul_ps(
+                    _mm256_add_ps(
+                        _mm256_mul_ps(_mm256_maskload_ps(sqw.as_ptr().add(r0), m), a),
+                        _mm256_maskload_ps(crows[j].add(r0), m),
+                    ),
+                    invv,
+                );
+                let b = _mm256_maskload_ps(best.as_ptr().add(r0), m);
+                _mm256_maskstore_ps(best.as_mut_ptr().add(r0), m, _mm256_max_ps(b, s));
+            }
+        }
+    }
+
+    /// Address of 8-row tile `r8`: the tile array is built in 16-row tiles,
+    /// whose second half is the next 8 rows at a 32-byte offset.
+    ///
+    /// # Safety
+    /// `r8 < 2 * ⌈nq/16⌉`.
+    #[inline(always)]
+    unsafe fn tile8(tiles: *const u8, tile_stride: usize, r8: usize) -> *const u8 {
+        tiles.add((r8 / 2) * tile_stride + (r8 % 2) * 32)
+    }
+
+    /// Every 8-row tile for `N` expanded tokens: pairs of tiles, then the
+    /// odd one.
+    ///
+    /// # Safety
+    /// As [`block`], for the whole tile array (`n8 = ⌈nq/8⌉` tiles).
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn tokens<const N: usize>(
+        ws: &[[i8; MAX_DIM]; N],
+        crows: &[*const f32; N],
+        invs: &[f32; N],
+        tiles: *const u8,
+        tile_stride: usize,
+        d4n: usize,
+        n8: usize,
+        nq: usize,
+        sqw: &[f32],
+        best: &mut [f32],
+    ) {
+        let mut t0 = 0usize;
+        while n8 - t0 >= 2 {
+            let tp = [
+                tile8(tiles, tile_stride, t0),
+                tile8(tiles, tile_stride, t0 + 1),
+            ];
+            block::<2, N>(ws, crows, invs, &tp, d4n, t0 * 8, nq, sqw, best);
+            t0 += 2;
+        }
+        if n8 - t0 == 1 {
+            let tp = [tile8(tiles, tile_stride, t0)];
+            block::<1, N>(ws, crows, invs, &tp, d4n, t0 * 8, nq, sqw, best);
+        }
+    }
+
+    /// # Safety
     /// Requires AVX2; `dim % 8 == 0 && dim <= MAX_DIM`;
-    /// `planes.stride >= padded_stride(dim)` (the dot loop reads 32-byte
-    /// chunks past `dim`, into the rows' zero padding).
+    /// `planes.tiles` built for `nq` rows at `planes.stride`.
     #[target_feature(enable = "avx2")]
     #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn maxsim_residual_lut_avx2(
@@ -737,16 +1033,19 @@ mod avx2 {
         inv_norms: &[f32],
         dim: usize,
         best: &mut Vec<f32>,
-        accs: &mut Vec<i32>,
     ) -> f32 {
         let nq = q8.values.nrows();
-        if nq == 0 || doc_packed.nrows() == 0 {
+        let n_tokens = doc_packed.nrows();
+        if nq == 0 || n_tokens == 0 {
             return 0.0;
         }
         let kpb = lut.keys_per_byte;
         let pdim = dim / kpb;
-        let ps = planes.stride;
-        let qp_base = planes.data.as_ptr();
+        let d4n = dim / 4;
+        let n8 = nq.div_ceil(8);
+        let tile_stride = (planes.stride / 4) * 64;
+        let tiles = planes.tiles.as_ptr();
+        debug_assert!(planes.tiles.len() >= nq.div_ceil(16) * tile_stride);
         let d_all = doc_packed.as_slice().expect("doc bytes must be contiguous");
         let pb = doc_packed.ncols();
         let cd = cdot_t.as_slice().expect("cdot_t must be standard layout");
@@ -754,136 +1053,328 @@ mod avx2 {
         let sqw: &[f32] = &planes.sqw;
         best.clear();
         best.resize(nq, f32::NEG_INFINITY);
-        accs.clear();
-        accs.resize(nq, 0);
-        let mut w = [0i8; MAX_DIM];
         let mut tabs = [_mm_setzero_si128(); 8];
         for (tab, src) in tabs.iter_mut().zip(nib.tables.iter()).take(kpb) {
             *tab = _mm_loadu_si128(src.as_ptr() as *const __m128i);
         }
-        let low_mask = _mm_set1_epi8(0x0F);
-        let ones = _mm256_set1_epi16(1);
 
-        for (t, &code) in doc_codes.iter().enumerate() {
-            let row = &d_all[t * pb..t * pb + pb];
-            let wp = w.as_mut_ptr();
-            let mut i = 0usize;
-            while i + 16 <= pdim {
-                let v = _mm_loadu_si128(row.as_ptr().add(i) as *const __m128i);
-                let hi = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
-                let lo = _mm_and_si128(v, low_mask);
-                for (k, tab) in tabs.iter().enumerate().take(kpb) {
-                    let idx = if nib.from_hi[k] { hi } else { lo };
-                    _mm_storeu_si128(
-                        wp.add(k * pdim + i) as *mut __m128i,
-                        _mm_shuffle_epi8(*tab, idx),
-                    );
-                }
-                i += 16;
+        // Zeroed once: `expand` writes only below `dim`, so each buffer's
+        // tail stays zero and a 4-byte weight group never carries stale data.
+        let mut ws = [[0i8; MAX_DIM]; NT];
+        let mut crows = [std::ptr::null::<f32>(); NT];
+        let mut invs = [0f32; NT];
+        let mut t = 0usize;
+        while t + NT <= n_tokens {
+            for j in 0..NT {
+                let tt = t + j;
+                expand(
+                    &d_all[tt * pb..tt * pb + pdim],
+                    &tabs,
+                    nib,
+                    kpb,
+                    pdim,
+                    &mut ws[j],
+                );
+                crows[j] = cd.as_ptr().add(doc_codes[tt] as usize * nq);
+                invs[j] = inv_norms[tt];
             }
-            // Sub-16 tail: same padded-scratch expand as the NEON kernel —
-            // see the comment there. Keeps narrow dims on pshufb instead of
-            // a scalar walk; copy-out of only the valid lanes protects the
-            // next plane's low bytes.
-            if i < pdim {
-                let rem = pdim - i;
-                let mut src = [0u8; 16];
-                src[..rem].copy_from_slice(&row[i..pdim]);
-                let v = _mm_loadu_si128(src.as_ptr() as *const __m128i);
-                let hi = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
-                let lo = _mm_and_si128(v, low_mask);
-                let mut dst = [0i8; 16];
-                for k in 0..kpb {
-                    let idx = if nib.from_hi[k] { hi } else { lo };
-                    _mm_storeu_si128(
-                        dst.as_mut_ptr() as *mut __m128i,
-                        _mm_shuffle_epi8(tabs[k], idx),
-                    );
-                    w[k * pdim + i..k * pdim + pdim].copy_from_slice(&dst[..rem]);
-                }
-            }
-            let cid = code as usize;
-            let wp = w.as_ptr();
-            for (qi, acc_qi) in accs.iter_mut().enumerate() {
-                let qp = qp_base.add(qi * ps);
-                let mut acc = _mm256_setzero_si256();
-                let mut k = 0usize;
-                // Partial tail chunks are exact: both sides zero-pad past dim
-                // (w to MAX_DIM, query rows to their 64-lane stride).
-                while k < dim {
-                    let qv = _mm256_loadu_si256(qp.add(k) as *const __m256i);
-                    let wv = _mm256_loadu_si256(wp.add(k) as *const __m256i);
-                    let prod = _mm256_maddubs_epi16(_mm256_abs_epi8(wv), _mm256_sign_epi8(qv, wv));
-                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(prod, ones));
-                    k += 32;
-                }
-                let hi128 = _mm256_extracti128_si256(acc, 1);
-                let s128 = _mm_add_epi32(_mm256_castsi256_si128(acc), hi128);
-                let s64 = _mm_add_epi32(s128, _mm_srli_si128(s128, 8));
-                let s32 = _mm_add_epi32(s64, _mm_srli_si128(s64, 4));
-                *acc_qi = _mm_cvtsi128_si32(s32);
-            }
-            let inv = inv_norms[t];
-            fold_block(accs, sqw, cd.as_ptr().add(cid * nq), inv, best);
+            tokens::<NT>(
+                &ws,
+                &crows,
+                &invs,
+                tiles,
+                tile_stride,
+                d4n,
+                n8,
+                nq,
+                sqw,
+                best,
+            );
+            t += NT;
+        }
+        while t < n_tokens {
+            expand(
+                &d_all[t * pb..t * pb + pdim],
+                &tabs,
+                nib,
+                kpb,
+                pdim,
+                &mut ws[0],
+            );
+            let one_w = [ws[0]];
+            let one_c = [cd.as_ptr().add(doc_codes[t] as usize * nq)];
+            let one_i = [inv_norms[t]];
+            tokens::<1>(
+                &one_w,
+                &one_c,
+                &one_i,
+                tiles,
+                tile_stride,
+                d4n,
+                n8,
+                nq,
+                sqw,
+                best,
+            );
+            t += 1;
         }
         best.iter().sum()
     }
 }
 
-/// AVX-512 + VNNI path for the fused asym kernel.
+/// AVX-512 + VNNI path for the fused asym kernel, in GEMM-tile form.
 ///
-/// The expand stays 128-bit `pshufb` (it is charged once per doc token and
-/// amortized over every query row); what moves to 512 bits is the part
-/// charged per *(query row, token)* — ~32× more often — plus the fold.
+/// The expand stays 128-bit `pshufb` (charged once per doc token and
+/// amortized over every query row); what goes wide is the part charged per
+/// *(query row, token)*, plus the fold.
 ///
-/// The dot uses `vpdpbusd`, one µop for what AVX2 spends `maddubs` +
-/// `madd` on, over 64 lanes instead of 32. `vpdpbusd` wants
-/// unsigned × signed, so we feed it `|w|` (unsigned, ≤ 127 by the
-/// quantizer's clamp) against `sign(w)·q`. There is no 512-bit `vpsignb`,
-/// so the sign is applied with a mask: `movepi8_mask` extracts w's sign
-/// bits and `mask_sub_epi8` negates exactly those query lanes. Lanes where
-/// `w == 0` need no special handling — `|w| = 0` zeroes the product
-/// whatever the other operand is — and `-128` never occurs on either side
-/// (both are clamped to ±127 at quantization), so the negation is exact.
+/// A row-per-accumulator form would end every row with a 16-lane horizontal
+/// reduction and need a sign fix-up per chunk, because `vpdpbusd` is
+/// unsigned × signed. Both costs vanish when the query *rows* occupy the
+/// lanes instead ([`QueryPlanes::tiles`]):
+///
+/// * the query is stored as tiles of 16 rows × 4 consecutive plane dims (64
+///   bytes), every code offset by `+128` so it is a valid `u8`;
+/// * the token's expanded weights are broadcast 4 bytes at a time;
+/// * `acc = vpdpbusd(acc, q_tile, w_bcast)` then adds 4 dims for 16 rows at
+///   once, and after `dim/4` steps each lane holds one row's full sum, offset
+///   by `128·Σw`. One vector subtract per (token, tile) removes that offset
+///   exactly, and the fold runs straight on the lanes.
+///
+/// Per `vpdpbusd`: one broadcast load and a fraction of a tile load, no
+/// shuffles, no sign ops, no reductions.
+///
+/// Exactness: `Σ (q+128)·w = Σ q·w + 128·Σw` in exact integers, and
+/// `|q|,|w| <= 127` over `dim <= 256` keeps every partial sum far inside i32
+/// (the accumulator is bounded by 256·127·255 < 2^24). The fold is the same
+/// op sequence as the other kernels, so results are bit-identical to scalar.
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
     use super::*;
     use std::arch::x86_64::*;
 
-    /// 16-wide fold; same op order as the NEON/AVX2 twins, hence
-    /// bit-identical (see the NEON `fold_block` for the argument).
+    /// Document tokens held in registers per block.
+    const NT: usize = 4;
+
+    /// Expand one stored token's packed bytes into `kpb` planes of int8
+    /// weights, returning `Σw` over all `dim` weights for the `+128` offset
+    /// correction.
+    ///
+    /// # Safety
+    /// Requires `avx512f,avx512bw,avx512vnni`; `row.len() >= pdim`;
+    /// `kpb * pdim <= MAX_DIM`; `tabs` holds the nibble tables for `kpb`
+    /// keys; `w` is zero beyond `kpb * pdim` (the `Σw` reduction reads whole
+    /// 64-byte chunks, so stale bytes there would corrupt the correction).
     #[inline(always)]
-    unsafe fn fold_block(accs: &[i32], sqw: &[f32], crow: *const f32, inv: f32, best: &mut [f32]) {
-        let nq = accs.len();
-        let invv = _mm512_set1_ps(inv);
+    unsafe fn expand(
+        row: &[u8],
+        tabs: &[__m128i; 8],
+        nib: &NibbleLut,
+        kpb: usize,
+        pdim: usize,
+        w: &mut [i8; MAX_DIM],
+    ) -> i32 {
+        // The expansion itself is the AVX2 module's loop, duplicated rather
+        // than shared: a cross-module call would have to carry `ssse3` in its
+        // own target-feature set to be inlinable here, and an out-of-line
+        // `pshufb` per key position per 16 bytes would cost more than the
+        // duplication.
+        let low_mask = _mm_set1_epi8(0x0F);
+        let wp = w.as_mut_ptr();
         let mut i = 0usize;
-        while i + 16 <= nq {
-            let a = _mm512_cvtepi32_ps(_mm512_loadu_si512(accs.as_ptr().add(i) as *const _));
-            let s = _mm512_mul_ps(
-                _mm512_add_ps(
-                    _mm512_mul_ps(_mm512_loadu_ps(sqw.as_ptr().add(i)), a),
-                    _mm512_loadu_ps(crow.add(i)),
-                ),
-                invv,
-            );
-            let b = _mm512_loadu_ps(best.as_ptr().add(i));
-            _mm512_storeu_ps(best.as_mut_ptr().add(i), _mm512_max_ps(b, s));
+        while i + 16 <= pdim {
+            let v = _mm_loadu_si128(row.as_ptr().add(i) as *const __m128i);
+            let hi = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
+            let lo = _mm_and_si128(v, low_mask);
+            for (k, tab) in tabs.iter().enumerate().take(kpb) {
+                let idx = if nib.from_hi[k] { hi } else { lo };
+                _mm_storeu_si128(
+                    wp.add(k * pdim + i) as *mut __m128i,
+                    _mm_shuffle_epi8(*tab, idx),
+                );
+            }
             i += 16;
         }
-        while i < nq {
-            let s = (sqw[i] * accs[i] as f32 + *crow.add(i)) * inv;
-            if s > best[i] {
-                best[i] = s;
+        if i < pdim {
+            let rem = pdim - i;
+            let mut src = [0u8; 16];
+            src[..rem].copy_from_slice(&row[i..pdim]);
+            let v = _mm_loadu_si128(src.as_ptr() as *const __m128i);
+            let hi = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
+            let lo = _mm_and_si128(v, low_mask);
+            let mut dst = [0i8; 16];
+            for k in 0..kpb {
+                let idx = if nib.from_hi[k] { hi } else { lo };
+                _mm_storeu_si128(
+                    dst.as_mut_ptr() as *mut __m128i,
+                    _mm_shuffle_epi8(tabs[k], idx),
+                );
+                w[k * pdim + i..k * pdim + pdim].copy_from_slice(&dst[..rem]);
             }
-            i += 1;
+        }
+        // Σw: u8 ones × s8 weights, over the 64-byte chunks covering `dim`.
+        // `dim <= MAX_DIM` and the chunks start at 0, so the last one ends at
+        // or before byte 255.
+        let dim = kpb * pdim;
+        let ones = _mm512_set1_epi8(1);
+        let mut s = _mm512_setzero_si512();
+        let mut k = 0usize;
+        while k < dim {
+            s = _mm512_dpbusd_epi32(s, ones, _mm512_loadu_si512(w.as_ptr().add(k) as *const _));
+            k += 64;
+        }
+        _mm512_reduce_add_epi32(s)
+    }
+
+    /// One block: `RT` sixteen-row query tiles × `N` doc tokens over all
+    /// `d4n` dim groups, then the fold for exactly those rows and tokens.
+    ///
+    /// # Safety
+    /// Requires `avx512f,avx512bw,avx512vnni`. `tiles` addresses row tile
+    /// `row0/16` of the query's tile array, with at least `RT` tiles of
+    /// `tile_stride` bytes available; `row0 + 16·(RT−1) < nq`; `crows[j]`
+    /// readable for `nq` f32s; `sqw.len() == best.len() == nq`; `ws[j]`
+    /// readable for `4·d4n` bytes.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn block<const RT: usize, const N: usize>(
+        ws: &[[i8; MAX_DIM]; N],
+        corr: &[__m512i; N],
+        crows: &[*const f32; N],
+        invs: &[f32; N],
+        tiles: *const u8,
+        tile_stride: usize,
+        d4n: usize,
+        row0: usize,
+        nq: usize,
+        sqw: &[f32],
+        best: &mut [f32],
+    ) {
+        let zero = _mm512_setzero_si512();
+        let mut acc = [[zero; RT]; N];
+        for g in 0..d4n {
+            let mut q = [zero; RT];
+            for (rt, qt) in q.iter_mut().enumerate() {
+                *qt = _mm512_loadu_si512(tiles.add(rt * tile_stride + g * 64) as *const _);
+            }
+            for j in 0..N {
+                let wb =
+                    _mm512_set1_epi32((ws[j].as_ptr().add(g * 4) as *const i32).read_unaligned());
+                for rt in 0..RT {
+                    acc[j][rt] = _mm512_dpbusd_epi32(acc[j][rt], q[rt], wb);
+                }
+            }
+        }
+        for j in 0..N {
+            let invv = _mm512_set1_ps(invs[j]);
+            for (rt, acc_rt) in acc[j].iter().enumerate() {
+                let r0 = row0 + rt * 16;
+                let rem = (nq - r0).min(16);
+                // Masked loads/stores keep the last, partial row tile inside
+                // `sqw` / `crow` / `best`.
+                let mask: __mmask16 = if rem == 16 { 0xFFFF } else { (1u16 << rem) - 1 };
+                let a = _mm512_cvtepi32_ps(_mm512_sub_epi32(*acc_rt, corr[j]));
+                let s = _mm512_mul_ps(
+                    _mm512_add_ps(
+                        _mm512_mul_ps(_mm512_maskz_loadu_ps(mask, sqw.as_ptr().add(r0)), a),
+                        _mm512_maskz_loadu_ps(mask, crows[j].add(r0)),
+                    ),
+                    invv,
+                );
+                let b = _mm512_maskz_loadu_ps(mask, best.as_ptr().add(r0));
+                _mm512_mask_storeu_ps(best.as_mut_ptr().add(r0), mask, _mm512_max_ps(b, s));
+            }
+        }
+    }
+
+    /// Every row tile for `N` expanded tokens: blocks of four tiles, then the
+    /// remainder.
+    ///
+    /// # Safety
+    /// As [`block`], for the whole tile array (`n16` tiles).
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn tokens<const N: usize>(
+        ws: &[[i8; MAX_DIM]; N],
+        corr: &[__m512i; N],
+        crows: &[*const f32; N],
+        invs: &[f32; N],
+        tiles: *const u8,
+        tile_stride: usize,
+        d4n: usize,
+        n16: usize,
+        nq: usize,
+        sqw: &[f32],
+        best: &mut [f32],
+    ) {
+        let mut t0 = 0usize;
+        while n16 - t0 >= 4 {
+            let tp = tiles.add(t0 * tile_stride);
+            let r0 = t0 * 16;
+            block::<4, N>(
+                ws,
+                corr,
+                crows,
+                invs,
+                tp,
+                tile_stride,
+                d4n,
+                r0,
+                nq,
+                sqw,
+                best,
+            );
+            t0 += 4;
+        }
+        let tp = tiles.add(t0 * tile_stride);
+        let r0 = t0 * 16;
+        match n16 - t0 {
+            3 => block::<3, N>(
+                ws,
+                corr,
+                crows,
+                invs,
+                tp,
+                tile_stride,
+                d4n,
+                r0,
+                nq,
+                sqw,
+                best,
+            ),
+            2 => block::<2, N>(
+                ws,
+                corr,
+                crows,
+                invs,
+                tp,
+                tile_stride,
+                d4n,
+                r0,
+                nq,
+                sqw,
+                best,
+            ),
+            1 => block::<1, N>(
+                ws,
+                corr,
+                crows,
+                invs,
+                tp,
+                tile_stride,
+                d4n,
+                r0,
+                nq,
+                sqw,
+                best,
+            ),
+            _ => {}
         }
     }
 
     /// # Safety
-    /// Requires `avx512f,avx512bw,avx512vnni`; `dim % 8 == 0 && dim <= MAX_DIM`.
-    /// Reads 64-byte chunks of the query planes, whose stride is a multiple
-    /// of 64 ([`crate::binary::padded_stride`]), and of the `[i8; MAX_DIM]`
-    /// expansion buffer, which `dim <= 256` keeps in bounds.
+    /// Requires `avx512f,avx512bw,avx512vnni`; `dim % 8 == 0 && dim <=
+    /// MAX_DIM`; `planes.tiles` built for `nq` rows at `planes.stride`.
     #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
     #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn maxsim_residual_lut_avx512(
@@ -897,16 +1388,19 @@ mod avx512 {
         inv_norms: &[f32],
         dim: usize,
         best: &mut Vec<f32>,
-        accs: &mut Vec<i32>,
     ) -> f32 {
         let nq = q8.values.nrows();
-        if nq == 0 || doc_packed.nrows() == 0 {
+        let n_tokens = doc_packed.nrows();
+        if nq == 0 || n_tokens == 0 {
             return 0.0;
         }
         let kpb = lut.keys_per_byte;
         let pdim = dim / kpb;
-        let ps = planes.stride;
-        let qp_base = planes.data.as_ptr();
+        let d4n = dim / 4;
+        let n16 = nq.div_ceil(16);
+        let tile_stride = (planes.stride / 4) * 64;
+        let tiles = planes.tiles.as_ptr();
+        debug_assert!(planes.tiles.len() >= n16 * tile_stride);
         let d_all = doc_packed.as_slice().expect("doc bytes must be contiguous");
         let pb = doc_packed.ncols();
         let cd = cdot_t.as_slice().expect("cdot_t must be standard layout");
@@ -914,71 +1408,75 @@ mod avx512 {
         let sqw: &[f32] = &planes.sqw;
         best.clear();
         best.resize(nq, f32::NEG_INFINITY);
-        accs.clear();
-        accs.resize(nq, 0);
-        let mut w = [0i8; MAX_DIM];
         let mut tabs = [_mm_setzero_si128(); 8];
         for (tab, src) in tabs.iter_mut().zip(nib.tables.iter()).take(kpb) {
             *tab = _mm_loadu_si128(src.as_ptr() as *const __m128i);
         }
-        let low_mask = _mm_set1_epi8(0x0F);
-        let zero = _mm512_setzero_si512();
 
-        for (t, &code) in doc_codes.iter().enumerate() {
-            let row = &d_all[t * pb..t * pb + pb];
-            let wp = w.as_mut_ptr();
-            let mut i = 0usize;
-            while i + 16 <= pdim {
-                let v = _mm_loadu_si128(row.as_ptr().add(i) as *const __m128i);
-                let hi = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
-                let lo = _mm_and_si128(v, low_mask);
-                for (k, tab) in tabs.iter().enumerate().take(kpb) {
-                    let idx = if nib.from_hi[k] { hi } else { lo };
-                    _mm_storeu_si128(
-                        wp.add(k * pdim + i) as *mut __m128i,
-                        _mm_shuffle_epi8(*tab, idx),
-                    );
-                }
-                i += 16;
+        // Zeroed once, and `expand` writes only below `dim`, which is what
+        // makes the `Σw` reduction's 64-byte over-read contribute nothing.
+        let mut ws = [[0i8; MAX_DIM]; NT];
+        let mut corr = [_mm512_setzero_si512(); NT];
+        let mut crows = [std::ptr::null::<f32>(); NT];
+        let mut invs = [0f32; NT];
+        let mut t = 0usize;
+        while t + NT <= n_tokens {
+            for j in 0..NT {
+                let tt = t + j;
+                let sumw = expand(
+                    &d_all[tt * pb..tt * pb + pdim],
+                    &tabs,
+                    nib,
+                    kpb,
+                    pdim,
+                    &mut ws[j],
+                );
+                corr[j] = _mm512_set1_epi32(128 * sumw);
+                crows[j] = cd.as_ptr().add(doc_codes[tt] as usize * nq);
+                invs[j] = inv_norms[tt];
             }
-            if i < pdim {
-                let rem = pdim - i;
-                let mut src = [0u8; 16];
-                src[..rem].copy_from_slice(&row[i..pdim]);
-                let v = _mm_loadu_si128(src.as_ptr() as *const __m128i);
-                let hi = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
-                let lo = _mm_and_si128(v, low_mask);
-                let mut dst = [0i8; 16];
-                for k in 0..kpb {
-                    let idx = if nib.from_hi[k] { hi } else { lo };
-                    _mm_storeu_si128(
-                        dst.as_mut_ptr() as *mut __m128i,
-                        _mm_shuffle_epi8(tabs[k], idx),
-                    );
-                    w[k * pdim + i..k * pdim + pdim].copy_from_slice(&dst[..rem]);
-                }
-            }
-            let cid = code as usize;
-            let wp = w.as_ptr();
-            for (qi, acc_qi) in accs.iter_mut().enumerate() {
-                let qp = qp_base.add(qi * ps);
-                let mut acc = zero;
-                let mut k = 0usize;
-                // Both sides zero-pad past dim, so a trailing partial
-                // 64-lane chunk contributes exactly zero.
-                while k < dim {
-                    let qv = _mm512_loadu_si512(qp.add(k) as *const _);
-                    let wv = _mm512_loadu_si512(wp.add(k) as *const _);
-                    let mag = _mm512_abs_epi8(wv);
-                    let neg = _mm512_movepi8_mask(wv);
-                    let sq = _mm512_mask_sub_epi8(qv, neg, zero, qv);
-                    acc = _mm512_dpbusd_epi32(acc, mag, sq);
-                    k += 64;
-                }
-                *acc_qi = _mm512_reduce_add_epi32(acc);
-            }
-            let inv = inv_norms[t];
-            fold_block(accs, sqw, cd.as_ptr().add(cid * nq), inv, best);
+            tokens::<NT>(
+                &ws,
+                &corr,
+                &crows,
+                &invs,
+                tiles,
+                tile_stride,
+                d4n,
+                n16,
+                nq,
+                sqw,
+                best,
+            );
+            t += NT;
+        }
+        while t < n_tokens {
+            let sumw = expand(
+                &d_all[t * pb..t * pb + pdim],
+                &tabs,
+                nib,
+                kpb,
+                pdim,
+                &mut ws[0],
+            );
+            let one_w = [ws[0]];
+            let one_corr = [_mm512_set1_epi32(128 * sumw)];
+            let one_c = [cd.as_ptr().add(doc_codes[t] as usize * nq)];
+            let one_i = [inv_norms[t]];
+            tokens::<1>(
+                &one_w,
+                &one_corr,
+                &one_c,
+                &one_i,
+                tiles,
+                tile_stride,
+                d4n,
+                n16,
+                nq,
+                sqw,
+                best,
+            );
+            t += 1;
         }
         best.iter().sum()
     }
@@ -1099,11 +1597,15 @@ mod tests {
             return;
         }
         let mut rng = StdRng::seed_from_u64(23);
-        // nq values chosen to exercise every fold_block branch: 3 = pure
-        // scalar tail, 7 = one NEON vector iter + tail (AVX2 tail-only),
-        // 8 = exactly one AVX2 vector iter, 9 = vector iter(s) + 1-lane
-        // tail on both ISAs, 32 = the production query shape, vector-only.
-        for &nq in &[3usize, 7, 8, 9, 32] {
+        // nq values chosen to reach every row-blocking branch. NEON folds
+        // four rows at a time: 3 = pure scalar tail, 9 = vector blocks + a
+        // 1-row tail, 32 = the production query shape, no tail. The x86
+        // kernels block over whole row tiles instead, and the remainder arms
+        // are selected by how many tiles a query fills: AVX2 works in 8-row
+        // tiles (7 and 9 give a partial tile, 17 an odd tile after a pair),
+        // AVX-512 in 16-row tiles (17 -> 2, 48 -> the 3-tile arm, 65 -> a
+        // 4-tile block plus a single). 8 is exactly one AVX2 tile.
+        for &nq in &[3usize, 7, 8, 9, 17, 32, 48, 65] {
             for &nbits in &[1usize, 2, 4] {
                 for &dim in &[8usize, 16, 40, 48, 128, 200, 256] {
                     let k = 12;
@@ -1130,7 +1632,7 @@ mod tests {
                     );
                     // Fresh scratch per call — also proves the kernels fully
                     // initialize it (no state carried between calls).
-                    let (mut best, mut accs) = (Vec::new(), Vec::new());
+                    let mut best = Vec::new();
                     #[cfg(target_arch = "aarch64")]
                     let simd = unsafe {
                         super::neon::maxsim_residual_lut_neon(
@@ -1144,7 +1646,6 @@ mod tests {
                             &inv,
                             dim,
                             &mut best,
-                            &mut accs,
                         )
                     };
                     #[cfg(target_arch = "x86_64")]
@@ -1160,7 +1661,6 @@ mod tests {
                             &inv,
                             dim,
                             &mut best,
-                            &mut accs,
                         )
                     };
                     assert_eq!(
@@ -1175,7 +1675,7 @@ mod tests {
                     // reaches it there).
                     #[cfg(target_arch = "x86_64")]
                     if has_avx512_vnni() {
-                        let (mut best, mut accs) = (Vec::new(), Vec::new());
+                        let mut best = Vec::new();
                         let v512 = unsafe {
                             super::avx512::maxsim_residual_lut_avx512(
                                 &q8,
@@ -1188,7 +1688,6 @@ mod tests {
                                 &inv,
                                 dim,
                                 &mut best,
-                                &mut accs,
                             )
                         };
                         assert_eq!(
